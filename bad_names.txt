@@ -1,0 +1,172 @@
+# Bad Names Pattern File for GOAnnotate
+# ======================================
+#
+# This file contains patterns for gene/protein names that should be filtered out
+# during GO annotation. These are typically uninformative names that don't help
+# identify the gene function.
+#
+# Pattern types:
+#   1. Plain text - matched as substring (case-insensitive)
+#      Short patterns (<=6 chars) are matched exactly
+#      Longer patterns are matched as substrings
+#
+#   2. Regex patterns - prefix with "regex:" for full regex matching
+#      Example: regex:^LOC\d+$
+#
+# Lines starting with # are comments and ignored
+# Blank lines are ignored
+#
+
+# =============================================================================
+# UNINFORMATIVE NAMES
+# =============================================================================
+
+# Generic placeholders
+ypothetical protein
+ncharacterized protein
+redicted protein
+nknown protein
+nnamed protein product
+putative protein
+expressed protein
+conserved hypothetical
+ypothetical conserved
+ncharacterized conserved
+nknown function
+
+# Domain-only descriptions (often not informative about function)
+domain-containing protein
+domain containing protein
+DUF domain
+protein of unknown function
+family protein
+
+# =============================================================================
+# DATABASE/PROJECT-SPECIFIC PATTERNS
+# =============================================================================
+
+# Japanese RIKEN cDNA project
+RIKEN
+
+# HUGE project (Kazusa DNA Research Institute)
+KIAA
+
+# Full-length cDNA project
+FLJ
+
+# Mammalian Gene Collection
+MGC
+
+# IMAGE clone prefixes
+BC0
+
+# NCBI automatic naming
+LOC
+NEWENTRY
+
+# Generic ORF labels
+ORF
+
+# Chromosome ORF naming
+CXorf
+Corf
+
+# =============================================================================
+# REGEX PATTERNS FOR COMPLEX MATCHING
+# =============================================================================
+
+# NCBI LOC followed by numbers (e.g., LOC123456)
+regex:^LOC\d+$
+regex:^loc\d+$
+
+# Generic accession-like patterns (e.g., ABC12345)
+regex:^[A-Z]{2,4}\d{4,}$
+
+# Lab internal naming: PREFIX_NUMBER_SUFFIX (e.g., NTP_1235_bu)
+regex:^[A-Za-z]+_\d+_[A-Za-z]+$
+
+# Chromosome ORF naming (e.g., C1orf123, C22orf45)
+regex:^C\d+orf\d+$
+
+# Simple orf numbering
+regex:^orf\d+$
+
+# NCBI prediction prefixes
+#regex:^PREDICTED:
+#regex:^LOW QUALITY PROTEIN:
+
+# Just numbers
+regex:^\d+$
+
+# Gene prediction tool output patterns
+regex:^g\d+\.t\d+$
+regex:^maker-
+regex:^augustus-
+regex:^snap-
+regex:^genemark-
+regex:^GENSCAN
+regex:^Glyma\.\d+G\d+
+
+# Ensembl-style automatic IDs
+regex:^ENS[A-Z]+\d+$
+
+# RefSeq predicted patterns
+regex:^XP_\d+
+regex:^NP_\d+.*hypothetical
+regex:^YP_\d+.*hypothetical
+
+# UniProt unreviewed entry patterns (trembl)
+regex:^tr\|[A-Z0-9]+\|[A-Z0-9]+_[A-Z0-9]+\s+Uncharacterized
+
+# Species-specific uninformative patterns
+
+# Arabidopsis
+regex:^At\dg\d+$
+regex:^AT\dG\d+$
+
+# Rice
+regex:^Os\d+g\d+$
+regex:^LOC_Os\d+g\d+$
+
+# Maize
+regex:^Zm\d+d\d+$
+regex:^GRMZM\d+G\d+$
+
+# Soybean
+regex:^Glyma\d+g\d+$
+
+# Medicago
+regex:^Medtr\dg\d+$
+
+# =============================================================================
+# FISH GENOME PATTERNS
+# =============================================================================
+
+# Placeholder names common in fish genomes
+#senescence-associated
+#vegetative cell wall protein
+
+# Zebrafish clone IDs used as protein names
+regex:^Si:\d+-
+regex:^si:\d+-
+regex:^Si:ch\d+-
+regex:^Si:dkey-
+regex:^Si:busm
+regex:^Si:rp\d+-
+regex:^si:ch\d+-
+regex:^si:dkey-
+regex:^[Ss]i:
+regex:^zgc:\d+
+regex:^wu:
+regex:^im:
+
+# =============================================================================
+# ADD CUSTOM PATTERNS BELOW
+# =============================================================================
+
+# Example: filter out names from a specific organism or database
+# regex:^MyOrganism_\d+$
+
+# Example: filter specific uninformative terms from your database
+# some lab-specific term
+

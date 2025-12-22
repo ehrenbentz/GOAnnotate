@@ -1,0 +1,116 @@
+1. Prepare GO Mapping File
+
+# Download GAF file (GO annotations)
+wget https://ftp.ebi.ac.uk/pub/databases/GO/goa/UNIPROT/goa_uniprot_all.gaf.gz
+
+# Create GO mapping
+./create_go_mapping.py goa-gaf --gaf goa_uniprot_all.gaf.gz --output Uniprot_All_GO_mapping.tsv
+
+################################################################################################
+
+2. Prepare UniProtKB Vertebrate Database
+
+# Download Swiss-Prot Vertebrata
+wget https://ftp.uniprot.org/pub/databases/uniprot/current_release/knowledgebase/taxonomic_divisions/uniprot_sprot_vertebrates.dat.gz
+
+# Download TrEMBL Vertebrata
+wget https://ftp.uniprot.org/pub/databases/uniprot/current_release/knowledgebase/taxonomic_divisions/uniprot_trembl_vertebrates.dat.gz
+
+# Convert .dat to FASTA (if only using vertrbrata. Otherwise, just download the full .fasta files and skip this step)
+./dat_to_fasta.py uniprot_sprot_vertebrates.dat.gz uniprot_sprot_vertebrates.fasta
+./dat_to_fasta.py uniprot_trembl_vertebrates.dat.gz uniprot_trembl_vertebrates.fasta
+
+
+# Download full UniProtKB (Swiss-Prot + TrEMBL; ~55GB compressed)
+wget https://ftp.uniprot.org/pub/databases/uniprot/current_release/knowledgebase/complete/uniprot_trembl.fasta.gz
+wget https://ftp.uniprot.org/pub/databases/uniprot/current_release/knowledgebase/complete/uniprot_sprot.fasta.gz
+
+
+# Build Diamond databases
+diamond makedb --in uniprot_sprot.fasta.gz -d SwissProt_Diamond_DB
+diamond makedb --in uniprot_trembl.fasta.gz -d TrEMBL_Diamond_DB
+
+
+################################################################################################
+
+3. Extract CDS from Gene Models
+# Note: agat is vastly better than gffread. Use agat.
+# Note: Ensure genome.fasta is line-wrapped to 80 or 60 characters for agat
+
+# Extract CDS sequences
+agat_sp_extract_sequences.pl -g Annotations.gff3 -f Genome.fasta -t cds --mrna -o temp_CDS.fasta
+
+# Make gene ID the first field in the fasta header
+# Blastx and GOAnntaote.py both use the first field to identify and agregate blast hits.
+# If you wish to aggregate annotations by gene, ensure that the geneID is the first field in the fasta file
+# If you wish to aggregate by transcript or mRNA, ensure that the mRNA ID is the first field in the fasta file
+awk '/^>/ {gene=substr($1,2); printf ">%s %s", $2, gene; for(i=3;i<=NF;i++) printf " %s",$i; print ""; next} {print}' temp_CDS.fasta > CDS.fasta
+
+# This awk command will make geneID the first field and strip "gene=" from the geneID field
+# Example: ">mRNA1 gene=gene1 name=g1.t1 seq_id=h2tg000023l type=exon" 
+#    becomes
+#          ">gene1 mRNA1 name=g1.t1 seq_id=h2tg000023l type=exon"
+awk '/^>/ {
+    for(i=2; i<=NF; i++) {
+        if($i ~ /^gene=/) {
+            gene_id = substr($i, 6);
+            break;
+        }
+    }
+    printf ">%s %s", gene_id, substr($1,2);
+    for(i=2; i<=NF; i++) printf " %s", $i;
+    print "";
+    next
+} {print}' temp_CDS.fasta > CDS.fasta
+
+################################################################################################
+
+4. Run Diamond BLASTx SEPARATELY for SwissProt and TrEMBL
+
+diamond blastx \
+-d /home/ehren/Bio/Databases/Uniprot/FULL/SwissProt_ALL_Diamond_DB.dmnd \
+-q CDS.fasta \
+-o SwissProt_diamond_blastx_results.tsv \
+-f 6 qseqid sseqid pident length mismatch gapopen qstart qend sstart send evalue bitscore stitle \
+-k 50 \
+-e 1e-5 \
+--threads 60
+
+diamond blastx \
+-d /home/ehren/Bio/Databases/Uniprot/FULL/TrEMBL_ALL_Diamond_DB.dmnd \
+-q CDS.fasta \
+-o TrEMBL_diamond_blastx_results.tsv \
+-f 6 qseqid sseqid pident length mismatch gapopen qstart qend sstart send evalue bitscore stitle \
+-k 50 \
+-e 1e-5 \
+--threads 60
+
+# Combine SwissProt and TrEMBL blastx results
+cat SwissProt_diamond_blastx_results.tsv TrEMBL_diamond_blastx_results.tsv > UniProt_diamond_blastx_results.tsv
+
+################################################################################################
+
+5. Download GO Ontology
+
+wget https://purl.obolibrary.org/obo/go.obo -O go.obo
+
+################################################################################################
+
+6. Run GOAnnotate
+
+../GOAnnotate.py \
+    --gff pat_Annots.gff3 \
+    --transcripts Reticulata_Paternal_CDS.fasta \
+    --blast UniProt_paternal_blastx_results.tsv \
+    --go-mapping ../Uniprot_All_GO_mapping.tsv \
+    --ncbi-idmapping /home/ehren/Bio/Databases/NCBI/idmapping_selected.tab \                                        
+    --ncbi-geneinfo /home/ehren/Bio/Databases/NCBI/gene_info \                                                      
+    --go-obo ../go.obo \
+    --bad-names ../bad_names.txt \
+    --evalue 1e-5 \
+    --top-n 30 \
+    --consensus-threshold 0.5 \
+    --min-consensus-fraction 0.4 \
+    --output Annotations
+
+#########################################################################

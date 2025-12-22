@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# Data files
+*.fasta
+*.fa
+*.faa
+*.blast
+*.xml
+*.gaf
+*.gz
+*.dmnd
+
+# Output files
+*.tsv
+*.csv
+*.out
+
+# Temporary files
+*.tmp
+temp_*
+.DS_Store
+
+# Large database files
+*Diamond_DB*
+go.obo
+*_mapping.tsv
+idmapping_selected.tab
+gene_info
