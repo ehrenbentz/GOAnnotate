@@ -8,29 +8,38 @@ __pycache__/
 dist/
 build/
 
-# Data files
+# Sequence and annotation files
 *.fasta
 *.fa
 *.faa
+*.gff3
+*.gff
+*.gtf
+
+# BLAST and Diamond
 *.blast
+*.dmnd
+
+# Data files
+*.tsv
+*.csv
 *.xml
 *.gaf
 *.gz
-*.dmnd
+*.obo
+*.sqlite
 
-# Output files
-*.tsv
-*.csv
-*.out
+# Output directories
+*output*
 
 # Temporary files
 *.tmp
+*.log
 temp_*
 .DS_Store
 
 # Large database files
 *Diamond_DB*
-go.obo
 *_mapping.tsv
 idmapping_selected.tab
-gene_info
+gene_info*

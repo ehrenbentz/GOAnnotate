@@ -1,34 +1,43 @@
 #!/usr/bin/env python3
 """
-GOAnnotate: Gene Ontology Annotation Pipeline using Blastx and UniProt
-Written by E. J. Bentz (2025)
+GOAnnotate: Gene Ontology Annotation Pipeline using BLAST/Diamond and UniProt
+Written by E. J. Bentz
 
-Required input files:
-1) A FASTA file containing all the sequences to be annotated
-2) Diamond/Blastx results obtained by blasting sequences to appropriate SwissProt and/or TrEMBL protein databases
-3) A GO mapping file (created from the uniprot goa.gaf file)
-4) The current go.obo hierarchy definitions file
-5) A bad_names.txt file containing patterns that will NOT be used to annotate genes
+Annotation-only mode: annotates pre-computed BLAST results against a
+transcript-level CDS FASTA with transcript-to-gene mapping.
+
+Required: --transcripts, --blast-results, --go-mapping (or --db), --bad-names
+
+The --transcripts CDS FASTA defines the complete gene set. Transcript IDs
+are extracted from the first field of each header; gene IDs from the gene=
+field (if absent, transcript ID is used as gene ID). All genes appear in
+the output, including those without BLAST hits.
+
+The GO OBO hierarchy file (--go-obo) is automatically downloaded if not
+provided or if the existing file is more than 30 days old.
 
 Usage:
-  ./GOAnnotate.py --transcripts transcripts.fasta --blast-results diamond_results.tsv \\
+  ./GOAnnotate.py --transcripts CDS.fasta --blast-results diamond_results.tsv \\
                   --go-mapping GO_mapping.tsv --bad-names bad_names.txt --go-obo go.obo -o output_dir
-
-Note: The --transcripts file defines the complete gene set. Gene IDs are extracted from the first
-field of each FASTA header (the portion before the first whitespace). All genes from this file
-will appear in the output, including those without BLAST hits. Statistics are calculated based
-on the number of unique gene IDs, not just those with BLAST hits.
 
 """
 import sys
+import os
 import re
 import argparse
 import logging
+import math
+import multiprocessing
+import time
 from pathlib import Path
 from datetime import datetime
-from collections import defaultdict, Counter
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from typing import Optional
+from difflib import SequenceMatcher
+import statistics
+import shutil
+import urllib.parse
 
 logging.basicConfig(
     level=logging.INFO,
@@ -50,24 +59,30 @@ class BlastStats:
     other_hits: int = 0
 
 
-# =============================================================================
+####################
 # BAD NAMES FILTER
-# =============================================================================
-
+####################
 class BadNameFilter:
     """
-    Filter for removing uninformative or spurious gene/protein names.
+    Filter for cleaning and removing uninformative gene/protein names and symbols.
 
-    Supports three types of patterns:
-      1. Exact matches (case-insensitive) - patterns <=6 chars
-      2. Substring matches (case-insensitive) - patterns >6 chars
-      3. Regex patterns (prefixed with 'regex:')
+    Supports five types of patterns:
+      1. Strip patterns (prefixed with 'strip_regex:') - artifacts stripped from names
+      2. Exact matches (case-insensitive) - plain text patterns <=6 chars
+      3. Substring matches (case-insensitive) - plain text patterns >6 chars
+      4. Regex patterns (prefixed with 'regex:') - matched against protein names
+      5. Symbol regex patterns (prefixed with 'symbol_regex:') - matched against gene symbols
+
+    Processing order: clean_name() applies strip patterns first, then
+    is_bad_name() checks the cleaned result against discard patterns.
     """
 
     def __init__(self, patterns_file: str):
         self.exact_matches = set()
         self.substrings = []
         self.regex_patterns = []
+        self.symbol_regex_patterns = []
+        self.strip_patterns = []
 
         if not Path(patterns_file).exists():
             raise FileNotFoundError(f"Bad names pattern file not found: {patterns_file}")
@@ -76,19 +91,33 @@ class BadNameFilter:
             self._parse_patterns(f.read())
 
         logger.info(
-            f"BadNameFilter: loaded {len(self.exact_matches)} exact, "
-            f"{len(self.substrings)} substring, {len(self.regex_patterns)} regex patterns "
+            f"BadNameFilter: loaded {len(self.strip_patterns)} strip, "
+            f"{len(self.exact_matches)} exact, "
+            f"{len(self.substrings)} substring, {len(self.regex_patterns)} regex, "
+            f"{len(self.symbol_regex_patterns)} symbol_regex patterns "
             f"from '{patterns_file}'"
         )
 
     def _parse_patterns(self, text: str):
-        """Parse pattern text into exact, substring, and regex categories."""
+        """Parse pattern text into strip, exact, substring, regex, and symbol_regex categories."""
         for line in text.strip().split('\n'):
             line = line.strip()
             if not line or line.startswith('#'):
                 continue
 
-            if line.startswith('regex:'):
+            if line.startswith('strip_regex:'):
+                pattern = line[12:].strip()
+                try:
+                    self.strip_patterns.append(re.compile(pattern, re.IGNORECASE))
+                except re.error as e:
+                    logger.warning(f"Invalid strip_regex pattern '{pattern}': {e}")
+            elif line.startswith('symbol_regex:'):
+                pattern = line[13:].strip()
+                try:
+                    self.symbol_regex_patterns.append(re.compile(pattern, re.IGNORECASE))
+                except re.error as e:
+                    logger.warning(f"Invalid symbol_regex pattern '{pattern}': {e}")
+            elif line.startswith('regex:'):
                 pattern = line[6:].strip()
                 try:
                     self.regex_patterns.append(re.compile(pattern, re.IGNORECASE))
@@ -103,7 +132,7 @@ class BadNameFilter:
                     self.substrings.append(lower)
 
     def is_bad_name(self, name: str) -> bool:
-        """Check if a name matches any bad pattern."""
+        """Check if a protein name matches any bad pattern."""
         if not name:
             return True
 
@@ -125,14 +154,59 @@ class BadNameFilter:
 
         return False
 
+    def clean_name(self, name: str) -> Optional[str]:
+        """
+        Strip database-specific artifacts from a protein name.
+
+        Applies all strip_regex patterns loaded from the patterns file,
+        then cleans up residual punctuation and whitespace.
+
+        This method runs BEFORE the bad_names discard filter so that
+        informative names obscured by database prefixes, suffixes, or
+        qualifiers are preserved rather than discarded.
+
+        Args:
+            name: Raw protein name string from a BLAST stitle.
+
+        Returns:
+            Cleaned protein name, or None if the name is empty after cleaning.
+        """
+        if not name:
+            return None
+
+        cleaned = name
+        for pattern in self.strip_patterns:
+            cleaned = pattern.sub('', cleaned)
+
+        # Remove trailing commas left after stripping
+        cleaned = re.sub(r',\s*$', '', cleaned)
+        # Collapse multiple spaces into one and strip leading/trailing whitespace
+        cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+
+        if not cleaned:
+            return None
+
+        return cleaned
+
+    def is_bad_symbol(self, symbol: str) -> bool:
+        """Check if a gene symbol matches any bad symbol pattern."""
+        if not symbol:
+            return True
+
+        for pattern in self.symbol_regex_patterns:
+            if pattern.search(symbol):
+                return True
+
+        return False
+
     def filter_names(self, names: list) -> list:
         """Return only names that are NOT bad."""
         return [n for n in names if not self.is_bad_name(n)]
 
 
-# =============================================================================
+###########################
 # BLAST HIT DATA STRUCTURE
-# =============================================================================
+###########################
 
 @dataclass
 class BlastHit:
@@ -207,155 +281,6 @@ class BlastHit:
         """Check if this hit is from TrEMBL (unreviewed)."""
         return self.subject_id.startswith('tr|')
 
-    def is_valid_gene_symbol(self, symbol: str) -> bool:
-        """Check if a gene symbol is informative (not a placeholder or internal ID)."""
-        if not symbol:
-            return False
-
-        symbol_upper = symbol.upper()
-
-        # Filter out LOC numbers (NCBI automatic naming)
-        if re.match(r'^LOC\d+$', symbol_upper):
-            return False
-
-        # Filter out zebrafish clone IDs (SI:*, si:dkey-*, zgc:*, wu:*, zmp:*, etc.)
-        if re.match(r'^SI:', symbol, re.IGNORECASE):
-            return False
-        if re.match(r'^zgc:\d+$', symbol, re.IGNORECASE):
-            return False
-        if re.match(r'^wu:', symbol, re.IGNORECASE):
-            return False
-        if re.match(r'^im:', symbol, re.IGNORECASE):
-            return False
-        if re.match(r'^zmp:', symbol, re.IGNORECASE):
-            return False
-
-        # Filter out internal lab/genome annotation naming patterns
-        # Pattern: alphanumeric prefix + underscore + 5+ digits
-        # Examples: D9C73_027734, KOW79_015307, JOB18_020029, F2P81_025073
-        if re.match(r'^[A-Z0-9]+_\d{5,}$', symbol_upper):
-            return False
-
-        # Pattern: PREFIX_LETTER+DIGITS (4+ digits)
-        # Examples: XNOV1_A014589, JOQ06_022217, PECUL_23A059567
-        if re.match(r'^[A-Z0-9]+_[A-Z]*\d{4,}$', symbol_upper):
-            return False
-
-        # Genome annotation style: letter + digits + underscore + digits + G + digits
-        # Examples: D4764_01G0004220, D4764_11G0002770
-        if re.match(r'^[A-Z]\d+_\d+G\d+$', symbol_upper):
-            return False
-
-        # Fish genome annotation patterns
-        # D5F01_LYC10690 style: PREFIX_PREFIXNUMBER
-        if re.match(r'^[A-Z]\d+[A-Z]+_[A-Z]+\d+$', symbol_upper):
-            return False
-
-        # Nfu_g_1_016631 style (Nile tilapia/Nothobranchius furzeri genome)
-        if re.match(r'^[A-Z][A-Z]+_[A-Z]_\d+_\d+$', symbol_upper):
-            return False
-
-        # EXN66_Car014809 style: PREFIX_PrefixNumber
-        if re.match(r'^[A-Z0-9]+_[A-Z][A-Z]+\d{4,}$', symbol_upper):
-            return False
-
-        # DR999_PMT18446, E1301_Tti021464 style
-        if re.match(r'^[A-Z]\d+_[A-Z]+\d+$', symbol_upper):
-            return False
-
-        # LOCUS patterns: MMEN_LOCUS7967, PLEPLA_LOCUS46505
-        if re.match(r'^[A-Z]+_LOCUS\d+$', symbol_upper):
-            return False
-
-        # Medaka/Oryzias latipes: OLA.12830, OLA.95
-        if re.match(r'^OLA\.\d+$', symbol_upper):
-            return False
-
-        # Xenopus: XELAEV_18009728mg
-        if re.match(r'^XELAEV_\d+', symbol_upper):
-            return False
-
-        # Long alphanumeric genome IDs: GSTENG00028376001, GSONMT00077921001
-        if re.match(r'^[A-Z]{3,}\d{8,}$', symbol_upper):
-            return False
-
-        # PPUP9740 style (short prefix + many digits)
-        if re.match(r'^[A-Z]{2,4}\d{4,}$', symbol_upper):
-            return False
-
-        # Accession numbers with version (e.g., CU459095.1, AB123456.2, CABZ01015475.1)
-        if re.match(r'^[A-Z]{1,4}\d{5,}\.\d+$', symbol_upper):
-            return False
-
-        # Filter out automatic paralog/copy numbering patterns with underscores
-        # Examples: LIN1_28, Pol_27, PO21_2, CFDP2_13, G2E3_0, Ppm1l_0, YME1L1_1
-        # Pattern: alphanumeric name (2-10 chars) + underscore + small number (1-2 digits)
-        if re.match(r'^[A-Z0-9]{2,10}_\d{1,2}$', symbol_upper):
-            return False
-
-        # PECUL_23A059567 style: PREFIX_MIXED ending in many digits
-        if re.match(r'^[A-Z]+_[A-Z0-9]*\d{5,}$', symbol_upper):
-            return False
-
-        # Filter out transposon/retrotransposon naming
-#        if re.match(r'^POL_?\d*$', symbol_upper):
-#            return False
-#        if re.match(r'^PO\d+$', symbol_upper):
-#            return False
-#        if re.match(r'^TPASE$', symbol_upper):
-#            return False
-#        if re.match(r'^TY3B-', symbol_upper):
-#            return False
-
-        # Filter out KIAA protein project names (uninformative)
-        if re.match(r'^KIAA\d+$', symbol_upper):
-            return False
-
-        # Filter out Ensembl-style IDs
-        if re.match(r'^ENS[A-Z]+\d+$', symbol_upper):
-            return False
-
-        # Filter out patterns like GRMZM, Glyma, etc. (plant genome IDs)
-        if re.match(r'^GRMZM\d+G\d+$', symbol_upper):
-            return False
-        if re.match(r'^Glyma\.\d+G\d+$', symbol, re.IGNORECASE):
-            return False
-
-        # Filter out chromosome ORF naming (C1orf43, C2orf74, CXorf38, etc.)
-        if re.match(r'^C[0-9X]+ORF\d+$', symbol_upper):
-            return False
-        # Filter out cross-species chromosome ORF naming (e.g., C1H1ORF43 - chicken homolog)
-        if re.match(r'^C\d+H\d+ORF\d+$', symbol_upper):
-            return False
-        # Filter out CUNH#ORF# pattern (zebrafish/other fish referencing human ORFs)
-        if re.match(r'^CUNH\d+ORF\d+$', symbol_upper):
-            return False
-        # Filter out LG#H#ORF# pattern (linkage group + human ORF reference)
-        if re.match(r'^LG\d+H\d+ORF\d+$', symbol_upper):
-            return False
-        # Filter out gene names with C#ORF# suffix (e.g., ZHX1-C8ORF76)
-        if re.search(r'-C\d+ORF\d+$', symbol_upper):
-            return False
-
-        # Filter out generic ORF labels (just "ORF" with optional number)
-        if re.match(r'^ORF\d*$', symbol_upper):
-            return False
-
-        # Filter out RIKEN clone IDs (mouse cDNA project naming)
-        # Pattern: digits + letters + digits + "Rik" (e.g., 4933434E20Rik, 1700010I14Rik)
-        if re.match(r'^\d+[A-Z]+\d+RIK$', symbol_upper):
-            return False
-
-        # Filter out very short symbols that are likely not real (1-2 chars)
-        if len(symbol) < 2:
-            return False
-
-        # Filter out symbols that are mostly numbers (e.g., "123456")
-        if re.match(r'^\d+$', symbol):
-            return False
-
-        return True
-
 
 @dataclass
 class QueryAnnotation:
@@ -367,11 +292,19 @@ class QueryAnnotation:
     consensus_symbol: str = ""
     go_terms: set = field(default_factory=set)
     specific_go_terms: set = field(default_factory=set)
+    name_concordance: float = 0.0
+    symbol_concordance: float = 0.0
+    n_isoforms: int = 0
+    n_cluster_hits: int = 0
+    winning_cluster_names: list = field(default_factory=list)
+    winning_cluster_symbols: list = field(default_factory=list)
+    mean_cluster_bitscore: float = 0.0
+    go_source: str = ""
 
 
-# =============================================================================
-# GO HIERARCHY (for filtering to specific terms)
-# =============================================================================
+#########################
+# GO HIERARCHY STRUCTURE
+#########################
 
 class GOHierarchy:
     """
@@ -528,78 +461,162 @@ class GOHierarchy:
         return {t for t in go_terms if self.namespace.get(t) in target_ns}
 
 
-# =============================================================================
+########################
 # FASTA HEADER PARSING
-# =============================================================================
+########################
 
 def parse_fasta_headers(fasta_file: str) -> tuple:
     """
-    Parse a FASTA file and extract gene IDs from headers.
+    Parse CDS FASTA headers to build transcript-to-gene mapping.
 
-    Extracts the first whitespace-delimited field from each header line
-    (the portion after '>' up to the first space/tab).
-
-    Args:
-        fasta_file: Path to the FASTA file
+    Expects headers where transcript/mRNA ID is the first field and
+    gene ID is in a gene= field. If no gene= field exists, the
+    transcript ID is used as the gene ID (1:1 mapping).
 
     Returns:
-        Tuple of (total_sequences, list of unique gene IDs in order)
+        Tuple of (total_sequences,
+                  all_gene_ids: list of unique gene IDs in first-seen order,
+                  transcript_to_gene: dict of transcript_id -> gene_id,
+                  gene_to_transcripts: dict of gene_id -> list of transcript_ids)
     """
-    logger.info(f"Parsing gene IDs from {fasta_file}")
+    logger.info(f"Parsing CDS FASTA headers from {fasta_file}")
 
-    gene_ids = []
-    seen = set()
+    transcript_to_gene = {}
+    gene_to_transcripts = defaultdict(list)
+    gene_ids_ordered = []
+    gene_ids_seen = set()
     total_sequences = 0
 
     with open(fasta_file) as f:
         for line in f:
             if line.startswith('>'):
                 total_sequences += 1
-                # Extract first field (gene ID) from header
                 header = line[1:].strip()
-                gene_id = header.split()[0] if header else ""
+                fields = header.split()
+                transcript_id = fields[0] if fields else ""
 
-                if gene_id and gene_id not in seen:
-                    gene_ids.append(gene_id)
-                    seen.add(gene_id)
+                # Scan remaining fields for gene=XXXX
+                gene_id = None
+                for fld in fields[1:]:
+                    if fld.startswith('gene='):
+                        gene_id = fld[5:]
+                        break
 
-    logger.info(f"Found {total_sequences:,} sequences, {len(gene_ids):,} unique gene IDs")
-    return total_sequences, gene_ids
+                # If no gene= field, use transcript ID as gene ID
+                if gene_id is None:
+                    gene_id = transcript_id
+
+                transcript_to_gene[transcript_id] = gene_id
+                gene_to_transcripts[gene_id].append(transcript_id)
+
+                if gene_id not in gene_ids_seen:
+                    gene_ids_ordered.append(gene_id)
+                    gene_ids_seen.add(gene_id)
+
+    logger.info(f"Found {total_sequences:,} sequences, "
+                f"{len(gene_ids_ordered):,} unique genes, "
+                f"{len(transcript_to_gene):,} transcripts")
+
+    n_multi = sum(1 for txs in gene_to_transcripts.values() if len(txs) > 1)
+    if n_multi > 0:
+        logger.info(f"  {n_multi:,} genes have multiple transcripts")
+
+    return (total_sequences, gene_ids_ordered,
+            transcript_to_gene, dict(gene_to_transcripts))
 
 
-# =============================================================================
-# BLAST RESULTS PARSING
-# =============================================================================
+####################
+# GO OBO DOWNLOAD
+####################
 
-def parse_blast_results(blast_file: str, top_n: int = 25,
-                        evalue_threshold: float = 1e-5,
-                        prefer_swissprot: bool = True) -> tuple:
+GO_OBO_URL = "https://purl.obolibrary.org/obo/go.obo"
+GO_OBO_MAX_AGE_DAYS = 30
+
+
+def download_go_obo(output_path: str):
     """
-    Parse BLAST/Diamond output (format 6 with stitle) and return top N hits per query.
+    Download the current GO OBO hierarchy file from the Gene Ontology.
 
-    When prefer_swissprot is True, SwissProt (sp|) hits are prioritized over TrEMBL (tr|) hits.
-    This ensures that well-annotated SwissProt entries are used when available, even if
-    TrEMBL hits have slightly higher bitscores. Hits are sorted by: SwissProt first, then
-    by bitscore within each category.
+    Args:
+        output_path: Path to write the downloaded go.obo file.
+    """
+    import urllib.request
+    import urllib.error
+
+    logger.info(f"Downloading GO OBO file from {GO_OBO_URL} ...")
+
+    try:
+        req = urllib.request.Request(GO_OBO_URL, headers={"User-Agent": "GOAnnotate/2.0"})
+        with urllib.request.urlopen(req) as response, open(output_path, 'wb') as f:
+            f.write(response.read())
+    except urllib.error.URLError as e:
+        logger.error(f"Failed to download GO OBO file: {e}")
+        sys.exit(1)
+
+    logger.info(f"GO OBO file saved to: {output_path}")
+
+
+def resolve_go_obo(go_obo_path: str) -> str:
+    """
+    Ensure a valid, up-to-date GO OBO file is available.
+
+    If a path is provided and the file exists and is less than 30 days old,
+    it is used as-is. If the file is older than 30 days, a fresh copy is
+    re-downloaded to the same path. If no path is provided, defaults to
+    ./go.obo in the current working directory.
+
+    Args:
+        go_obo_path: User-supplied path to a go.obo file, or None.
+
+    Returns:
+        Path to the go.obo file to use.
+    """
+    # Default to ./go.obo when no path provided
+    if not go_obo_path:
+        go_obo_path = "go.obo"
+
+    obo = Path(go_obo_path)
+
+    if obo.exists():
+        age_days = (datetime.now() - datetime.fromtimestamp(
+            obo.stat().st_mtime)).days
+        if age_days <= GO_OBO_MAX_AGE_DAYS:
+            logger.info(f"Using existing GO OBO file: {go_obo_path} ({age_days} days old)")
+            return go_obo_path
+        else:
+            logger.warning(f"GO OBO file is {age_days} days old (>{GO_OBO_MAX_AGE_DAYS}); "
+                           f"re-downloading to {go_obo_path}")
+    else:
+        logger.info(f"GO OBO file not found at {go_obo_path}; downloading")
+
+    download_go_obo(str(obo))
+    return str(obo)
+
+
+#########################
+# BLAST RESULTS PARSING
+#########################
+
+def parse_blast_results(blast_file: str,
+                        evalue_threshold: float = 1e-5) -> tuple:
+    """
+    Parse BLAST/Diamond output (format 6 with stitle) keyed by transcript ID.
+
+    Collects all hits per transcript, applying only e-value filtering.
+    No sorting or truncation is performed here.
 
     Args:
         blast_file: Path to BLAST output file
-        top_n: Maximum hits to keep per query
         evalue_threshold: E-value cutoff for filtering hits (default: 1e-5)
-        prefer_swissprot: Prioritize SwissProt hits over TrEMBL (default: True)
 
-    Returns: tuple of (dict of query_id -> list of BlastHit objects, BlastStats)
+    Returns:
+        tuple of (dict of transcript_id -> list of BlastHit, BlastStats)
     """
     logger.info(f"Parsing BLAST results from {blast_file}")
     logger.info(f"E-value threshold: {evalue_threshold}")
 
-    if prefer_swissprot:
-        logger.info("SwissProt hits will be prioritized over TrEMBL hits")
-
-    # Collect ALL hits first (no top_n limit during parsing)
-    # This allows proper sorting before truncation
-    results = defaultdict(list)
-    all_queries_in_file = set()  # Track all unique queries before filtering
+    transcript_hits = defaultdict(list)
+    all_queries_in_file = set()
     stats = BlastStats()
 
     with open(blast_file) as f:
@@ -631,10 +648,10 @@ def parse_blast_results(blast_file: str, top_n: int = 25,
                 send=int(parts[9]),
                 evalue=evalue,
                 bitscore=float(parts[11]),
-                stitle=parts[12] if len(parts) > 12 else ""
+                stitle='\t'.join(parts[12:]) if len(parts) > 12 else ""
             )
 
-            results[hit.query_id].append(hit)
+            transcript_hits[query_id].append(hit)
 
             # Track database source counts
             if hit.is_swissprot:
@@ -646,189 +663,380 @@ def parse_blast_results(blast_file: str, top_n: int = 25,
 
     # Update stats
     stats.queries_in_file = len(all_queries_in_file)
-    stats.queries_after_evalue_filter = len(results)
+    stats.queries_after_evalue_filter = len(transcript_hits)
     stats.hits_after_evalue_filter = stats.swissprot_hits + stats.trembl_hits + stats.other_hits
 
-    # Sort and truncate hits for each query
-    # When prefer_swissprot is True: SwissProt first, then by bitscore
-    # Otherwise: just by bitscore
-    for query_id in results:
-        if prefer_swissprot:
-            # Sort key: (not is_swissprot, -bitscore)
-            # This puts SwissProt first (False < True), then sorts by bitscore descending
-            results[query_id].sort(key=lambda h: (not h.is_swissprot, -h.bitscore))
-        else:
-            # Sort by bitscore only
-            results[query_id].sort(key=lambda h: -h.bitscore)
-        # Truncate to top_n
-        results[query_id] = results[query_id][:top_n]
-
-    logger.info(f"Parsed hits for {len(results)} queries")
-    logger.info(f"  Total hits in file: {stats.total_hits_in_file}")
+    logger.info(f"Parsed hits for {len(transcript_hits):,} transcripts")
+    logger.info(f"  Total hits in file: {stats.total_hits_in_file:,}")
     if stats.hits_filtered_by_evalue > 0:
-        logger.info(f"  Filtered by e-value (>{evalue_threshold}): {stats.hits_filtered_by_evalue}")
-    logger.info(f"  Hits passing e-value filter: {stats.hits_after_evalue_filter}")
-    logger.info(f"  SwissProt (sp|): {stats.swissprot_hits}")
-    logger.info(f"  TrEMBL (tr|): {stats.trembl_hits}")
+        logger.info(f"  Filtered by e-value (>{evalue_threshold}): {stats.hits_filtered_by_evalue:,}")
+    logger.info(f"  Hits passing e-value filter: {stats.hits_after_evalue_filter:,}")
+    logger.info(f"  SwissProt (sp|): {stats.swissprot_hits:,}")
+    logger.info(f"  TrEMBL (tr|): {stats.trembl_hits:,}")
     if stats.other_hits > 0:
-        logger.info(f"  Other: {stats.other_hits}")
+        logger.info(f"  Other: {stats.other_hits:,}")
 
-    # Count retained hits after truncation
-    retained_sp = sum(1 for hits in results.values() for h in hits if h.is_swissprot)
-    retained_tr = sum(1 for hits in results.values() for h in hits if h.is_trembl)
-    logger.info(f"  Retained after top-{top_n} selection: {retained_sp} SwissProt, {retained_tr} TrEMBL")
-
-    return dict(results), stats
+    return dict(transcript_hits), stats
 
 
-# =============================================================================
-# CONSENSUS NAME FINDING
-# =============================================================================
+##########################################
+# PER-TRANSCRIPT FILTERING AND SELECTION 
+##########################################
+
+def filter_and_select_hits(transcript_hits: dict,
+                           bad_name_filter: BadNameFilter,
+                           top_n: int = 30) -> dict:
+    """
+    For each transcript, clean names, filter bad names, apply conditional
+    SwissProt preference, and select top-N hits.
+
+    Returns:
+        dict of transcript_id -> list of (BlastHit, cleaned_name, valid_symbol) tuples
+    """
+    logger.info(f"Filtering and selecting top-{top_n} hits per transcript")
+
+    filtered = {}
+    total_input = 0
+    total_surviving = 0
+    total_after_topn = 0
+
+    for transcript_id, hits in transcript_hits.items():
+        total_input += len(hits)
+
+        # Step 2a: Clean and filter every hit
+        surviving = []
+        for hit in hits:
+            raw_name = hit.gene_name
+            cleaned_name = bad_name_filter.clean_name(raw_name)
+            if cleaned_name is None:
+                continue
+            if bad_name_filter.is_bad_name(cleaned_name):
+                continue
+
+            symbol = hit.gene_symbol
+            if bad_name_filter.is_bad_symbol(symbol):
+                valid_symbol = ""
+            else:
+                valid_symbol = symbol
+
+            surviving.append((hit, cleaned_name, valid_symbol))
+
+        total_surviving += len(surviving)
+
+        if not surviving:
+            continue
+
+        # Step 2b: Sort by bitscore descending
+        surviving.sort(key=lambda t: -t[0].bitscore)
+
+        # Step 2c: Top-N truncation
+        selected = surviving[:top_n]
+        total_after_topn += len(selected)
+        filtered[transcript_id] = selected
+
+    logger.info(f"  Transcripts with surviving hits: {len(filtered):,}")
+    logger.info(f"  Hits: {total_input:,} input -> "
+                f"{total_surviving:,} after filtering -> "
+                f"{total_after_topn:,} after top-{top_n}")
+
+    return filtered
+
+
+###################
+# ISOFORM MERGING
+###################
+
+def merge_hits_by_gene(filtered_transcript_hits: dict,
+                       transcript_to_gene: dict) -> dict:
+    """
+    Merge filtered hits from all transcripts of each gene into a single pool.
+
+    Each hit is tagged with its source transcript ID.
+
+    Returns:
+        dict of gene_id -> list of (BlastHit, cleaned_name, valid_symbol, source_transcript) tuples
+    """
+    gene_hits = defaultdict(list)
+
+    for transcript_id, hits in filtered_transcript_hits.items():
+        gene_id = transcript_to_gene.get(transcript_id, transcript_id)
+        for hit, cleaned_name, valid_symbol in hits:
+            gene_hits[gene_id].append((hit, cleaned_name, valid_symbol, transcript_id))
+
+    return dict(gene_hits)
+
+
+############################
+# CLUSTERING AND SIMILARITY 
+############################
 
 def normalize_gene_name(name: str) -> str:
     """
     Normalize a gene name for comparison purposes.
+    Performs only lowercase and whitespace collapsing.
     """
     if not name:
         return ""
-
-    # Lowercase
     name = name.lower()
-
-    # Remove common suffixes/prefixes
-    name = re.sub(r'\s*-like\s*', ' ', name)
-    name = re.sub(r'\s*homolog\s*', ' ', name)
-    name = re.sub(r'\s*isoform\s*\w*', '', name)
-    name = re.sub(r'\s*variant\s*\w*', '', name)
-    name = re.sub(r'\s*precursor\s*', '', name)
-    name = re.sub(r'\s*fragment\s*', '', name)
-
-    # Remove numbers at end (isoform numbers)
-    name = re.sub(r'\s+\d+$', '', name)
-
-    # Remove extra whitespace
     name = ' '.join(name.split())
-
-    return name.strip()
-
-
-def tokenize_name(name: str) -> set:
-    """Convert a name to a set of tokens for similarity comparison."""
-    # Remove punctuation and split
-    tokens = re.findall(r'\b\w+\b', name.lower())
-    # Remove very short tokens and common words
-    stopwords = {'the', 'a', 'an', 'of', 'and', 'or', 'in', 'to', 'for', 'with', 'by'}
-    return {t for t in tokens if len(t) > 2 and t not in stopwords}
+    return name
 
 
-def name_similarity(name1: str, name2: str) -> float:
+def name_similarity(norm1: str, norm2: str) -> float:
     """
-    Calculate similarity between two gene names using Jaccard index of tokens.
+    Compute name-only similarity between two normalized protein names.
+    Returns max(Jaccard token similarity, SequenceMatcher ratio).
+    Both inputs must already be normalized (lowercase, whitespace-collapsed).
     """
-    tokens1 = tokenize_name(name1)
-    tokens2 = tokenize_name(name2)
+    tokens1 = set(re.findall(r'\w+', norm1))
+    tokens2 = set(re.findall(r'\w+', norm2))
+    if tokens1 and tokens2:
+        jaccard = len(tokens1 & tokens2) / len(tokens1 | tokens2)
+    else:
+        jaccard = 0.0
 
-    if not tokens1 or not tokens2:
-        return 0.0
+    seq_ratio = SequenceMatcher(None, norm1, norm2).ratio()
 
-    intersection = len(tokens1 & tokens2)
-    union = len(tokens1 | tokens2)
-
-    return intersection / union if union > 0 else 0.0
+    return max(jaccard, seq_ratio)
 
 
-def find_consensus_name(names: list, similarity_threshold: float = 0.5,
-                        min_cluster_fraction: float = 0.4,
-                        bitscores: list = None) -> tuple:
+def pair_similarity(name1: str, symbol1: str, name2: str, symbol2: str) -> float:
     """
-    Find the consensus gene name from a list of names.
+    Compute similarity between two hits using both protein name and gene symbol.
+
+    Uses max of Jaccard token similarity and SequenceMatcher ratio on
+    normalized names. When both hits have gene symbols, symbol agreement
+    boosts similarity and symbol disagreement caps it.
+    """
+    norm1 = normalize_gene_name(name1)
+    norm2 = normalize_gene_name(name2)
+
+    name_sim = name_similarity(norm1, norm2)
+
+    # Symbol modulation
+    if symbol1 and symbol2:
+        sym_sim = SequenceMatcher(None, symbol1.lower(), symbol2.lower()).ratio()
+        if sym_sim == 1.0:
+            return min(1.0, name_sim + 0.2)
+        if sym_sim < 0.8:
+            return min(name_sim, 0.3)
+        return name_sim
+
+    return name_sim
+
+
+def cluster_hits_agglomerative(hits_with_names: list,
+                                similarity_threshold: float = 0.5) -> list:
+    """
+    Perform average-linkage agglomerative clustering on hits.
 
     Args:
-        names: List of gene names from BLAST hits
-        similarity_threshold: Minimum similarity to join a cluster
-        min_cluster_fraction: Minimum fraction of hits in consensus cluster
-        bitscores: Optional list of bitscores (same order as names) for weighting
+        hits_with_names: list of (BlastHit, cleaned_name, valid_symbol, source_transcript) tuples
+        similarity_threshold: minimum similarity to merge clusters
 
-    Returns: (consensus_name, indices_of_matching_hits)
+    Returns:
+        list of clusters, where each cluster is a list of indices into hits_with_names
     """
-    if not names:
-        return "", []
+    n = len(hits_with_names)
+    if n == 0:
+        return []
+    if n == 1:
+        return [[0]]
 
-    if len(names) == 1:
-        return names[0], [0]
+    # Compute pairwise similarity matrix
+    sim = [[0.0] * n for _ in range(n)]
+    for i in range(n):
+        for j in range(i + 1, n):
+            s = pair_similarity(
+                hits_with_names[i][1], hits_with_names[i][2],
+                hits_with_names[j][1], hits_with_names[j][2]
+            )
+            sim[i][j] = s
+            sim[j][i] = s
 
-    # Normalize names
-    normalized = [normalize_gene_name(n) for n in names]
+    # Initialize each hit as its own cluster
+    # Use a dict so we can delete merged clusters efficiently
+    clusters = {i: [i] for i in range(n)}
 
-    # Build similarity clusters using simple greedy clustering
-    clusters = []  # list of (representative_name, [indices])
+    while len(clusters) > 1:
+        # Find the pair of clusters with highest average inter-cluster similarity
+        best_sim = -1.0
+        best_pair = None
+        cluster_ids = list(clusters.keys())
 
-    for i, name in enumerate(normalized):
-        if not name:
-            continue
+        for idx_a in range(len(cluster_ids)):
+            for idx_b in range(idx_a + 1, len(cluster_ids)):
+                ca_id = cluster_ids[idx_a]
+                cb_id = cluster_ids[idx_b]
+                ca = clusters[ca_id]
+                cb = clusters[cb_id]
 
-        # Find best matching cluster
-        best_cluster = None
-        best_sim = 0
+                # Average linkage: mean of all pairwise similarities
+                total = sum(sim[i][j] for i in ca for j in cb)
+                avg = total / (len(ca) * len(cb))
 
-        for cluster_idx, (rep_name, indices) in enumerate(clusters):
-            sim = name_similarity(name, rep_name)
-            if sim > best_sim and sim >= similarity_threshold:
-                best_sim = sim
-                best_cluster = cluster_idx
+                if avg > best_sim:
+                    best_sim = avg
+                    best_pair = (ca_id, cb_id)
 
-        if best_cluster is not None:
-            clusters[best_cluster][1].append(i)
-        else:
-            # Start new cluster
-            clusters.append((name, [i]))
+        if best_sim < similarity_threshold:
+            break
 
+        # Merge the two closest clusters
+        a_id, b_id = best_pair
+        clusters[a_id] = clusters[a_id] + clusters[b_id]
+        del clusters[b_id]
+
+    return list(clusters.values())
+
+
+################################
+# CLUSTER SCORING AND SELECTION 
+################################
+
+def select_winning_cluster(clusters: list,
+                           hits_with_names: list) -> tuple:
+    """
+    Score clusters and select the winner. ALWAYS returns the best-scoring
+    cluster. There is no fallback to all hits.
+
+    Score = sum(bitscores) * sqrt(cluster_size) * (1 + 0.1 * (n_isoforms - 1))
+
+    Returns:
+        (winning_cluster_indices: list, cluster_fraction: float)
+
+    cluster_fraction is the fraction of total hits in the winning cluster.
+    This is metadata for logging/output only. It does NOT change which
+    indices are returned.
+    """
     if not clusters:
-        return "", []
+        return [], 0.0
 
-    # Score clusters - use bitscore weighting if available
-    if bitscores and len(bitscores) == len(names):
-        # Weight by sum of bitscores in cluster (better hits = more weight)
-        def cluster_score(cluster):
-            rep_name, indices = cluster
-            total_score = sum(bitscores[i] for i in indices)
-            # Also factor in cluster size to avoid single high-scoring outlier dominating
-            size_factor = len(indices) ** 0.5  # sqrt to balance size vs score
-            return total_score * size_factor
+    total_hits = len(hits_with_names)
+    best_score = -1.0
+    best_cluster = None
 
-        clusters.sort(key=cluster_score, reverse=True)
-    else:
-        # Fall back to largest cluster
-        clusters.sort(key=lambda x: len(x[1]), reverse=True)
+    for cluster in clusters:
+        bitscores_sum = sum(hits_with_names[i][0].bitscore for i in cluster)
+        size = len(cluster)
+        # Count distinct source transcripts in this cluster
+        n_isoforms = len(set(hits_with_names[i][3] for i in cluster))
+        score = bitscores_sum * math.sqrt(size) * (1 + 0.1 * (n_isoforms - 1))
 
-    largest_cluster = clusters[0]
+        if score > best_score:
+            best_score = score
+            best_cluster = cluster
 
-    # Check if it meets the minimum fraction requirement
-    cluster_fraction = len(largest_cluster[1]) / len(names)
+    cluster_fraction = len(best_cluster) / total_hits if total_hits > 0 else 0.0
 
-    if cluster_fraction >= min_cluster_fraction:
-        # Return the original (non-normalized) name from the best hit in cluster
-        # (first one, which has highest bitscore if sorted)
-        best_idx = largest_cluster[1][0]
-        return names[best_idx], largest_cluster[1]
-
-    # No clear consensus
-    return "", []
+    return best_cluster, cluster_fraction
 
 
-# =============================================================================
-# GO TERM MAPPING
-# =============================================================================
+###############################
+# PAIRED NAME/SYMBOL SELECTION 
+###############################
 
-def collect_accessions_from_blast(blast_results: dict) -> set:
+def select_name_and_symbol(winning_indices: list,
+                           hits_with_names: list,
+                           bad_name_filter: BadNameFilter,
+                           uniprot_to_geneid: dict = None,
+                           geneid_to_symbol: dict = None) -> tuple:
     """
-    Collect all possible accession formats from parsed BLAST results.
+    Select the best protein name and gene symbol from the winning cluster.
+
+    Groups hits by gene symbol. Highest-scoring symbol group determines
+    both the gene symbol and the protein name (from that group's best hit).
+
+    Symbol group scoring: mean(bitscores) = sum(bitscores) / count.
+
+    Single-hit exception: a symbol group with only 1 hit can only win
+    if no other symbol group has 2+ hits.
+
+    Returns:
+        (protein_name: str, gene_symbol: str, winning_symbol_indices: list)
+
+    winning_symbol_indices are the indices (into hits_with_names) of the
+    hits in the winning symbol group. These are used downstream for GO
+    term collection and for populating filtered_hits.
+    """
+    if not winning_indices:
+        return "", "", []
+
+    # Group winning_indices by valid_symbol (lowercased), tracking original indices
+    symbol_groups = defaultdict(list)  # sym_key -> list of indices into hits_with_names
+    for idx in winning_indices:
+        hit, cleaned_name, valid_symbol, source_transcript = hits_with_names[idx]
+        key = valid_symbol.lower() if valid_symbol else ""
+        symbol_groups[key].append(idx)
+
+    # Separate no-symbol group
+    no_symbol_indices = symbol_groups.pop("", [])
+
+    if symbol_groups:
+        # Separate into multi-hit (2+ hits) and single-hit (1 hit) groups
+        multi_hit = {s: idxs for s, idxs in symbol_groups.items() if len(idxs) >= 2}
+        single_hit = {s: idxs for s, idxs in symbol_groups.items() if len(idxs) == 1}
+
+        # Score only multi-hit groups if any exist; otherwise score single-hit
+        candidates = multi_hit if multi_hit else single_hit
+
+        # Score = mean(bitscores) = sum(bitscores) / count
+        best_symbol_key = None
+        best_score = -1.0
+        for sym, idxs in candidates.items():
+            score = sum(hits_with_names[i][0].bitscore for i in idxs) / len(idxs)
+            if score > best_score:
+                best_score = score
+                best_symbol_key = sym
+
+        winning_sym_indices = candidates[best_symbol_key]
+
+        # Guard: reject a lone symbol in a large cluster where it
+        # represents less than 10% of hits — likely a misannotation.
+        if not (len(winning_sym_indices) == 1
+                and len(winning_indices) >= 10
+                and len(winning_sym_indices) / len(winning_indices) < 0.1):
+            # Protein name from highest-bitscore hit in winning symbol group
+            best_idx = max(winning_sym_indices, key=lambda i: hits_with_names[i][0].bitscore)
+            protein_name = hits_with_names[best_idx][1]   # cleaned_name
+            gene_symbol = hits_with_names[best_idx][2]    # original-case valid_symbol
+
+            return protein_name, gene_symbol, winning_sym_indices
+
+    # No-symbol path (also reached when single-symbol guard fires above)
+    best_idx = max(winning_indices, key=lambda i: hits_with_names[i][0].bitscore)
+    protein_name = hits_with_names[best_idx][1]
+    gene_symbol = ""
+
+    # NCBI fallback on best hit's accession
+    if uniprot_to_geneid is not None and geneid_to_symbol is not None:
+        accessions = extract_accession(hits_with_names[best_idx][0].subject_id)
+        for acc in accessions:
+            ncbi_symbol = get_ncbi_symbol(acc, uniprot_to_geneid, geneid_to_symbol)
+            if ncbi_symbol and not bad_name_filter.is_bad_symbol(ncbi_symbol):
+                gene_symbol = ncbi_symbol
+                break
+
+    # No symbol groups: entire winning cluster is the symbol group
+    return protein_name, gene_symbol, list(winning_indices)
+
+
+###################
+# GO TERM MAPPING
+###################
+
+def collect_accessions_from_blast(filtered_hits: dict) -> set:
+    """
+    Collect all possible accession formats from filtered BLAST results.
     Used to filter GO mapping loading to only relevant entries.
+
+    Args:
+        filtered_hits: dict of transcript_id -> list of (BlastHit, cleaned_name, valid_symbol) tuples
     """
     accessions = set()
-    for hits in blast_results.values():
-        for hit in hits:
-            accessions.update(extract_accession(hit.subject_id))
+    for hits in filtered_hits.values():
+        for hit_tuple in hits:
+            accessions.update(extract_accession(hit_tuple[0].subject_id))
     return accessions
 
 
@@ -926,20 +1134,20 @@ def get_go_terms_for_hits(hits: list, go_mapping: dict) -> set:
     return go_terms
 
 
-# =============================================================================
+################################
 # NCBI CROSS-REFERENCE LOADING
-# =============================================================================
+################################
 
 def load_ncbi_idmapping(idmapping_file: str, accession_filter: set = None) -> dict:
     """
-    Load UniProt accession to NCBI GeneID mapping from idmapping_selected.tab.
+    Load UniProt accession to NCBI GeneID mapping from idmapping_selected.tsv.
 
     File format (tab-separated):
       Column 1: UniProt accession (e.g., P31946)
       Column 3: NCBI GeneID (e.g., 7529)
 
     Args:
-        idmapping_file: Path to idmapping_selected.tab
+        idmapping_file: Path to idmapping_selected.tsv
         accession_filter: If provided, only load entries for these accessions
 
     Returns: dict of UniProt accession -> NCBI GeneID (as string)
@@ -1055,200 +1263,576 @@ def get_ncbi_symbol(accession: str, uniprot_to_geneid: dict, geneid_to_symbol: d
     return ""
 
 
-# =============================================================================
-# MAIN ANNOTATION PIPELINE
-# =============================================================================
+###########################
+# SQLITE DATABASE LOADING
+###########################
 
-def annotate_queries(blast_results: dict,
-                     go_mapping: dict,
-                     go_hierarchy: GOHierarchy,
-                     bad_name_filter: BadNameFilter,
-                     all_gene_ids: list,
-                     top_n: int = 25,
-                     consensus_threshold: float = 0.5,
-                     min_consensus_fraction: float = 0.4,
-                     namespaces: list = None,
-                     uniprot_to_geneid: dict = None,
-                     geneid_to_symbol: dict = None) -> dict:
+def load_go_mapping_sqlite(db_path: str, accession_filter: set = None) -> dict:
     """
-    Main annotation pipeline for parsed BLAST results.
+    Load accession to GO term mapping from SQLite database.
+
+    Uses a temporary table + JOIN pattern for efficient filtered queries
+    when an accession filter is provided.
 
     Args:
-        blast_results: dict of query_id -> list of BlastHit objects
-        go_mapping: dict of accession -> set of GO IDs
-        go_hierarchy: GOHierarchy object
-        bad_name_filter: BadNameFilter object
-        all_gene_ids: List of all gene IDs from the input FASTA file.
-                      Annotations will be created for all IDs (including those without BLAST hits).
-        top_n: Number of top hits to consider
-        consensus_threshold: Similarity threshold for name clustering
-        min_consensus_fraction: Minimum fraction of hits for consensus
-        namespaces: GO namespaces to include
-        uniprot_to_geneid: Optional dict mapping UniProt accession -> NCBI GeneID
-        geneid_to_symbol: Optional dict mapping NCBI GeneID -> gene symbol
+        db_path: Path to the GOAnnotate SQLite database.
+        accession_filter: If provided, only load entries for these accessions.
 
-    Returns: dict of query_id -> QueryAnnotation
+    Returns: dict of accession -> set of GO IDs
     """
-    logger.info(f"Annotating {len(all_gene_ids):,} genes ({len(blast_results):,} have BLAST hits)...")
+    import sqlite3
 
-    annotations = {}
+    logger.info(f"Loading GO mapping from SQLite: {db_path}")
+    if accession_filter:
+        logger.info(f"Filtering to {len(accession_filter):,} accessions from BLAST results")
 
-    stats = {
-        'total_genes': len(all_gene_ids),
-        'genes_with_blast_hits': 0,
-        'genes_with_good_hits': 0,
-        'genes_with_consensus': 0,
-        'genes_with_go_terms': 0,
-        'total_hits': 0,
-        'hits_after_bad_name_filter': 0,
-        'hits_after_consensus_filter': 0,
-        'symbols_from_uniprot': 0,
-        'symbols_from_ncbi': 0,
-    }
+    conn = sqlite3.connect(db_path)
+    mapping = defaultdict(set)
 
-    # Check if NCBI cross-reference is available
-    ncbi_available = uniprot_to_geneid is not None and geneid_to_symbol is not None
+    if accession_filter:
+        conn.execute("CREATE TEMP TABLE _acc_filter (acc TEXT PRIMARY KEY)")
+        batch = [(acc,) for acc in accession_filter]
+        for i in range(0, len(batch), 100_000):
+            conn.executemany(
+                "INSERT OR IGNORE INTO _acc_filter VALUES (?)",
+                batch[i:i + 100_000]
+            )
+        cursor = conn.execute(
+            "SELECT g.accession, g.go_terms FROM go_mapping g "
+            "INNER JOIN _acc_filter f ON g.accession = f.acc"
+        )
+    else:
+        cursor = conn.execute("SELECT accession, go_terms FROM go_mapping")
 
-    for query_id in all_gene_ids:
-        # Get BLAST hits for this query (may be empty)
-        hits = blast_results.get(query_id, [])
+    for accession, go_terms_raw in cursor:
+        for part in go_terms_raw.split('\t'):
+            for go_term in re.split(r'[;,]', part):
+                go_term = go_term.strip()
+                if go_term.startswith('GO:'):
+                    mapping[accession].add(sys.intern(go_term))
 
-        # Sort hits: Swiss-Prot first, then by bitscore within each category
-        sorted_hits = sorted(hits, key=lambda h: (not h.is_swissprot, -h.bitscore))
-        annot = QueryAnnotation(query_id=query_id, hits=sorted_hits[:top_n])
+    conn.close()
+    logger.info(f"Loaded GO mappings for {len(mapping):,} accessions")
+    return dict(mapping)
 
-        # Track genes with BLAST hits
-        if hits:
-            stats['genes_with_blast_hits'] += 1
-        stats['total_hits'] += len(annot.hits)
 
-        # Step 1: Filter out bad names
-        good_hits = []
-        for hit in annot.hits:
-            if not bad_name_filter.is_bad_name(hit.gene_name):
-                good_hits.append(hit)
+def load_ncbi_idmapping_sqlite(db_path: str, accession_filter: set = None) -> dict:
+    """
+    Load UniProt accession to NCBI GeneID mapping from SQLite database.
 
-        stats['hits_after_bad_name_filter'] += len(good_hits)
+    Uses a temporary table + JOIN pattern for efficient filtered queries
+    when an accession filter is provided.
 
-        if not good_hits:
-            annotations[query_id] = annot
-            continue
+    Args:
+        db_path: Path to the GOAnnotate SQLite database.
+        accession_filter: If provided, only load entries for these accessions.
 
-        stats['genes_with_good_hits'] += 1
+    Returns: dict of UniProt accession -> NCBI GeneID (as string)
+    """
+    import sqlite3
 
-        # Step 2: Find consensus name and filter
-        names = [hit.gene_name for hit in good_hits]
-        bitscores = [hit.bitscore for hit in good_hits]
-        consensus_name, matching_indices = find_consensus_name(
-            names,
-            similarity_threshold=consensus_threshold,
-            min_cluster_fraction=min_consensus_fraction,
-            bitscores=bitscores
+    logger.info(f"Loading UniProt->NCBI GeneID mapping from SQLite: {db_path}")
+    if accession_filter:
+        logger.info(f"Filtering to {len(accession_filter):,} accessions from BLAST results")
+
+    conn = sqlite3.connect(db_path)
+
+    if accession_filter:
+        conn.execute("CREATE TEMP TABLE _acc_filter (acc TEXT PRIMARY KEY)")
+        batch = [(acc,) for acc in accession_filter]
+        for i in range(0, len(batch), 100_000):
+            conn.executemany(
+                "INSERT OR IGNORE INTO _acc_filter VALUES (?)",
+                batch[i:i + 100_000]
+            )
+        cursor = conn.execute(
+            "SELECT m.uniprot_acc, m.gene_id FROM ncbi_idmapping m "
+            "INNER JOIN _acc_filter f ON m.uniprot_acc = f.acc"
+        )
+    else:
+        cursor = conn.execute(
+            "SELECT uniprot_acc, gene_id FROM ncbi_idmapping"
         )
 
-        if consensus_name and matching_indices:
-            annot.consensus_name = consensus_name
-            annot.filtered_hits = [good_hits[i] for i in matching_indices]
-            stats['genes_with_consensus'] += 1
-        else:
-            # No clear consensus - keep all good hits but no consensus name
-            annot.filtered_hits = good_hits
-            # Use the top hit's name as a fallback
-            annot.consensus_name = good_hits[0].gene_name if good_hits else ""
+    mapping = {}
+    for uniprot_acc, gene_id in cursor:
+        mapping[uniprot_acc] = gene_id
 
-        stats['hits_after_consensus_filter'] += len(annot.filtered_hits)
+    conn.close()
+    logger.info(f"Loaded {len(mapping):,} UniProt->GeneID mappings")
+    return mapping
 
-        # Step 2.5: Find consensus gene symbol from filtered hits
-        # Priority: use symbol from the same hit that provided the consensus name
-        # Fallback: use most common valid symbol from the cluster
 
-        # First, try to get symbol from the best hit (the one that provided consensus_name)
-        best_hit_symbol = None
-        if annot.filtered_hits:
-            best_hit = annot.filtered_hits[0]
-            sym = best_hit.gene_symbol
-            if sym and best_hit.is_valid_gene_symbol(sym):
-                best_hit_symbol = sym
+def load_ncbi_geneinfo_sqlite(db_path: str, geneid_filter: set = None) -> dict:
+    """
+    Load NCBI GeneID to gene symbol mapping from SQLite database.
 
-        if best_hit_symbol:
-            # Use symbol from the same hit as the protein name (keeps them coupled)
-            annot.consensus_symbol = best_hit_symbol.lower()
-            stats['symbols_from_uniprot'] += 1
-        else:
-            # Fallback 1: best hit lacks GN= field, use most common symbol from cluster
-            valid_symbols = []
-            for hit in annot.filtered_hits:
-                sym = hit.gene_symbol
-                if sym and hit.is_valid_gene_symbol(sym):
-                    valid_symbols.append(sym)
+    Uses a temporary table + JOIN pattern for efficient filtered queries
+    when a GeneID filter is provided.
 
-            if valid_symbols:
-                # Find most common symbol (assign even if only 1 exists)
-                symbol_counts = Counter(valid_symbols)
-                most_common_symbol, count = symbol_counts.most_common(1)[0]
-                annot.consensus_symbol = most_common_symbol.lower()
-                stats['symbols_from_uniprot'] += 1
+    Args:
+        db_path: Path to the GOAnnotate SQLite database.
+        geneid_filter: If provided, only load entries for these GeneIDs.
 
-            # Fallback 2: No UniProt symbol found, try NCBI cross-reference
-            elif ncbi_available and annot.filtered_hits:
-                # Try to get symbol from NCBI for the best hit
-                best_hit = annot.filtered_hits[0]
-                # Extract UniProt accession from subject_id
-                accessions = extract_accession(best_hit.subject_id)
-                for acc in accessions:
-                    ncbi_symbol = get_ncbi_symbol(acc, uniprot_to_geneid, geneid_to_symbol)
-                    # Validate NCBI symbol using same filtering as UniProt symbols
-                    if ncbi_symbol and best_hit.is_valid_gene_symbol(ncbi_symbol):
-                        annot.consensus_symbol = ncbi_symbol.lower()
-                        stats['symbols_from_ncbi'] += 1
-                        break
+    Returns: dict of GeneID (as string) -> gene symbol
+    """
+    import sqlite3
 
-        # Step 3: Get GO terms from top 5 highest bitscore hits in consensus cluster
-        top_hits_for_go = sorted(annot.filtered_hits, key=lambda h: h.bitscore, reverse=True)[:5]
-        go_terms = get_go_terms_for_hits(top_hits_for_go, go_mapping)
+    logger.info(f"Loading NCBI GeneID->Symbol mapping from SQLite: {db_path}")
+    if geneid_filter:
+        logger.info(f"Filtering to {len(geneid_filter):,} GeneIDs")
+
+    conn = sqlite3.connect(db_path)
+
+    if geneid_filter:
+        conn.execute("CREATE TEMP TABLE _gid_filter (gid TEXT PRIMARY KEY)")
+        batch = [(gid,) for gid in geneid_filter]
+        for i in range(0, len(batch), 100_000):
+            conn.executemany(
+                "INSERT OR IGNORE INTO _gid_filter VALUES (?)",
+                batch[i:i + 100_000]
+            )
+        cursor = conn.execute(
+            "SELECT g.gene_id, g.symbol FROM ncbi_geneinfo g "
+            "INNER JOIN _gid_filter f ON g.gene_id = f.gid"
+        )
+    else:
+        cursor = conn.execute(
+            "SELECT gene_id, symbol FROM ncbi_geneinfo"
+        )
+
+    mapping = {}
+    for gene_id, symbol in cursor:
+        mapping[gene_id] = symbol
+
+    conn.close()
+    logger.info(f"Loaded {len(mapping):,} GeneID->Symbol mappings")
+    return mapping
+
+
+###########################
+# MAIN ANNOTATION PIPELINE
+###########################
+
+# Module-level globals for worker processes (set by _init_worker)
+_worker_go_mapping = None
+_worker_go_hierarchy = None
+_worker_bad_name_filter = None
+_worker_uniprot_to_geneid = None
+_worker_geneid_to_symbol = None
+
+
+def _init_worker(go_mapping, go_hierarchy, bad_name_filter,
+                 uniprot_to_geneid, geneid_to_symbol):
+    """
+    Initialize shared read-only data in each worker process.
+    Called once per worker when the pool is created.
+    """
+    global _worker_go_mapping, _worker_go_hierarchy, _worker_bad_name_filter
+    global _worker_uniprot_to_geneid, _worker_geneid_to_symbol
+    _worker_go_mapping = go_mapping
+    _worker_go_hierarchy = go_hierarchy
+    _worker_bad_name_filter = bad_name_filter
+    _worker_uniprot_to_geneid = uniprot_to_geneid
+    _worker_geneid_to_symbol = geneid_to_symbol
+
+
+def annotate_single_gene(gene_id: str,
+                         hits_with_names: list,
+                         consensus_threshold: float,
+                         namespaces: list) -> tuple:
+    """
+    Run the full annotation pipeline for a single gene.
+
+    This function is called by worker processes in the multiprocessing pool.
+    It accesses shared read-only data via module-level globals set by
+    _init_worker().
+
+    Args:
+        gene_id: The gene identifier.
+        hits_with_names: List of (BlastHit, cleaned_name, valid_symbol,
+                         source_transcript) tuples for this gene.
+        consensus_threshold: Similarity threshold for clustering.
+        namespaces: GO namespace filter list, or None.
+
+    Returns:
+        Tuple of (gene_id, result_dict) where result_dict is a plain dict
+        containing all annotation fields and statistics flags.
+    """
+    try:
+        go_mapping = _worker_go_mapping
+        go_hierarchy = _worker_go_hierarchy
+        bad_name_filter = _worker_bad_name_filter
+        uniprot_to_geneid = _worker_uniprot_to_geneid
+        geneid_to_symbol = _worker_geneid_to_symbol
+
+        result = {
+            'hits': [],
+            'filtered_hits': [],
+            'consensus_name': '',
+            'consensus_symbol': '',
+            'go_terms': set(),
+            'specific_go_terms': set(),
+            'name_concordance': 0.0,
+            'symbol_concordance': 0.0,
+            'cluster_fraction': 0.0,
+            'had_hits': False,
+            'had_protein_name': False,
+            'had_symbol': False,
+            'symbol_source': '',
+            'n_isoforms': 0,
+            'n_cluster_hits': 0,
+            'winning_cluster_names': [],
+            'winning_cluster_symbols': [],
+            'mean_cluster_bitscore': 0.0,
+            'go_source': '',
+        }
+
+        if not hits_with_names:
+            return (gene_id, result)
+
+        result['had_hits'] = True
+        result['n_isoforms'] = len(set(t[3] for t in hits_with_names))
+
+        # Store all merged hits sorted by bitscore
+        result['hits'] = sorted(
+            [t[0] for t in hits_with_names],
+            key=lambda h: h.bitscore, reverse=True
+        )
+
+        # Phase 4: Cluster
+        clusters = cluster_hits_agglomerative(
+            hits_with_names,
+            similarity_threshold=consensus_threshold
+        )
+
+        # Phase 5: Select winning cluster
+        winning_indices, cluster_fraction = select_winning_cluster(
+            clusters, hits_with_names
+        )
+        result['cluster_fraction'] = cluster_fraction
+        result['n_cluster_hits'] = len(winning_indices)
+        result['winning_cluster_names'] = [
+            hits_with_names[i][1] for i in winning_indices
+        ]
+        result['winning_cluster_symbols'] = [
+            hits_with_names[i][2] for i in winning_indices if hits_with_names[i][2]
+        ]
+        if winning_indices:
+            result['mean_cluster_bitscore'] = (
+                sum(hits_with_names[i][0].bitscore for i in winning_indices)
+                / len(winning_indices)
+            )
+
+        # Phase 6: Select name and symbol
+        ncbi_available = uniprot_to_geneid is not None and geneid_to_symbol is not None
+        protein_name, gene_symbol, winning_symbol_indices = select_name_and_symbol(
+            winning_indices, hits_with_names,
+            bad_name_filter,
+            uniprot_to_geneid=uniprot_to_geneid if ncbi_available else None,
+            geneid_to_symbol=geneid_to_symbol if ncbi_available else None
+        )
+
+        result['consensus_name'] = protein_name
+        result['consensus_symbol'] = gene_symbol.lower() if gene_symbol else ""
+
+        if protein_name:
+            result['had_protein_name'] = True
+        if gene_symbol:
+            result['had_symbol'] = True
+            # Determine symbol source
+            if any(hits_with_names[i][2] for i in winning_indices):
+                result['symbol_source'] = 'uniprot'
+            else:
+                result['symbol_source'] = 'ncbi'
+
+        # Concordance: compare final name/symbol against full merged hit pool
+        if protein_name and hits_with_names:
+            final_name_norm = normalize_gene_name(protein_name)
+            name_match_count = sum(
+                1 for _h, cn, _vs, _st in hits_with_names
+                if name_similarity(final_name_norm, normalize_gene_name(cn)) >= consensus_threshold
+            )
+            result['name_concordance'] = name_match_count / len(hits_with_names)
+
+        if gene_symbol and hits_with_names:
+            final_sym_lower = gene_symbol.lower()
+            symbol_match_count = sum(
+                1 for _h, _cn, vs, _st in hits_with_names
+                if vs and vs.lower() == final_sym_lower
+            )
+            result['symbol_concordance'] = symbol_match_count / len(hits_with_names)
+
+        # Set filtered_hits from winning symbol group (sorted by bitscore)
+        result['filtered_hits'] = sorted(
+            [hits_with_names[i][0] for i in winning_symbol_indices],
+            key=lambda h: h.bitscore, reverse=True
+        )
+
+        # Phase 7: GO terms from winning symbol group (top 5 by bitscore)
+        go_source_indices = sorted(
+            winning_symbol_indices,
+            key=lambda i: hits_with_names[i][0].bitscore, reverse=True
+        )[:5]
+        go_hits = [hits_with_names[i][0] for i in go_source_indices]
+        go_terms = get_go_terms_for_hits(go_hits, go_mapping)
+        go_source = "cluster_top5" if go_terms else ""
+
+        # Phase 7b: SwissProt GO supplement
+        winning_name_norm = normalize_gene_name(protein_name) if protein_name else ""
+        winning_sym_lower = gene_symbol.lower() if gene_symbol else ""
+        go_source_set = set(go_source_indices)
+
+        for idx in winning_indices:
+            if idx in go_source_set:
+                continue
+            hit, cleaned_name, symbol, _src = hits_with_names[idx]
+            if not hit.is_swissprot:
+                continue
+            sym_match = (winning_sym_lower and symbol
+                         and symbol.lower() == winning_sym_lower)
+            name_match = False
+            if not sym_match and winning_name_norm and cleaned_name:
+                name_norm = normalize_gene_name(cleaned_name)
+                sim = pair_similarity(winning_name_norm, "", name_norm, "")
+                name_match = sim >= consensus_threshold
+            if sym_match or name_match:
+                sp_terms = get_go_terms_for_hits([hit], go_mapping)
+                if sp_terms:
+                    new_terms = sp_terms - go_terms if go_terms else sp_terms
+                    if new_terms:
+                        go_source = "cluster_top5+swissprot_supplement"
+                    go_terms = go_terms | sp_terms if go_terms else sp_terms
+
+        result['go_source'] = go_source
 
         # Filter by namespace if specified
         if namespaces and go_terms:
             go_terms = go_hierarchy.filter_by_namespace(go_terms, namespaces)
 
-        annot.go_terms = go_terms
+        result['go_terms'] = go_terms
 
         if go_terms:
+            result['specific_go_terms'] = go_hierarchy.filter_to_specific(go_terms)
+
+        return (gene_id, result)
+
+    except Exception as e:
+        raise RuntimeError(f"Error annotating gene {gene_id}: {e}") from e
+
+
+def annotate_queries(filtered_transcript_hits: dict,
+                     transcript_to_gene: dict,
+                     gene_to_transcripts: dict,
+                     go_mapping: dict,
+                     go_hierarchy: GOHierarchy,
+                     bad_name_filter: BadNameFilter,
+                     all_gene_ids: list,
+                     consensus_threshold: float = 0.5,
+                     namespaces: list = None,
+                     uniprot_to_geneid: dict = None,
+                     geneid_to_symbol: dict = None,
+                     threads: int = None) -> dict:
+    """
+    Main annotation pipeline: merge isoform hits, cluster, select name/symbol,
+    collect GO terms. Per-gene annotation runs in parallel via multiprocessing.
+
+    For each gene:
+      1. Merge hits across isoforms (Phase 3)
+      2. Cluster hits by name/symbol similarity (Phase 4)
+      3. Score and select winning cluster (Phase 5)
+      4. Select protein name and gene symbol (Phase 6)
+      5. Set filtered_hits from winning symbol group (Phase 6 output)
+      6. Collect GO terms from winning symbol group (Phase 7)
+
+    After all genes: symbol propagation (Phase 8), concordance recalculation,
+    and statistics logging (sequential).
+
+    Returns: dict of gene_id -> QueryAnnotation
+    """
+    # Phase 3: Merge hits by gene
+    gene_hits = merge_hits_by_gene(filtered_transcript_hits, transcript_to_gene)
+
+    # Determine worker count
+    n_workers = threads if threads is not None else os.cpu_count()
+    n_genes_with_hits = sum(1 for gid in all_gene_ids if gid in gene_hits)
+    n_workers = min(n_workers, max(1, n_genes_with_hits))
+
+    logger.info(f"Annotating {len(all_gene_ids):,} genes "
+                f"({n_genes_with_hits:,} have filtered hits) "
+                f"using {n_workers} workers...")
+
+    # Build task list
+    tasks = []
+    for gene_id in all_gene_ids:
+        hits = gene_hits.get(gene_id, [])
+        tasks.append((gene_id, hits, consensus_threshold, namespaces))
+
+    # Run per-gene annotation
+    start_time = time.time()
+
+    if n_workers == 1:
+        # Single-process mode: avoid multiprocessing overhead
+        _init_worker(go_mapping, go_hierarchy, bad_name_filter,
+                     uniprot_to_geneid, geneid_to_symbol)
+        results = [annotate_single_gene(*task) for task in tasks]
+    else:
+        chunksize = max(1, len(tasks) // (n_workers * 4))
+        with multiprocessing.Pool(
+            processes=n_workers,
+            initializer=_init_worker,
+            initargs=(go_mapping, go_hierarchy, bad_name_filter,
+                      uniprot_to_geneid, geneid_to_symbol)
+        ) as pool:
+            results = pool.starmap(annotate_single_gene, tasks,
+                                   chunksize=chunksize)
+
+    elapsed = time.time() - start_time
+    genes_per_sec = len(all_gene_ids) / elapsed if elapsed > 0 else 0
+    logger.info(f"  Per-gene annotation completed in {elapsed:.1f}s "
+                f"({genes_per_sec:.0f} genes/sec)")
+
+    # Collect results into annotations dict and accumulate statistics
+    annotations = {}
+    cluster_fractions = []
+    stats = {
+        'total_genes': len(all_gene_ids),
+        'genes_with_hits': 0,
+        'genes_with_protein_name': 0,
+        'genes_with_go_terms': 0,
+        'symbols_from_uniprot': 0,
+        'symbols_from_ncbi': 0,
+    }
+
+    for gene_id, result_dict in results:
+        annot = QueryAnnotation(query_id=gene_id)
+        annot.hits = result_dict['hits']
+        annot.filtered_hits = result_dict['filtered_hits']
+        annot.consensus_name = result_dict['consensus_name']
+        annot.consensus_symbol = result_dict['consensus_symbol']
+        annot.go_terms = result_dict['go_terms']
+        annot.specific_go_terms = result_dict['specific_go_terms']
+        annot.name_concordance = result_dict['name_concordance']
+        annot.symbol_concordance = result_dict['symbol_concordance']
+        annot.n_isoforms = result_dict['n_isoforms']
+        annot.n_cluster_hits = result_dict['n_cluster_hits']
+        annot.winning_cluster_names = result_dict['winning_cluster_names']
+        annot.winning_cluster_symbols = result_dict['winning_cluster_symbols']
+        annot.mean_cluster_bitscore = result_dict['mean_cluster_bitscore']
+        annot.go_source = result_dict['go_source']
+        annotations[gene_id] = annot
+
+        if result_dict['had_hits']:
+            stats['genes_with_hits'] += 1
+        if result_dict['had_protein_name']:
+            stats['genes_with_protein_name'] += 1
+        if result_dict['had_symbol']:
+            if result_dict['symbol_source'] == 'uniprot':
+                stats['symbols_from_uniprot'] += 1
+            elif result_dict['symbol_source'] == 'ncbi':
+                stats['symbols_from_ncbi'] += 1
+        if result_dict['go_terms']:
             stats['genes_with_go_terms'] += 1
+        if result_dict['cluster_fraction'] > 0:
+            cluster_fractions.append(result_dict['cluster_fraction'])
 
-            # Step 4: Filter to most specific terms
-            annot.specific_go_terms = go_hierarchy.filter_to_specific(go_terms)
+    # Phase 8: Symbol propagation
+    # For genes sharing an identical normalized protein name, propagate
+    # the most common symbol to genes that lack one.
+    name_to_genes = defaultdict(list)
+    for gene_id, annot in annotations.items():
+        if annot.consensus_name:
+            norm = normalize_gene_name(annot.consensus_name)
+            name_to_genes[norm].append(gene_id)
 
-        annotations[query_id] = annot
+    symbols_propagated = 0
+    propagated_gene_ids = []
+    for norm_name, gene_id_list in name_to_genes.items():
+        if len(gene_id_list) < 2:
+            continue
+        existing_symbols = [annotations[gid].consensus_symbol
+                            for gid in gene_id_list
+                            if annotations[gid].consensus_symbol]
+        if not existing_symbols:
+            continue
+        genes_without = [gid for gid in gene_id_list
+                         if not annotations[gid].consensus_symbol]
+        if not genes_without:
+            continue
+        best_symbol = Counter(existing_symbols).most_common(1)[0][0]
+        for gid in genes_without:
+            annotations[gid].consensus_symbol = best_symbol
+            symbols_propagated += 1
+            propagated_gene_ids.append(gid)
+
+    stats['symbols_from_propagation'] = symbols_propagated
+    if symbols_propagated > 0:
+        logger.info(f"  Symbol propagation: {symbols_propagated:,} genes received symbols "
+                    f"from genes with identical protein names")
+
+    # Recalculate symbol_concordance for genes that received propagated symbols
+    for gid in propagated_gene_ids:
+        annot = annotations[gid]
+        hits_pool = gene_hits.get(gid, [])
+        if annot.consensus_symbol and hits_pool:
+            final_sym_lower = annot.consensus_symbol.lower()
+            match_count = sum(1 for _h, _cn, vs, _st in hits_pool
+                              if vs and vs.lower() == final_sym_lower)
+            annot.symbol_concordance = match_count / len(hits_pool)
 
     # Log statistics
+    total = max(1, stats['total_genes'])
     logger.info("Annotation statistics:")
     logger.info(f"  Total genes: {stats['total_genes']:,}")
-    logger.info(f"  Genes with BLAST hits: {stats['genes_with_blast_hits']:,} "
-                f"({100*stats['genes_with_blast_hits']/stats['total_genes']:.1f}%)")
-    logger.info(f"  Genes with good hits (after bad name filter): {stats['genes_with_good_hits']:,} "
-                f"({100*stats['genes_with_good_hits']/stats['total_genes']:.1f}%)")
-    logger.info(f"  Genes with consensus name: {stats['genes_with_consensus']:,} "
-                f"({100*stats['genes_with_consensus']/stats['total_genes']:.1f}%)")
-    total_symbols = stats['symbols_from_uniprot'] + stats['symbols_from_ncbi']
+    logger.info(f"  Genes with filtered hits: {stats['genes_with_hits']:,} "
+                f"({100*stats['genes_with_hits']/total:.1f}%)")
+    logger.info(f"  Genes with protein name: {stats['genes_with_protein_name']:,} "
+                f"({100*stats['genes_with_protein_name']/total:.1f}%)")
+    total_symbols = (stats['symbols_from_uniprot'] + stats['symbols_from_ncbi']
+                     + stats['symbols_from_propagation'])
     logger.info(f"  Genes with gene symbol: {total_symbols:,} "
-                f"({100*total_symbols/stats['total_genes']:.1f}%)")
+                f"({100*total_symbols/total:.1f}%)")
     if stats['symbols_from_uniprot'] > 0:
         logger.info(f"    - From UniProt GN= field: {stats['symbols_from_uniprot']:,}")
     if stats['symbols_from_ncbi'] > 0:
         logger.info(f"    - From NCBI cross-reference: {stats['symbols_from_ncbi']:,}")
+    if stats['symbols_from_propagation'] > 0:
+        logger.info(f"    - From name-based propagation: {stats['symbols_from_propagation']:,}")
     logger.info(f"  Genes with GO terms: {stats['genes_with_go_terms']:,} "
-                f"({100*stats['genes_with_go_terms']/stats['total_genes']:.1f}%)")
-    logger.info(f"  Total hits: {stats['total_hits']:,}")
-    logger.info(f"  Hits after bad name filter: {stats['hits_after_bad_name_filter']:,}")
-    logger.info(f"  Hits after consensus filter: {stats['hits_after_consensus_filter']:,}")
+                f"({100*stats['genes_with_go_terms']/total:.1f}%)")
+
+    # Log cluster fraction statistics
+    if cluster_fractions:
+        mean_frac = sum(cluster_fractions) / len(cluster_fractions)
+        sorted_fracs = sorted(cluster_fractions)
+        n = len(sorted_fracs)
+        if n % 2 == 0:
+            median_frac = (sorted_fracs[n // 2 - 1] + sorted_fracs[n // 2]) / 2
+        else:
+            median_frac = sorted_fracs[n // 2]
+        logger.info(f"  Winning cluster fraction: mean={mean_frac:.2f}, "
+                    f"median={median_frac:.2f}, "
+                    f"min={sorted_fracs[0]:.2f}, max={sorted_fracs[-1]:.2f}")
+
+    # Log concordance statistics
+    name_concordances = [a.name_concordance for a in annotations.values() if a.consensus_name]
+    symbol_concordances = [a.symbol_concordance for a in annotations.values() if a.consensus_symbol]
+
+    if name_concordances:
+        logger.info(f"  Name concordance: mean={statistics.mean(name_concordances):.2f}, "
+                    f"median={statistics.median(name_concordances):.2f}, "
+                    f"min={min(name_concordances):.2f}, max={max(name_concordances):.2f}")
+    if symbol_concordances:
+        logger.info(f"  Symbol concordance: mean={statistics.mean(symbol_concordances):.2f}, "
+                    f"median={statistics.median(symbol_concordances):.2f}, "
+                    f"min={min(symbol_concordances):.2f}, max={max(symbol_concordances):.2f}")
 
     return annotations
 
 
-# =============================================================================
+####################
 # OUTPUT FUNCTIONS
-# =============================================================================
+####################
 
 def strip_uniprot_prefix(protein_name: str) -> str:
     """
@@ -1278,15 +1862,18 @@ def strip_uniprot_prefix(protein_name: str) -> str:
     return protein_name
 
 
-def write_annotated_fasta(input_fasta: str, annotations: dict, output_file: Path):
+def write_annotated_fasta(input_fasta: str, annotations: dict, output_file: Path,
+                          transcript_to_gene: dict = None):
     """
     Write an annotated FASTA file with Name= and product= fields added to headers.
     Replaces any existing Name= or product= fields in the header.
 
     Args:
         input_fasta: Path to the original FASTA file
-        annotations: dict of query_id -> QueryAnnotation
+        annotations: dict of gene_id -> QueryAnnotation
         output_file: Path to write the annotated FASTA
+        transcript_to_gene: Optional mapping from transcript ID to gene ID.
+                            If provided, looks up annotation by gene ID.
     """
     logger.info(f"Writing annotated FASTA to {output_file}")
 
@@ -1298,8 +1885,14 @@ def write_annotated_fasta(input_fasta: str, annotations: dict, output_file: Path
             if line.startswith('>'):
                 total_count += 1
                 header = line[1:].rstrip()
-                # Extract gene ID (first field)
-                gene_id = header.split()[0] if header else ""
+                # Extract first field from header
+                first_field = header.split()[0] if header else ""
+
+                # Resolve gene ID via transcript-to-gene mapping if available
+                if transcript_to_gene:
+                    gene_id = transcript_to_gene.get(first_field, first_field)
+                else:
+                    gene_id = first_field
 
                 # Look up annotation
                 annot = annotations.get(gene_id)
@@ -1308,12 +1901,9 @@ def write_annotated_fasta(input_fasta: str, annotations: dict, output_file: Path
                     annotated_count += 1
 
                     # Remove any existing Name= or product= fields from header
-                    header_cleaned = re.sub(r'\s+Name=\S+', '', header)
-                    header_cleaned = re.sub(r'\s+product=[^\s]+(?:\s+[^\s=]+)*(?=\s+\w+=|$)', '', header_cleaned)
-                    # Simpler approach: remove Name=value and product=value patterns
-                    header_cleaned = re.sub(r'\bName=\S+\s*', '', header_cleaned)
-                    header_cleaned = re.sub(r'\bproduct=\S+\s*', '', header_cleaned)
-                    header_cleaned = header_cleaned.strip()
+                    header_cleaned = re.sub(r'\bName=\S+\s*', '', header)
+                    header_cleaned = re.sub(r'\bproduct=.*?(?=\s+\w+=|$)', '', header_cleaned)
+                    header_cleaned = re.sub(r'  +', ' ', header_cleaned).strip()
 
                     # Build annotation fields
                     fields = []
@@ -1335,9 +1925,31 @@ def write_annotated_fasta(input_fasta: str, annotations: dict, output_file: Path
     logger.info(f"Annotated {annotated_count:,} of {total_count:,} sequences in FASTA")
 
 
+def _gff3_encode_value(value: str) -> str:
+    """
+    Percent-encode a GFF3 attribute value per the GFF3 specification.
+
+    Characters requiring encoding: tab, newline, carriage return, %, ;, =, &, comma.
+    Spaces are encoded as %20.
+    """
+    return urllib.parse.quote(value, safe='abcdefghijklmnopqrstuvwxyz'
+                              'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
+                              '-._~:@!$\'()*+/')
+
+
 def write_annotated_gff3(input_gff: str, annotations: dict, output_file: Path):
     """
-    Write an annotated GFF3 file with Name= and product= attributes added.
+    Write an annotated GFF3 file with cleaned attributes and functional
+    annotations following GFF3 conventions.
+
+    Original feature IDs and Parent references are preserved. Custom
+    attributes (gene_id, transcript_id) are removed from the output.
+
+    Attributes per feature type:
+        gene:  ID, Name, product
+        mRNA:  ID, Parent, Name, product
+        exon, CDS, five_prime_UTR, three_prime_UTR:  ID, Parent
+        start_codon, stop_codon, intron: Parent only
 
     Args:
         input_gff: Path to the original GFF3 file
@@ -1346,8 +1958,13 @@ def write_annotated_gff3(input_gff: str, annotations: dict, output_file: Path):
     """
     logger.info(f"Writing annotated GFF3 to {output_file}")
 
-    annotated_count = 0
-    feature_count = 0
+    # Sub-features that keep their ID
+    SUB_ID_TYPES = {'exon', 'CDS', 'five_prime_UTR', 'three_prime_UTR'}
+    # Sub-features that only receive Parent (no ID)
+    PARENT_ONLY_TYPES = {'start_codon', 'stop_codon', 'intron'}
+
+    annotated_genes = 0
+    gene_count = 0
 
     with open(input_gff) as fin, open(output_file, 'w') as fout:
         for line in fin:
@@ -1367,136 +1984,172 @@ def write_annotated_gff3(input_gff: str, annotations: dict, output_file: Path):
                 fout.write(line + '\n')
                 continue
 
-            feature_count += 1
+            feature_type = parts[2]
             attributes = parts[8]
 
-            # Extract ID from attributes
-            gene_id = None
-            id_match = re.search(r'ID=([^;]+)', attributes)
-            if id_match:
-                gene_id = id_match.group(1)
+            # Parse attributes into dict for lookup
+            attr_dict = {}
+            for attr in attributes.split(';'):
+                attr = attr.strip()
+                if attr and '=' in attr:
+                    key, val = attr.split('=', 1)
+                    attr_dict[key] = val
 
-            # Look up annotation
-            annot = annotations.get(gene_id) if gene_id else None
+            old_id = attr_dict.get('ID')
+            old_parent = attr_dict.get('Parent')
 
-            if annot and (annot.consensus_symbol or annot.consensus_name):
-                annotated_count += 1
-                # Build new attributes
-                new_attrs = []
+            # Determine gene_id for annotation lookup (feature-type-aware)
+            if feature_type == 'gene':
+                lookup_id = attr_dict.get('gene_id') or old_id
+            elif feature_type == 'mRNA':
+                # mRNA Parent= points to the gene ID
+                lookup_id = old_parent or attr_dict.get('gene_id')
+            else:
+                lookup_id = attr_dict.get('gene_id')
 
-                # Parse existing attributes
-                for attr in attributes.split(';'):
-                    attr = attr.strip()
-                    if not attr:
-                        continue
-                    # Skip existing Name and product attributes (we'll replace them)
-                    if attr.startswith('Name=') or attr.startswith('product='):
-                        continue
-                    new_attrs.append(attr)
+            annot = annotations.get(lookup_id) if lookup_id else None
 
-                # Add our annotation attributes
-                if annot.consensus_symbol:
-                    new_attrs.append(f"Name={annot.consensus_symbol}")
-                if annot.consensus_name:
-                    # Strip UniProt ID prefix and replace spaces with underscores for GFF3
-                    product = strip_uniprot_prefix(annot.consensus_name)
-                    product = product.replace(' ', '_')
-                    new_attrs.append(f"product={product}")
+            # Build new column-9 attributes based on feature type
+            new_attrs = []
 
-                parts[8] = ';'.join(new_attrs)
+            if feature_type == 'gene':
+                gene_count += 1
+                new_attrs.append(f"ID={old_id}")
 
+                if annot:
+                    if annot.consensus_symbol:
+                        new_attrs.append(f"Name={annot.consensus_symbol}")
+                    if annot.consensus_name:
+                        product = strip_uniprot_prefix(annot.consensus_name)
+                        new_attrs.append(f"product={product}")
+                    if annot.consensus_symbol or annot.consensus_name:
+                        annotated_genes += 1
+
+            elif feature_type == 'mRNA':
+                new_attrs.append(f"ID={old_id}")
+                if old_parent:
+                    new_attrs.append(f"Parent={old_parent}")
+
+                if annot:
+                    if annot.consensus_symbol:
+                        new_attrs.append(f"Name={annot.consensus_symbol}")
+                    if annot.consensus_name:
+                        product = strip_uniprot_prefix(annot.consensus_name)
+                        new_attrs.append(f"product={product}")
+
+            elif feature_type in SUB_ID_TYPES:
+                if old_id:
+                    new_attrs.append(f"ID={old_id}")
+                if old_parent:
+                    new_attrs.append(f"Parent={old_parent}")
+
+            elif feature_type in PARENT_ONLY_TYPES:
+                if old_parent:
+                    new_attrs.append(f"Parent={old_parent}")
+
+            else:
+                # Unknown feature type: keep original attributes,
+                # remove gene_id/transcript_id
+                if old_id:
+                    new_attrs.append(f"ID={old_id}")
+                if old_parent:
+                    new_attrs.append(f"Parent={old_parent}")
+                for key, val in attr_dict.items():
+                    if key not in ('ID', 'Parent', 'gene_id', 'transcript_id'):
+                        new_attrs.append(f"{key}={val}")
+
+            parts[8] = ';'.join(new_attrs) if new_attrs else '.'
             fout.write('\t'.join(parts) + '\n')
 
-    logger.info(f"Annotated {annotated_count:,} of {feature_count:,} features in GFF3")
+    logger.info(f"Annotated {annotated_genes:,} of {gene_count:,} genes in GFF3")
 
 
 def write_annotation_results(annotations: dict,
-                             go_hierarchy: GOHierarchy,
                              output_dir: Path,
                              prefix: str,
                              input_fasta: str = None,
                              input_gff: str = None,
                              args: argparse.Namespace = None,
                              blast_stats: BlastStats = None,
-                             total_sequences: int = None):
+                             total_sequences: int = None,
+                             transcript_to_gene: dict = None):
     """
     Write annotation results to various output files.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1. Main annotation table
-    main_file = output_dir / f"{prefix}_annotations.tsv"
-    logger.info(f"Writing main annotations to {main_file}")
+    # 1. Gene-to-symbol mapping
+    symbol_file = output_dir / f"{prefix}_gene2symbol.tsv"
+    logger.info(f"Writing gene2symbol to {symbol_file}")
 
-    with open(main_file, 'w') as f:
-        f.write("query_id\tgene_symbol\tconsensus_name\tnum_hits\tnum_filtered_hits\t"
-                "num_go_terms\tnum_specific_go_terms\ttop_hit_evalue\ttop_hit_pident\ttop_hit_bitscore\n")
-
+    with open(symbol_file, 'w') as f:
+        f.write("gene_id\tgene_symbol\n")
         for query_id, annot in sorted(annotations.items()):
-            top_evalue = annot.filtered_hits[0].evalue if annot.filtered_hits else "NA"
-            top_pident = annot.filtered_hits[0].pident if annot.filtered_hits else "NA"
-            top_bitscore = annot.filtered_hits[0].bitscore if annot.filtered_hits else "NA"
+            f.write(f"{query_id}\t{annot.consensus_symbol}\n")
 
-            f.write(f"{query_id}\t{annot.consensus_symbol}\t{annot.consensus_name}\t{len(annot.hits)}\t"
-                    f"{len(annot.filtered_hits)}\t{len(annot.go_terms)}\t"
-                    f"{len(annot.specific_go_terms)}\t{top_evalue}\t{top_pident}\t{top_bitscore}\n")
+    # 2. Gene-to-name mapping
+    name_file = output_dir / f"{prefix}_gene2name.tsv"
+    logger.info(f"Writing gene2name to {name_file}")
 
-    # 2. GO term assignments (all GO terms)
-    go_all_file = output_dir / f"{prefix}_GO_all.tsv"
-    logger.info(f"Writing all GO terms to {go_all_file}")
-
-    with open(go_all_file, 'w') as f:
-        f.write("query_id\tgene_symbol\tprotein_name\tgo_terms\n")
+    with open(name_file, 'w') as f:
+        f.write("gene_id\tprotein_name\n")
         for query_id, annot in sorted(annotations.items()):
-            gene_symbol = annot.consensus_symbol or ""
-            protein_name = annot.consensus_name or ""
-            go_terms_str = ';'.join(sorted(annot.go_terms)) if annot.go_terms else ""
-            f.write(f"{query_id}\t{gene_symbol}\t{protein_name}\t{go_terms_str}\n")
+            pname = strip_uniprot_prefix(annot.consensus_name) if annot.consensus_name else ""
+            f.write(f"{query_id}\t{pname}\n")
 
-    # 3. GO term assignments (specific/leaf terms only)
-    go_specific_file = output_dir / f"{prefix}_GO_specific.tsv"
-    logger.info(f"Writing specific GO terms to {go_specific_file}")
+    # 3. Gene-to-GO mapping
+    go_file = output_dir / f"{prefix}_gene2go.tsv"
+    logger.info(f"Writing gene2go to {go_file}")
 
-    with open(go_specific_file, 'w') as f:
-        f.write("query_id\tgene_symbol\tprotein_name\tgo_terms\n")
+    with open(go_file, 'w') as f:
+        f.write("gene_id\tgo_terms\n")
         for query_id, annot in sorted(annotations.items()):
-            gene_symbol = annot.consensus_symbol or ""
-            protein_name = annot.consensus_name or ""
-            go_terms_str = ';'.join(sorted(annot.specific_go_terms)) if annot.specific_go_terms else ""
-            f.write(f"{query_id}\t{gene_symbol}\t{protein_name}\t{go_terms_str}\n")
+            go_str = ';'.join(sorted(annot.specific_go_terms)) if annot.specific_go_terms else ""
+            f.write(f"{query_id}\t{go_str}\n")
 
-    # 4. Detailed GO term table with names
-    go_detailed_file = output_dir / f"{prefix}_GO_detailed.tsv"
-    logger.info(f"Writing detailed GO terms to {go_detailed_file}")
+    # 4. Annotation evidence
+    evidence_file = output_dir / f"{prefix}_annotation_evidence.tsv"
+    logger.info(f"Writing annotation evidence to {evidence_file}")
 
-    with open(go_detailed_file, 'w') as f:
-        f.write("query_id\tgo_term\tgo_name\tnamespace\tis_specific\n")
+    with open(evidence_file, 'w') as f:
+        f.write("gene_id\tgene_symbol\tprotein_name\tn_isoforms\tn_total_hits\t"
+                "n_cluster_hits\twinning_cluster_names\twinning_cluster_symbols\t"
+                "top_hit_sseqid\ttop_hit_bitscore\ttop_hit_source\t"
+                "mean_cluster_bitscore\tname_concordance\tsymbol_concordance\t"
+                "go_source\tn_go_terms\n")
         for query_id, annot in sorted(annotations.items()):
-            if annot.go_terms:
-                for go_term in sorted(annot.go_terms):
-                    go_name = go_hierarchy.names.get(go_term, "unknown")
-                    namespace = go_hierarchy.namespace.get(go_term, "unknown")
-                    is_specific = "yes" if go_term in annot.specific_go_terms else "no"
-                    f.write(f"{query_id}\t{go_term}\t{go_name}\t{namespace}\t{is_specific}\n")
+            pname = strip_uniprot_prefix(annot.consensus_name) if annot.consensus_name else ""
+            cluster_names = "|".join(annot.winning_cluster_names)
+            cluster_symbols = "|".join(annot.winning_cluster_symbols)
+
+            if annot.filtered_hits:
+                top_hit = annot.filtered_hits[0]
+                top_sseqid = top_hit.subject_id
+                top_bitscore = f"{top_hit.bitscore:.2f}"
+                if top_hit.subject_id.startswith('sp|'):
+                    top_source = "sp"
+                elif top_hit.subject_id.startswith('tr|'):
+                    top_source = "tr"
+                else:
+                    top_source = ""
             else:
-                # Include genes without GO terms with empty values
-                f.write(f"{query_id}\t\t\t\t\n")
+                top_sseqid = ""
+                top_bitscore = "0.00"
+                top_source = ""
 
-    # 5. Protein names table
-    names_file = output_dir / f"{prefix}_protein_names.tsv"
-    logger.info(f"Writing protein names to {names_file}")
-
-    with open(names_file, 'w') as f:
-        f.write("query_id\tgene_symbol\tprotein_name\tall_symbols\tall_hit_names\n")
-        for query_id, annot in sorted(annotations.items()):
-            all_symbols = "|".join(h.gene_symbol for h in annot.filtered_hits[:5] if h.gene_symbol)
-            all_names = "|".join(h.gene_name for h in annot.filtered_hits[:5])
-            f.write(f"{query_id}\t{annot.consensus_symbol}\t{annot.consensus_name}\t{all_symbols}\t{all_names}\n")
+            f.write(f"{query_id}\t{annot.consensus_symbol}\t{pname}\t"
+                    f"{annot.n_isoforms}\t{len(annot.hits)}\t"
+                    f"{annot.n_cluster_hits}\t{cluster_names}\t{cluster_symbols}\t"
+                    f"{top_sseqid}\t{top_bitscore}\t{top_source}\t"
+                    f"{annot.mean_cluster_bitscore:.2f}\t"
+                    f"{annot.name_concordance:.2f}\t{annot.symbol_concordance:.2f}\t"
+                    f"{annot.go_source}\t{len(annot.specific_go_terms)}\n")
 
     # 6. Annotated FASTA file
     if input_fasta:
         fasta_out = output_dir / f"{prefix}_annotated.fasta"
-        write_annotated_fasta(input_fasta, annotations, fasta_out)
+        write_annotated_fasta(input_fasta, annotations, fasta_out,
+                              transcript_to_gene=transcript_to_gene)
 
     # 7. Annotated GFF3 file (if GFF input was provided)
     if input_gff:
@@ -1532,7 +2185,12 @@ def write_annotation_results(annotations: dict,
             cmd_parts = ["GOAnnotate.py"]
             cmd_parts.extend(["--transcripts", str(args.transcripts)])
             cmd_parts.extend(["--blast-results", str(args.blast_results)])
-            cmd_parts.extend(["--go-mapping", str(args.go_mapping)])
+            if args.gff:
+                cmd_parts.extend(["--gff", str(args.gff)])
+            if args.db:
+                cmd_parts.extend(["--db", str(args.db)])
+            if args.go_mapping:
+                cmd_parts.extend(["--go-mapping", str(args.go_mapping)])
             cmd_parts.extend(["--go-obo", str(args.go_obo)])
             cmd_parts.extend(["--bad-names", str(args.bad_names)])
             cmd_parts.extend(["--output", str(args.output)])
@@ -1540,12 +2198,7 @@ def write_annotation_results(annotations: dict,
             cmd_parts.extend(["--evalue", str(args.evalue)])
             cmd_parts.extend(["--top-n", str(args.top_n)])
             cmd_parts.extend(["--consensus-threshold", str(args.consensus_threshold)])
-            cmd_parts.extend(["--min-consensus-fraction", str(args.min_consensus_fraction)])
             cmd_parts.extend(["--namespace"] + args.namespace)
-            if args.no_prefer_swissprot:
-                cmd_parts.append("--no-prefer-swissprot")
-            if args.gff:
-                cmd_parts.extend(["--gff", str(args.gff)])
             f.write(" \\\n    ".join(cmd_parts) + "\n\n")
 
         # Input files section
@@ -1554,7 +2207,10 @@ def write_annotation_results(annotations: dict,
             f.write("-" * 70 + "\n")
             f.write(f"  Transcripts:    {args.transcripts}\n")
             f.write(f"  BLAST results:  {args.blast_results}\n")
-            f.write(f"  GO mapping:     {args.go_mapping}\n")
+            if args.db:
+                f.write(f"  SQLite DB:      {args.db}\n")
+            if args.go_mapping:
+                f.write(f"  GO mapping:     {args.go_mapping}\n")
             f.write(f"  GO OBO:         {args.go_obo}\n")
             f.write(f"  Bad names:      {args.bad_names}\n")
             if args.gff:
@@ -1565,11 +2221,10 @@ def write_annotation_results(annotations: dict,
         if args:
             f.write("Parameters:\n")
             f.write("-" * 70 + "\n")
+            f.write(f"  Mode:                     Annotation only\n")
             f.write(f"  E-value threshold:        {args.evalue}\n")
             f.write(f"  Top N hits:               {args.top_n}\n")
             f.write(f"  Consensus threshold:      {args.consensus_threshold}\n")
-            f.write(f"  Min consensus fraction:   {args.min_consensus_fraction}\n")
-            f.write(f"  Prefer SwissProt:         {not args.no_prefer_swissprot}\n")
             f.write(f"  GO namespaces:            {', '.join(args.namespace)}\n\n")
 
         # BLAST statistics section
@@ -1609,57 +2264,109 @@ def write_annotation_results(annotations: dict,
         f.write(f"  Total unique GO terms (all):      {len(all_go):,}\n")
         f.write(f"  Total unique GO terms (specific): {len(all_specific):,}\n")
         f.write(f"  GO term reduction: {len(all_go):,} -> {len(all_specific):,} "
-                f"({100*(1-len(all_specific)/len(all_go)) if all_go else 0:.1f}% reduction)\n")
+                f"({100*(1-len(all_specific)/len(all_go)) if all_go else 0:.1f}% reduction)\n\n")
+
+        # Concordance statistics
+        name_concs = [a.name_concordance for a in annotations.values() if a.consensus_name]
+        sym_concs = [a.symbol_concordance for a in annotations.values() if a.consensus_symbol]
+
+        if name_concs or sym_concs:
+            f.write("Concordance Statistics:\n")
+            f.write("-" * 70 + "\n")
+            if name_concs:
+                f.write(f"  Name concordance:   mean={statistics.mean(name_concs):.2f}, "
+                        f"median={statistics.median(name_concs):.2f}, "
+                        f"min={min(name_concs):.2f}, max={max(name_concs):.2f}\n")
+            if sym_concs:
+                f.write(f"  Symbol concordance: mean={statistics.mean(sym_concs):.2f}, "
+                        f"median={statistics.median(sym_concs):.2f}, "
+                        f"min={min(sym_concs):.2f}, max={max(sym_concs):.2f}\n")
 
     logger.info(f"Results written to {output_dir}")
 
 
-# =============================================================================
+###################
 # CLI
-# =============================================================================
+###################
+
+class VerticalHelpFormatter(argparse.RawDescriptionHelpFormatter):
+    """Help formatter that displays each argument's help on a single line."""
+
+    def __init__(self, prog, indent_increment=2, max_help_position=36, width=None):
+        if width is None:
+            width = max(shutil.get_terminal_size().columns, 100)
+        super().__init__(prog, indent_increment, max_help_position, width)
+
+    def _split_lines(self, text, width):
+        return text.splitlines()
+
 
 def build_parser():
     parser = argparse.ArgumentParser(
         description="GOAnnotate: Gene Ontology annotation pipeline using UniProt BLAST/Diamond results",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+        formatter_class=VerticalHelpFormatter,
+        epilog="""\
+Required: --transcripts, --blast-results, --db (or --go-mapping), --bad-names, --output
+
+  The --db SQLite database (built by build_databases.py) is the recommended way
+  to provide GO mappings and NCBI cross-references. Alternatively, use --go-mapping
+  with optional --ncbi-idmapping + --ncbi-geneinfo flat files.
+
+  The GO OBO file (--go-obo) is auto-downloaded if not provided or >30 days old.
+
+Examples:
+  # Using SQLite database (recommended)
+  GOAnnotate.py --transcripts CDS.fasta --blast-results UniProt_results.tsv \\
+      --db GOAnnotate_db.sqlite --bad-names bad_names.txt -o output_dir
+
+  # Using flat files
+  GOAnnotate.py --transcripts CDS.fasta --blast-results UniProt_results.tsv \\
+      --go-mapping GO_mapping.tsv --ncbi-idmapping idmapping_selected.tab \\
+      --ncbi-geneinfo gene_info.tsv --bad-names bad_names.txt -o output_dir
+"""
     )
 
     # Input options
     input_group = parser.add_argument_group("Input options")
     input_group.add_argument(
-        "--transcripts", required=True, metavar="FILE",
-        help="Input FASTA file containing all transcripts (used to define the complete gene set)"
+        "--transcripts", metavar="FILE", required=True,
+        help="CDS FASTA file with transcript-level headers (gene= field for gene mapping) [required]"
     )
     input_group.add_argument(
-        "--blast-results", "--blast", required=True, metavar="FILE",
-        help="BLAST/Diamond results file (format 6 with stitle)"
+        "--blast-results", "--blast", metavar="FILE", required=True,
+        help="BLAST/Diamond results file, format 6 with stitle [required]"
     )
     input_group.add_argument(
         "--gff", metavar="FILE",
-        help="Optional GFF3 file to annotate with gene symbols and product names"
+        help="GFF3 annotation file [optional: for annotated GFF3 output]"
     )
 
     # GO mapping
     go_group = parser.add_argument_group("GO options")
     go_group.add_argument(
-        "--go-mapping", required=True, metavar="FILE",
-        help="Accession to GO term mapping file (accession<TAB>GO:xxxx;GO:yyyy)"
+        "--go-mapping", metavar="FILE",
+        help="Accession-to-GO mapping file (accession<TAB>GO:xxxx;GO:yyyy) [required unless --db]"
     )
     go_group.add_argument(
-        "--go-obo", required=True, metavar="FILE",
-        help="GO OBO hierarchy file"
+        "--db", metavar="FILE",
+        help="SQLite database built by build_databases.py "
+             "(replaces --go-mapping, --ncbi-idmapping, --ncbi-geneinfo)"
+    )
+    go_group.add_argument(
+        "--go-obo", metavar="FILE",
+        help="GO OBO hierarchy file (auto-downloaded if missing or >30 days old)"
     )
     go_group.add_argument(
         "--namespace", nargs='+', default=["BP", "MF", "CC"],
         choices=["BP", "MF", "CC"],
-        help="GO namespaces to include"
+        help="GO namespaces to include (default: BP MF CC)"
     )
 
     # NCBI cross-reference options
     ncbi_group = parser.add_argument_group("NCBI cross-reference options (for improved gene symbol coverage)")
     ncbi_group.add_argument(
         "--ncbi-idmapping", metavar="FILE",
-        help="UniProt ID mapping file (idmapping_selected.tab) for UniProt->NCBI GeneID lookup"
+        help="UniProt ID mapping file (idmapping_selected.tsv) for UniProt->NCBI GeneID lookup"
     )
     ncbi_group.add_argument(
         "--ncbi-geneinfo", metavar="FILE",
@@ -1670,38 +2377,39 @@ def build_parser():
     filter_group = parser.add_argument_group("Filtering options")
     filter_group.add_argument(
         "--evalue", type=float, default=1e-5,
-        help="E-value threshold for filtering hits (use to apply stricter filtering than BLAST/Diamond)"
+        help="E-value threshold for filtering hits (default: %(default)s)"
     )
     filter_group.add_argument(
-        "--top-n", type=int, default=20,
-        help="Number of top BLAST hits to consider per query"
+        "--top-n", type=int, default=30,
+        help="Number of top BLAST hits to consider per transcript (default: %(default)s)"
     )
     filter_group.add_argument(
-        "--bad-names", required=True, metavar="FILE",
-        help="Bad names pattern file for filtering uninformative protein names"
+        "--bad-names", metavar="FILE",
+        help="Bad names pattern file for filtering uninformative protein names [required]"
     )
     filter_group.add_argument(
         "--consensus-threshold", type=float, default=0.5,
-        help="Similarity threshold for name clustering (0-1)"
+        help="Similarity threshold for name clustering, 0-1 (default: %(default)s)"
     )
-    filter_group.add_argument(
-        "--min-consensus-fraction", type=float, default=0.4,
-        help="Minimum fraction of hits that must agree for consensus"
-    )
-    filter_group.add_argument(
-        "--no-prefer-swissprot", action="store_true",
-        help="Don't prioritize SwissProt hits over TrEMBL (by default, SwissProt is preferred)"
+
+    # Performance options
+    perf_group = parser.add_argument_group("Performance options")
+    perf_group.add_argument(
+        "--threads", type=int, default=None,
+        help="Number of parallel workers for annotation "
+             "(default: number of CPUs)"
     )
 
     # Output options
     output_group = parser.add_argument_group("Output options")
     output_group.add_argument(
-        "--output", "-o", default="./GOAnnotate_results", metavar="DIR",
-        help="Output directory"
+        "--output", "-o", required=True, metavar="DIR",
+        help="Output directory (required). Directory name is used as the "
+             "file prefix unless overridden with --prefix"
     )
     output_group.add_argument(
-        "--prefix", default="annotation",
-        help="Output file prefix"
+        "--prefix", default=None,
+        help="Output file prefix (default: derived from output directory name)"
     )
 
     return parser
@@ -1714,23 +2422,32 @@ def main():
     # Initialize components
     logger.info("Initializing GOAnnotate pipeline...")
 
-    # Validate input files exist
+    ###############################
+    # Validate required arguments
+    ###############################
+
+    missing = []
+    if not args.go_mapping and not args.db:
+        missing.append("--go-mapping (or --db)")
+    if not args.bad_names:
+        missing.append("--bad-names")
+    if missing:
+        logger.error(f"Missing required arguments: {', '.join(missing)}")
+        sys.exit(1)
+
+    # Validate file existence
     if not Path(args.transcripts).exists():
         logger.error(f"Transcripts FASTA file not found: {args.transcripts}")
         sys.exit(1)
-
     if not Path(args.blast_results).exists():
         logger.error(f"BLAST results file not found: {args.blast_results}")
         sys.exit(1)
-
-    if not Path(args.go_obo).exists():
-        logger.error(f"GO OBO file not found: {args.go_obo}")
-        sys.exit(1)
-
-    if not Path(args.go_mapping).exists():
+    if args.go_mapping and not Path(args.go_mapping).exists():
         logger.error(f"GO mapping file not found: {args.go_mapping}")
         sys.exit(1)
-
+    if args.db and not Path(args.db).exists():
+        logger.error(f"SQLite database not found: {args.db}")
+        sys.exit(1)
     if args.gff and not Path(args.gff).exists():
         logger.error(f"GFF3 file not found: {args.gff}")
         sys.exit(1)
@@ -1749,76 +2466,121 @@ def main():
         logger.error(f"NCBI gene_info file not found: {args.ncbi_geneinfo}")
         sys.exit(1)
 
-    # Step 0: Parse transcripts file to get complete gene list
-    total_sequences, all_gene_ids = parse_fasta_headers(args.transcripts)
+    # Create output directory
+    output_dir = Path(args.output)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Step 1: Parse BLAST results first (needed to filter GO mapping loading)
-    blast_results, blast_stats = parse_blast_results(
+    # Derive prefix from output directory name if not explicitly provided
+    if args.prefix is None:
+        args.prefix = output_dir.resolve().name
+
+    #######################
+    # Resolve GO OBO file
+    #######################
+
+    args.go_obo = resolve_go_obo(args.go_obo)
+
+    ############################################################################
+    # Phase 0: Parse FASTA headers to build gene universe + transcript-gene map
+    ############################################################################
+
+    total_sequences, all_gene_ids, transcript_to_gene, gene_to_transcripts = \
+        parse_fasta_headers(args.transcripts)
+
+    #####################################################
+    # Phase 1: Parse BLAST results (keyed by transcript)
+    #####################################################
+
+    transcript_hits, blast_stats = parse_blast_results(
         args.blast_results,
-        top_n=args.top_n,
-        evalue_threshold=args.evalue,
-        prefer_swissprot=not args.no_prefer_swissprot
+        evalue_threshold=args.evalue
     )
 
-    # Step 2: Collect accessions from BLAST hits for filtering GO mapping
-    blast_accessions = collect_accessions_from_blast(blast_results)
-
-    # Step 3: Load GO mapping (filtered to only accessions in BLAST results)
-    go_mapping = load_go_mapping(args.go_mapping, accession_filter=blast_accessions)
-
-    # Load GO hierarchy
-    go_hierarchy = GOHierarchy(args.go_obo)
+    ###################################################################
+    # Phase 2: Per-transcript cleaning, filtering, and top-N selection
+    ###################################################################
 
     # Initialize bad name filter
     bad_name_filter = BadNameFilter(args.bad_names)
 
-    # Step 3.5: Load NCBI cross-reference mappings if provided
+    filtered_transcript_hits = filter_and_select_hits(
+        transcript_hits,
+        bad_name_filter=bad_name_filter,
+        top_n=args.top_n
+    )
+
+    ###############################################################
+    # Collect accessions from filtered hits for GO mapping loading
+    ###############################################################
+
+    blast_accessions = collect_accessions_from_blast(filtered_transcript_hits)
+
+    # Load GO mapping
+    if args.db:
+        go_mapping = load_go_mapping_sqlite(args.db,
+                                            accession_filter=blast_accessions)
+    else:
+        go_mapping = load_go_mapping(args.go_mapping,
+                                     accession_filter=blast_accessions)
+
+    # Load GO hierarchy
+    go_hierarchy = GOHierarchy(args.go_obo)
+
+    # Load NCBI cross-reference mappings
     uniprot_to_geneid = None
     geneid_to_symbol = None
-    if args.ncbi_idmapping and args.ncbi_geneinfo:
-        # Load UniProt -> GeneID mapping (filtered to BLAST accessions)
+    if args.db:
+        uniprot_to_geneid = load_ncbi_idmapping_sqlite(
+            args.db, accession_filter=blast_accessions
+        )
+        found_geneids = set(uniprot_to_geneid.values())
+        geneid_to_symbol = load_ncbi_geneinfo_sqlite(
+            args.db, geneid_filter=found_geneids
+        )
+    elif args.ncbi_idmapping and args.ncbi_geneinfo:
         uniprot_to_geneid = load_ncbi_idmapping(
             args.ncbi_idmapping,
             accession_filter=blast_accessions
         )
-        # Collect GeneIDs that were found
         found_geneids = set(uniprot_to_geneid.values())
-        # Load GeneID -> Symbol mapping (filtered to found GeneIDs)
         geneid_to_symbol = load_ncbi_geneinfo(
             args.ncbi_geneinfo,
             geneid_filter=found_geneids
         )
 
-    # Create output directory
-    output_dir = Path(args.output)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    #####################################################
+    # Phases 3-7: Annotate (merge, cluster, select, GO)
+    #####################################################
 
-    # Step 4: Annotate
     annotations = annotate_queries(
-        blast_results=blast_results,
+        filtered_transcript_hits=filtered_transcript_hits,
+        transcript_to_gene=transcript_to_gene,
+        gene_to_transcripts=gene_to_transcripts,
         go_mapping=go_mapping,
         go_hierarchy=go_hierarchy,
         bad_name_filter=bad_name_filter,
         all_gene_ids=all_gene_ids,
-        top_n=args.top_n,
         consensus_threshold=args.consensus_threshold,
-        min_consensus_fraction=args.min_consensus_fraction,
         namespaces=args.namespace,
         uniprot_to_geneid=uniprot_to_geneid,
-        geneid_to_symbol=geneid_to_symbol
+        geneid_to_symbol=geneid_to_symbol,
+        threads=args.threads
     )
 
-    # Step 5: Write output
+    ################
+    # Write outputs
+    ################
+
     write_annotation_results(
         annotations=annotations,
-        go_hierarchy=go_hierarchy,
         output_dir=output_dir,
         prefix=args.prefix,
         input_fasta=args.transcripts,
         input_gff=args.gff,
         args=args,
         blast_stats=blast_stats,
-        total_sequences=total_sequences
+        total_sequences=total_sequences,
+        transcript_to_gene=transcript_to_gene
     )
 
     logger.info("GOAnnotate pipeline completed successfully")

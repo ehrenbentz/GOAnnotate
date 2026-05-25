@@ -1,21 +1,78 @@
 # Bad Names Pattern File for GOAnnotate
 # ======================================
 #
-# This file contains patterns for gene/protein names that should be filtered out
-# during GO annotation. These are typically uninformative names that don't help
-# identify the gene function.
+# This file contains patterns for cleaning and filtering gene/protein names
+# during GO annotation. There are three filtering contexts:
+#
+#   A) Artifact stripping  - strip database artifacts from protein names
+#   B) Protein name filtering - discard uninformative protein descriptions
+#   C) Gene symbol filtering  - discard uninformative gene symbols
+#
+# Processing order: strip (A) runs first, then filter (B/C) on the cleaned name.
 #
 # Pattern types:
-#   1. Plain text - matched as substring (case-insensitive)
+#   1. strip_regex:   - regex stripped FROM protein names before filtering
+#      Matched text is removed. Applied in order, case-insensitive.
+#      Example: strip_regex:^PREDICTED:\s*
+#
+#   2. Plain text - matched as substring (case-insensitive) against protein names
 #      Short patterns (<=6 chars) are matched exactly
 #      Longer patterns are matched as substrings
 #
-#   2. Regex patterns - prefix with "regex:" for full regex matching
+#   3. regex:         - regex matched against protein names (case-insensitive)
 #      Example: regex:^LOC\d+$
+#
+#   4. symbol_regex:  - regex matched against gene symbols (case-insensitive)
+#      Example: symbol_regex:^LOC\d+$
 #
 # Lines starting with # are comments and ignored
 # Blank lines are ignored
 #
+
+# =============================================================================
+# ARTIFACT STRIPPING (strip_regex:)
+# =============================================================================
+# These patterns are stripped FROM protein names BEFORE the discard filter runs.
+# Use for database prefixes, suffixes, and qualifiers that obscure an otherwise
+# informative name. Patterns are applied sequentially in the order listed.
+
+# UniProt database ID prefix (e.g., "sp|Q02084|A33_PLEWA Zinc-binding protein A33")
+# Must be first so downstream patterns (e.g., ^[Ss]i: for zebrafish) can match
+strip_regex:^(?:sp|tr)\|[A-Za-z0-9]+\|[A-Za-z0-9_]+\s+
+
+# NCBI automated prediction prefix (e.g., "PREDICTED: calcium channel protein")
+strip_regex:^PREDICTED:\s*
+
+# NCBI low quality annotation prefix
+strip_regex:^LOW QUALITY PROTEIN:\s*
+
+# UniProt partial sequence indicator (e.g., "Hemoglobin subunit beta (Fragment)")
+strip_regex:\(Fragment\)
+
+# Isoform designations (e.g., "isoform X1", "isoform A")
+strip_regex:\bisoform\s+\S+
+
+# Splice variant designations (e.g., "splice variant 2")
+strip_regex:\bsplice\s+variant\s*\S*
+
+# Transcript variant designations (e.g., "transcript variant X1")
+strip_regex:\btranscript\s+variant\s*\S*
+
+# Allele labels (e.g., "allele HLA-A")
+strip_regex:\ballele\s+\S+
+
+# Variant numeric labels (e.g., "variant 3")
+strip_regex:\bvariant\s+\d+
+
+# Genomic annotation artifact as standalone word
+strip_regex:\bpseudogene\b
+
+# Trailing "-like" suffix only; does NOT match when followed by "protein"
+# (e.g., "protein 6-like" -> "protein 6", but "6-like protein 1" is unchanged)
+strip_regex:-like\s*$
+
+# Homolog designations (e.g., "kinase homolog" -> "kinase")
+strip_regex:\bhomolog\b
 
 # =============================================================================
 # UNINFORMATIVE NAMES
@@ -23,7 +80,7 @@
 
 # Generic placeholders
 ypothetical protein
-ncharacterized protein
+ncharacterized
 redicted protein
 nknown protein
 nnamed protein product
@@ -31,8 +88,8 @@ putative protein
 expressed protein
 conserved hypothetical
 ypothetical conserved
-ncharacterized conserved
 nknown function
+open reading frame
 
 # Domain-only descriptions (often not informative about function)
 domain-containing protein
@@ -76,8 +133,7 @@ Corf
 # =============================================================================
 
 # NCBI LOC followed by numbers (e.g., LOC123456)
-regex:^LOC\d+$
-regex:^loc\d+$
+regex:^LOC\d+
 
 # Generic accession-like patterns (e.g., ABC12345)
 regex:^[A-Z]{2,4}\d{4,}$
@@ -91,9 +147,7 @@ regex:^C\d+orf\d+$
 # Simple orf numbering
 regex:^orf\d+$
 
-# NCBI prediction prefixes
-#regex:^PREDICTED:
-#regex:^LOW QUALITY PROTEIN:
+# NCBI prediction prefixes (handled by strip_regex; stripped, not discarded)
 
 # Just numbers
 regex:^\d+$
@@ -161,12 +215,117 @@ regex:^wu:
 regex:^im:
 
 # =============================================================================
+# GENE SYMBOL PATTERNS (symbol_regex:)
+# =============================================================================
+# These patterns filter uninformative gene symbols from the GN= field.
+# They are applied separately from the protein name patterns above.
+
+# Too-short symbols (0-1 characters)
+symbol_regex:^.{0,1}$
+
+# Purely numeric symbols
+symbol_regex:^\d+$
+
+# NCBI LOC numbers (e.g., LOC123456)
+symbol_regex:^LOC\d+$
+
+# Zebrafish clone IDs
+symbol_regex:^SI:
+symbol_regex:^zgc:\d+$
+symbol_regex:^wu:
+symbol_regex:^im:
+symbol_regex:^zmp:
+
+# Internal lab/genome annotation naming: PREFIX_5+DIGITS (e.g., D9C73_027734)
+symbol_regex:^[A-Z0-9]+_\d{5,}$
+
+# PREFIX_LETTER+DIGITS with 4+ digits (e.g., XNOV1_A014589)
+symbol_regex:^[A-Z0-9]+_[A-Z]*\d{4,}$
+
+# Genome annotation: letter + digits + underscore + digits + G + digits
+# (e.g., D4764_01G0004220)
+symbol_regex:^[A-Z]\d+_\d+G\d+$
+
+# Fish genome annotation (e.g., D5F01_LYC10690)
+symbol_regex:^[A-Z]\d+[A-Z]+_[A-Z]+\d+$
+
+# Nothobranchius furzeri / Nile tilapia style (e.g., Nfu_g_1_016631)
+symbol_regex:^[A-Z][A-Z]+_[A-Z]_\d+_\d+$
+
+# EXN66_Car014809 style
+symbol_regex:^[A-Z0-9]+_[A-Z][A-Z]+\d{4,}$
+
+# DR999_PMT18446, E1301_Tti021464 style
+symbol_regex:^[A-Z]\d+_[A-Z]+\d+$
+
+# LOCUS patterns (e.g., MMEN_LOCUS7967, PLEPLA_LOCUS46505)
+symbol_regex:^[A-Z]+_LOCUS\d+$
+
+# Medaka/Oryzias latipes (e.g., OLA.12830)
+symbol_regex:^OLA\.\d+$
+
+# Xenopus (e.g., XELAEV_18009728mg)
+symbol_regex:^XELAEV_\d+
+
+# Long alphanumeric genome IDs (e.g., GSTENG00028376001)
+symbol_regex:^[A-Z]{3,}\d{8,}$
+
+# Short prefix + many digits (e.g., PPUP9740)
+symbol_regex:^[A-Z]{2,4}\d{4,}$
+
+# Accession numbers with version (e.g., CU459095.1, CABZ01015475.1)
+symbol_regex:^[A-Z]{1,4}\d{5,}\.\d+$
+
+# Automatic paralog/copy numbering (e.g., LIN1_28, Pol_27, YME1L1_1)
+symbol_regex:^[A-Z0-9]{2,10}_\d{1,2}$
+
+# PECUL_23A059567 style: PREFIX_MIXED ending in many digits
+symbol_regex:^[A-Z]+_[A-Z0-9]*\d{5,}$
+
+# Transposon/retrotransposon naming (commented out by default)
+#symbol_regex:^POL_?\d*$
+#symbol_regex:^PO\d+$
+#symbol_regex:^TPASE$
+#symbol_regex:^TY3B-
+
+# KIAA protein project names
+symbol_regex:^KIAA\d+$
+
+# Ensembl-style IDs (e.g., ENSG00000141510)
+symbol_regex:^ENS[A-Z]+\d+$
+
+# Plant genome IDs
+symbol_regex:^GRMZM\d+G\d+$
+symbol_regex:^Glyma\.\d+G\d+$
+
+# Chromosome ORF naming (e.g., C1orf43, CXorf38)
+symbol_regex:^C[0-9X]+ORF\d+$
+
+# Cross-species chromosome ORF naming (e.g., C1H1ORF43 - chicken homolog)
+symbol_regex:^C\d+H\d+ORF\d+$
+
+# CUNH#ORF# pattern (zebrafish/fish referencing human ORFs)
+symbol_regex:^CUNH\d+ORF\d+$
+
+# LG#H#ORF# pattern (linkage group + human ORF reference)
+symbol_regex:^LG\d+H\d+ORF\d+$
+
+# Gene names with C#ORF# suffix (e.g., ZHX1-C8ORF76)
+symbol_regex:-C\d+ORF\d+$
+
+# Generic ORF labels (just "ORF" with optional number)
+symbol_regex:^ORF\d*$
+
+# RIKEN clone IDs (e.g., 4933434E20Rik, 1700010I14Rik)
+symbol_regex:^\d+[A-Z]+\d+RIK$
+
+# =============================================================================
 # ADD CUSTOM PATTERNS BELOW
 # =============================================================================
 
 # Example: filter out names from a specific organism or database
 # regex:^MyOrganism_\d+$
+# symbol_regex:^MyOrganism_\d+$
 
 # Example: filter specific uninformative terms from your database
 # some lab-specific term
-
