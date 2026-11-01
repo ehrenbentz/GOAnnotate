@@ -1,0 +1,484 @@
+# GOAnnotate name and symbol patterns
+# ====================================
+#
+# Purpose: stop designations that belong to another genome or another
+# annotation pipeline from being carried into the genome being annotated,
+# and keep names that carry no information from being applied as products.
+# UniProt and NCBI protein names are full of such carryover: "-like" is a
+# paralog marker added by the NCBI pipeline to one genome; C6orf89 is a
+# position on a human chromosome; LOC121139165 is a locus in one assembly;
+# 1700129C05Rik is a RIKEN clone. None of these mean anything in another
+# species. "Olfactory receptor", on the other hand, is correct anywhere.
+#
+# Text in a database hit falls into three classes, with three treatments:
+#
+#   A. Genome-specific IDENTIFIERS   -> removed from the name as tokens; the
+#      (LOC numbers, locus tags,        name is discarded only if nothing
+#      clone IDs, C#orf#)               informative remains. As gene symbols
+#                                       they are discarded, but only after
+#                                       the symbol failed to resolve to a
+#                                       reference-species ortholog symbol.
+#   B. Genome-specific QUALIFIERS    -> stripped; the rest of the name is used
+#      (-like, isoform X1, LOW QUALITY PROTEIN:, (Fragment), putative)
+#   C. Family-level DESCRIPTORS      -> kept; used as the product only when no
+#      (Olfactory receptor,             more specific name is available in
+#      Zinc finger protein)             the winning group of hits
+#
+# Pattern types (all case-insensitive; one per line; # starts a comment):
+#
+#   qualifier_regex:   class B, removed from names first        (alias: strip_regex:)
+#   identifier_regex:  class A, removed from names as tokens
+#   placeholder:       a whole name that carries no information once A and B
+#                      are removed; exact whole-name match, punctuation ignored
+#   exact:             discard names equal to this text
+#   contains:          discard names containing this text
+#   regex:             discard names matching this regex
+#   generic_regex:     class C, family-level names (kept, deprioritized)
+#   normalize_regex:   removed only when names are COMPARED (clustering,
+#                      agreement), never from output
+#   symbol_regex:      discard gene symbols matching this regex, applied after
+#                      ortholog resolution has been attempted
+#   product_regex:     "PATTERN => REPLACEMENT" applied to the final product
+#                      names only (naming conventions); see the last section
+#
+# Order of operations on a hit name: qualifiers are stripped, identifiers are
+# removed, punctuation is tidied, then the name is tested against placeholder/
+# exact/contains/regex. Hits whose name is discarded contribute nothing.
+#
+# Tuning for a new taxon usually means adding identifier_regex: and
+# symbol_regex: lines for the locus-tag style of the genomes that dominate
+# your hits. The per-run {prefix}_name_audit.txt lists what survived.
+# Put additions in a separate file passed with --bad-names-extra so that the
+# bundled file can be updated independently.
+#
+# Lines without a prefix are accepted for compatibility with 1.x files:
+# 6 characters or fewer -> exact:, longer -> contains:
+
+# =============================================================================
+# B. QUALIFIERS (qualifier_regex:) - stripped from names, rest of the name used
+# =============================================================================
+
+# UniProt database ID prefix (e.g., "sp|Q02084|A33_PLEWA Zinc-binding protein A33")
+qualifier_regex:^(?:sp|tr)\|[A-Za-z0-9]+\|[A-Za-z0-9_]+\s+
+
+# NCBI pipeline prefixes
+qualifier_regex:^PREDICTED:\s*
+qualifier_regex:^LOW QUALITY PROTEIN:\s*
+
+# Full-length cDNA project names that carry the real name after "similar to"
+# ("cDNA FLJ58486, highly similar to Homo sapiens tubulin alpha 1a")
+qualifier_regex:^cDNA FLJ\d+(?: fis)?,?\s*(?:(?:highly |weakly |moderately )?similar to\s+(?:Homo sapiens |Mus musculus |Rattus norvegicus |human |mouse |rat )?)?
+
+# Similarity prefixes ("similar to Avpr1a", "weakly similar to ...")
+qualifier_regex:^(?:highly |weakly |moderately )?similar to\s+(?:Homo sapiens |Mus musculus |human |mouse |rat )?
+
+# Curator judgment on that entry, not part of the name
+qualifier_regex:^(?:putative|probable|possible)\s+
+
+# UniProt partial sequence indicator (e.g., "Hemoglobin subunit beta (Fragment)")
+qualifier_regex:\(Fragments?\)
+qualifier_regex:,?\s+partial$
+
+# Isoform, splice and transcript variants, alleles
+qualifier_regex:\bisoform\s+\S+
+qualifier_regex:\bsplice\s+variant\s*\S*
+qualifier_regex:\btranscript\s+variant\s*\S*
+qualifier_regex:\ballele\s+\S+
+qualifier_regex:\bvariant\s+\d+
+
+# Genomic annotation artifact as standalone word
+qualifier_regex:\bpseudogene\b
+
+# Trailing "-like": the NCBI pipeline's paralog marker, specific to one
+# genome. Only a TRAILING -like is removed; "Kinesin-like protein KIF1A" is
+# an official name and is kept. The GFF3 writer also never emits a trailing
+# -like on a GOAnnotate product.
+qualifier_regex:[\s-]like\s*$
+
+# Teleost genome-duplicate marker of ZFIN/NCBI names ("Ras-related protein
+# Rab-11b, tandem duplicate 1"): a designation within one genome.
+qualifier_regex:,?\s*tandem duplicate \d+\s*$
+
+# "homolog" is part of official names ("Disks large homolog 5") and is kept
+# in output; it is ignored only when names are compared (see normalize_regex).
+
+# =============================================================================
+# A. IDENTIFIERS (identifier_regex:) - removed from names as tokens
+# =============================================================================
+# "Bombesin receptor-activated protein C6orf89" -> "Bombesin receptor-activated protein"
+# "Uncharacterized protein KIAA2026"            -> "Uncharacterized protein" -> placeholder, discarded
+# "RIKEN cDNA 1700129C05 gene like"             -> nothing left, discarded
+
+# NCBI LOC numbers ("protein LOC121139165")
+identifier_regex:\bLOC\d{4,}\b
+
+# RIKEN cDNA project: full phrase and bare clone IDs (1700129C05Rik, D930020B18Rik)
+identifier_regex:\bRIKEN cDNA \S+ gene\b
+identifier_regex:\b[A-Z]?\d{4,}[A-Z]\d{2}Rik(?:l?\d*)?\b
+identifier_regex:\bRIKEN\b
+
+# MGI placeholder names ("predicted gene 4779", "predicted gene, 35549") and Gm symbols
+identifier_regex:\bpredicted gene,?\s*\d+\b
+identifier_regex:\bGm\d{3,}\b
+
+# cDNA clone names used as protein names ("cDNA sequence BC004004", "expressed sequence AI413782")
+identifier_regex:\bcDNA sequence \S+
+identifier_regex:\bexpressed sequence \S+
+identifier_regex:\bDNA segment,[^,]*,[^,]*expressed \S+
+
+# Clone and cDNA project identifiers inside names
+identifier_regex:\bKIAA\d{4}L?\d*\b(?: homolog)?
+identifier_regex:\bFLJ\d{5}\b
+identifier_regex:\bMGC\d{4,}\b
+identifier_regex:\bDKFZ[pP]\d{3,}[A-Z]\d+\b
+identifier_regex:\bBC\d{6}\b
+identifier_regex:\bIMAGE:\d+\b
+identifier_regex:\bclone[: ]\S+
+
+# Chromosome open reading frame names, a position in one genome
+# (C6orf89, CXorf38, "C1orf122 homolog", chicken-style "C2H1orf43")
+identifier_regex:\bC(?:\d{1,2}|[XY])(?:H\d{1,2})?orf\d+[A-Z]?\b(?: homolog)?
+identifier_regex:\b(?:chromosome|linkage group) [0-9XYZW]{1,2}(?:H\d{1,2})? open reading frame,? \d+(?:[ -]like(?: \d+)?| homolog)?
+identifier_regex:\bCUNH\d+orf\d+\b
+identifier_regex:\bLG\d+H\d+orf\d+\b
+
+# C. elegans cosmid gene names (K02A2.6, F59E12.2, Y48G1A.4, ZK1307.6) and
+# clone accessions (AL929275.1, AABR07066201.1) used as names
+identifier_regex:\b[A-Z]{1,3}\d{1,3}[A-Z]{1,2}\d{1,3}[A-Z]?\.\d{1,2}[a-z]?\b
+identifier_regex:\bZK\d{2,4}\.\d{1,2}[a-z]?\b
+
+# FlyBase annotation identifiers of unnamed Drosophila genes ("collagen alpha
+# chain CG42342", "protein CG14286") and species-prefixed FlyBase symbols
+# (Dmel\CG12325, Dsim\GD10424)
+identifier_regex:\bD[a-z]{3}\\\S+
+identifier_regex:\bCG\d{3,6}\b
+identifier_regex:\b[A-Z]{1,4}\d{6,}\.\d+\b
+
+# UniProt uncharacterized protein family numbers ("UPF0462 protein C4orf33")
+identifier_regex:\bUPF\d{4}\b
+
+# Pfam domains of unknown function ("DUF1234 domain-containing protein")
+identifier_regex:\bDUF\d{3,}\b
+
+# Sequence database accessions inside names
+identifier_regex:\bENS[A-Z]*[GPT]\d{11}\b
+identifier_regex:\b[XNY]P_\d+(?:\.\d+)?\b
+
+# Zebrafish clone names (si:dkey-7j14.5, zgc:112345, wu:fb12a03, im:7142702)
+identifier_regex:\b(?:si|zgc|wu|im|zmp):\S+
+
+# Plant locus identifiers
+identifier_regex:\bAt[1-5CM]g\d{5}\b
+identifier_regex:\bOs\d{2}g\d{7}\b
+identifier_regex:\bLOC_Os\d{2}g\d{5}\b
+identifier_regex:\bZm\d{5}[a-z]\d{6}\b
+identifier_regex:\bGRMZM\d+G\d+\b
+identifier_regex:\bGlyma[.\d]*\d+[Gg]\d+\b
+identifier_regex:\bMedtr\dg\d+\b
+
+# Gene prediction tool IDs
+identifier_regex:\bg\d+\.t\d+\b
+identifier_regex:\b(?:maker|augustus|snap|genemark)-\S+
+identifier_regex:\bGENSCAN\S*
+
+# =============================================================================
+# PLACEHOLDERS (placeholder:) - whole names with no information
+# =============================================================================
+# Tested after qualifiers and identifiers are removed. Punctuation and case
+# are ignored, so "Uncharacterized protein" and "uncharacterized protein," match.
+
+placeholder:protein
+placeholder:proteins
+placeholder:polypeptide
+placeholder:peptide
+placeholder:gene
+placeholder:orf
+placeholder:open reading frame
+placeholder:newentry
+placeholder:uncharacterized
+placeholder:uncharacterised
+placeholder:uncharacterized protein
+placeholder:uncharacterised protein
+placeholder:putative uncharacterized protein
+placeholder:hypothetical protein
+placeholder:conserved hypothetical protein
+placeholder:hypothetical conserved protein
+placeholder:conserved protein
+placeholder:predicted protein
+placeholder:unknown protein
+placeholder:unknown
+placeholder:unnamed protein product
+placeholder:putative protein
+placeholder:expressed protein
+placeholder:protein of unknown function
+placeholder:unknown function
+placeholder:domain
+placeholder:domain protein
+placeholder:domain-containing protein
+placeholder:domain containing protein
+placeholder:family protein
+placeholder:family member
+placeholder:repeat-containing protein
+placeholder:repeat protein
+placeholder:motif-containing protein
+placeholder:membrane protein
+placeholder:transmembrane protein
+placeholder:secreted protein
+placeholder:nuclear protein
+placeholder:cytoplasmic protein
+placeholder:mitochondrial protein
+placeholder:protein homolog
+placeholder:uncharacterized membrane protein
+placeholder:uncharacterized transmembrane protein
+placeholder:uncharacterized secreted protein
+placeholder:homolog
+placeholder:not available
+placeholder:na
+placeholder:none
+placeholder:null
+
+# =============================================================================
+# DISCARDS (exact: / contains: / regex:) - names removed entirely
+# =============================================================================
+
+# Placeholders with a leading qualifier that is not stripped
+regex:^(?:uncharacterized |uncharacterised |conserved )?(?:hypothetical |predicted |unknown )?domain[- ]containing protein$
+regex:^(?:uncharacterized |uncharacterised |conserved )?family protein$
+contains:conserved hypothetical
+contains:hypothetical protein
+contains:unnamed protein product
+contains:unknown function
+
+# Uncharacterized names with only a location or a typo ("uncharacterized
+# protein, mitochondrial", "umcharacterized homolog")
+regex:^(?:un?characteri[sz]ed|umcharacteri[sz]ed|hypothetical|unknown|predicted|novel)(?: protein| gene)?(?:,? (?:mitochondrial|chloroplastic|homolog|family member|precursor))*$
+
+# Names truncated in the source database ("Serine/threonine-protein" in TrEMBL)
+exact:serine/threonine-protein
+exact:tyrosine-protein
+
+# Chicken/other chromosome-ORF abbreviations used as names ("CG025 protein", "CB069 protein")
+regex:^C[A-Z]\d{3} protein$
+
+# UniProt entry names (5 characters) used as protein names in TrEMBL
+# ("ZN208 protein", "KI20A protein", "MBB1A protein") and locus tags with "protein"
+# ("PFC0760c protein"); other hits of the gene carry the real name
+regex:^(?=[A-Z0-9]{5} protein$)[A-Z]{1,3}\d{1,3}[A-Z]?\d? protein$
+regex:^[A-Z]{2,4}\d{4,}[a-z]? protein$
+
+# Names that are only an accession or locus tag
+regex:^[A-Z]{2,4}\d{4,}$
+regex:^[A-Za-z]+_\d+_[A-Za-z]+$
+regex:^orf\d+$
+regex:^\d+$
+
+# =============================================================================
+# C. FAMILY-LEVEL NAMES (generic_regex:) - kept, used only when nothing more
+#    specific is available in the winning group
+# =============================================================================
+# A structural rule also marks as family-level any name of one or two words
+# that ends in a protein-class word (receptor, kinase, protein, transporter,
+# channel, hydrolase, ...) and has no designator (a number, a code such as
+# 4K36 or PLK1, a Greek letter). "Olfactory receptor" is family-level,
+# "Olfactory receptor 4K36" is not. The lines below cover names the rule
+# misses. The audit file marks family-level products with G.
+
+generic_regex:^E3 ubiquitin-protein ligase$
+generic_regex:^serine/threonine-protein kinase$
+generic_regex:^tyrosine-protein kinase$
+generic_regex:^G[- ]protein[- ]coupled receptor$
+generic_regex:^olfactory receptor$
+generic_regex:^vomeronasal(?: type-[12])? receptor$
+generic_regex:^taste receptor$
+generic_regex:^zinc finger protein$
+generic_regex:^C2H2-type zinc finger protein$
+generic_regex:^KRAB domain-containing zinc finger protein$
+generic_regex:^ubiquitin carboxyl-terminal hydrolase$
+generic_regex:^histone H\d[AB]?$
+generic_regex:^immunoglobulin (?:heavy|light|kappa|lambda) (?:chain|variable region)$
+generic_regex:^T[- ]cell receptor (?:alpha|beta|gamma|delta) (?:chain|variable)$
+generic_regex:^(?:ATP-binding cassette|ABC) transporter$
+generic_regex:^solute carrier family \d+ member$
+generic_regex:^cytochrome P450$
+generic_regex:^glutathione S-transferase$
+generic_regex:^heat shock protein$
+generic_regex:^keratin$
+generic_regex:^protocadherin$
+generic_regex:^cadherin$
+generic_regex:^interferon$
+generic_regex:^interleukin$
+generic_regex:^transposase$
+# UniRule/InterPro-derived TrEMBL names: domain or enzyme class without a member
+generic_regex:domain[- ]containing protein$
+generic_regex:^[A-Za-z]+-like protein$
+generic_regex:^RING-type E3 ubiquitin transferase$
+generic_regex:^HECT-type E3 ubiquitin transferase$
+generic_regex:^small monomeric GTPase$
+generic_regex:^non-specific (?:serine/threonine )?protein[- ]kinase$
+generic_regex:^protein-(?:tyrosine|serine/threonine)-(?:phosphatase|kinase)$
+generic_regex:^protein-serine/threonine phosphatase$
+generic_regex:^carboxylic ester hydrolase$
+generic_regex:^(?:phospholipid|calcium|sodium/potassium|P-type)-transporting ATPase$
+generic_regex:^palmitoyltransferase$
+generic_regex:^phosphodiesterase$
+generic_regex:^UDP-glucuronosyltransferase$
+generic_regex:^fibroblast growth factor receptor$
+generic_regex:^taste receptor type \d$
+generic_regex:^(?:septin|tetraspanin|chymotrypsin|trypsin|claudin|annexin|galectin|syntaxin|kelch|ankyrin|cathepsin|collagen)$
+generic_regex:^casein kinase I$
+generic_regex:^poly \[ADP-ribose\] polymerase$
+generic_regex:^(?:homeobox|ribosomal|keratin-associated|microtubule-associated|forkhead box|ras-related) protein$
+generic_regex:^protein S100$
+generic_regex:^unspecific monooxygenase$
+generic_regex:^peptidylprolyl isomerase$
+generic_regex:^reverse transcriptase$
+generic_regex:^(?:endogenous )?retrovirus(?:-related)? (?:Pol|Gag|Env) polyprotein$
+
+# =============================================================================
+# COMPARISON ONLY (normalize_regex:) - ignored when names are compared
+# =============================================================================
+
+normalize_regex:\bhomolog\b
+normalize_regex:\bprecursor\b
+normalize_regex:-like\b
+
+# =============================================================================
+# GENE SYMBOLS (symbol_regex:) - discarded after ortholog resolution
+# =============================================================================
+# A symbol that matches here is first used to look up the gene in NCBI
+# gene_info and gene_orthologs; LOC121139165 from hamster still names a
+# real hamster gene whose human ortholog has a symbol. Only symbols that fail
+# to resolve are blanked.
+
+# Too short or purely numeric
+symbol_regex:^.{0,1}$
+symbol_regex:^\d+$
+
+# NCBI LOC numbers and MGI predicted genes
+symbol_regex:^LOC\d+$
+symbol_regex:^GM\d{3,}$
+
+# RIKEN clone IDs (4933434E20Rik, 1700010I14Rik)
+symbol_regex:^[A-Z]?\d+[A-Z]+\d+RIK(?:L?\d*)?$
+
+# Clone and cDNA project IDs
+symbol_regex:^KIAA\d+L?\d*$
+symbol_regex:^FLJ\d+$
+symbol_regex:^MGC\d+$
+symbol_regex:^DKFZP\d+[A-Z]\d+$
+symbol_regex:^BC\d{6}$
+symbol_regex:^[A-Z]\d{5}$
+
+# Clone and cDNA library identifiers kept as synonyms in NCBI gene_info
+# (HSPC041, CGI-12, UNQ1867, PRO2730, PSEC0105, LP2643, NPD011, HEL-S-15)
+symbol_regex:^(?:HSPC|CGI|UNQ|PRO|PSEC|LP|PP|NPD|HT|DC|MST|BM)-?\d{3,}$
+symbol_regex:^HEL-?S?-?\d+[A-Z]?$
+symbol_regex:^CGI-\d+$
+symbol_regex:^DJ\d+[A-Z]\d+(?:\.\d+)?$
+symbol_regex:^RP\d+-\d+[A-Z]\d+(?:\.\d+)?$
+
+# Chromosome ORF naming in any species form
+# (C1orf43, CXorf38, C3ORF86P, CXORF49C, CUNHXORF65, CB3H14ORF180, LG4H1ORF43, ZHX1-C8ORF76)
+symbol_regex:^C[A-Z0-9]*ORF\d+[A-Z]?$
+symbol_regex:^CUNH\d+ORF\d+$
+symbol_regex:^LG\d+H\d+ORF\d+$
+symbol_regex:-C\d+ORF\d+$
+symbol_regex:^ORF\d*$
+
+# FlyBase annotation identifiers (CG12325) and species-prefixed FlyBase
+# symbols (Dmel\CG12325), OrthoDB group IDs (EOG090X0JQ4), C. elegans
+# cosmid gene names (K02A2.6, Y54E10A.3, ZK1307.6)
+symbol_regex:^CG\d+$
+symbol_regex:^D[A-Z]{3}\\
+symbol_regex:^EOG\d{2}[A-Z0-9]{5,}$
+symbol_regex:^[A-Z]{1,3}\d{1,3}[A-Z]{1,2}\d{1,3}[A-Z]?\.\d{1,2}[A-Z]?$
+symbol_regex:^ZK\d{2,4}\.\d{1,2}[A-Z]?$
+
+# Zebrafish clone IDs
+symbol_regex:^SI:
+symbol_regex:^ZGC:\d+$
+symbol_regex:^WU:
+symbol_regex:^IM:
+symbol_regex:^ZMP:
+
+# Locus tags of genome annotation projects (PREFIX_DIGITS and variants):
+# D9C73_027734, XNOV1_A014589, D4764_01G0004220, D5F01_LYC10690, Nfu_g_1_016631,
+# EXN66_Car014809, DR999_PMT18446, MMEN_LOCUS7967, PECUL_23A059567, HispidOSU_009782,
+# ZBED1_224, MCOR_777
+symbol_regex:^[A-Z0-9]+_\d+$
+# with several underscore-separated parts (CLODIP_2_CD13543)
+symbol_regex:^[A-Z0-9]+(?:_[A-Z0-9]+)*_[A-Z]*\d{3,}$
+symbol_regex:^[A-Z0-9]+_[A-Z]*\d{4,}$
+
+# =============================================================================
+# PRODUCT NAMES (product_regex:) - applied to the final product names only
+# =============================================================================
+# Conventions of the INSDC/NCBI protein naming guidelines that UniProt names
+# do not always follow. "PATTERN => REPLACEMENT"; without "=>" the match is
+# removed. Patterns are case-insensitive; (?-i:...) makes a part case-
+# sensitive. Disabled with --no-product-cleanup.
+
+# EC and TC numbers belong in their own qualifiers, not in the name
+product_regex:\s*\((?:EC|TC)[ :][\d.\-]+\)
+
+# Molecular weights in parentheses ("(45 kDa)")
+product_regex:\s*\(\d+(?:\.\d+)?\s*kDa\)
+
+# Species names: "(Homo sapiens)", "Homo sapiens ...", "Drosophila homolog", "homolog of human ..."
+product_regex:\s*\((?-i:[A-Z][a-z]+ [a-z]{3,}(?: [a-z]+)?)\)
+product_regex:^(?:Homo sapiens|Mus musculus|Rattus norvegicus|Danio rerio|Gallus gallus|Xenopus (?:laevis|tropicalis)|Drosophila melanogaster|Caenorhabditis elegans|Saccharomyces cerevisiae|Escherichia coli)\s+
+product_regex:\b(?:Drosophila|yeast|C\. elegans|S\. cerevisiae|E\. coli|Xenopus|zebrafish|human|mouse|murine|rat) (homolog(?:ue)?|ortholog(?:ue)?)\b => \1
+product_regex:\b(homolog(?:ue)?|ortholog(?:ue)?) of (?:human|mouse|rat|Drosophila|yeast|C\. elegans|S\. cerevisiae|E\. coli|Xenopus|zebrafish)\b => \1
+
+# "<SYMBOL> protein" -> "protein <SYMBOL>" (gene symbol plus the word protein)
+product_regex:^((?-i:[A-Z][A-Z0-9]{2,})(?:-\d+)?) protein$ => protein \1
+
+# Doubled words and leftover punctuation
+product_regex:\b(protein|receptor|factor|subunit|kinase) \1\b => \1
+product_regex:\s*,\s*$
+product_regex:\s+precursor$
+symbol_regex:^[A-Z]\d+_\d+G\d+$
+symbol_regex:^[A-Z]\d+[A-Z]+_[A-Z]+\d+$
+symbol_regex:^[A-Z][A-Z]+_[A-Z]_\d+_\d+$
+symbol_regex:^[A-Z0-9]+_[A-Z][A-Z]+\d{4,}$
+symbol_regex:^[A-Z]\d+_[A-Z]+\d+$
+symbol_regex:^[A-Z0-9]+_LOCUS\d+$
+symbol_regex:^[A-Z]+_[A-Z0-9]*\d{5,}$
+symbol_regex:^[A-Z][A-Z0-9]*_[A-Z0-9]*\d{4,}$
+
+# Medaka (OLA.12830), Xenopus (XELAEV_18009728mg), Tetraodon (GSTENG00028376001)
+symbol_regex:^OLA\.\d+$
+symbol_regex:^XELAEV_\d+
+symbol_regex:^[A-Z]{3,}\d{8,}$
+
+# Short prefix + many digits (PPUP9740, Olr1468, Zfp1006): species-numbered
+# symbols that failed to resolve to the reference nomenclature
+symbol_regex:^[A-Z]{2,4}\d{4,}(?:L\d*)?$
+symbol_regex:^[A-Z]{4,}[A-Z0-9]*\d{4,}$
+symbol_regex:^UNKNOWN_GENE_\d+$
+symbol_regex:^[A-Z][A-Z0-9]{2,5}-\d{4,}$
+
+# Accession numbers with version (CU459095.1, CABZ01015475.1)
+symbol_regex:^[A-Z]{1,4}\d{5,}\.\d+$
+
+# Automatic paralog/copy numbering (LIN1_28, Pol_27, YME1L1_1)
+symbol_regex:^[A-Z0-9]{2,10}_\d{1,2}$
+
+# Ensembl IDs and plant locus IDs
+symbol_regex:^ENS[A-Z]+\d+$
+symbol_regex:^GRMZM\d+G\d+$
+symbol_regex:^Glyma\.\d+G\d+$
+symbol_regex:^AT[1-5CM]G\d{5}$
+symbol_regex:^OS\d{2}G\d{7}$
+
+# Transposon/retrotransposon naming (off by default)
+#symbol_regex:^POL_?\d*$
+#symbol_regex:^PO\d+$
+#symbol_regex:^TPASE$
+#symbol_regex:^TY3B-
+
+# =============================================================================
+# ADD CUSTOM PATTERNS IN A SEPARATE FILE (--bad-names-extra FILE)
+# =============================================================================
+# identifier_regex:\bMyGenome_\d+\b
+# symbol_regex:^MyGenome_\d+$

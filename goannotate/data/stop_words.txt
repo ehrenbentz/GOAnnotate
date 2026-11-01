@@ -1,0 +1,69 @@
+# GOAnnotate stop words: words that say nothing about what a protein is.
+# They count 0 when protein names are compared for clustering and
+# agreement (--word-weighting idf or stoplist). Output names are not
+# affected. One word per line, case-insensitive; # starts a comment.
+# After the AHRD blacklist and the PANNZER2 uninformative-word list.
+
+# Placeholders and qualifiers
+protein
+proteins
+polypeptide
+putative
+predicted
+probable
+possible
+hypothetical
+uncharacterized
+uncharacterised
+conserved
+novel
+unknown
+unnamed
+expressed
+# Relationship words
+homolog
+homologue
+homologous
+ortholog
+orthologue
+similar
+like
+related
+family
+member
+# Sequence-record words
+fragment
+partial
+isoform
+variant
+precursor
+product
+gene
+cdna
+clone
+orf
+sequence
+complete
+cds
+genome
+genomic
+shotgun
+chromosome
+contig
+low
+quality
+# Function words
+of
+and
+the
+with
+in
+to
+a
+an
+or
+for
+from
+by
+at
+on
