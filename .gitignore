@@ -31,6 +31,7 @@ build/
 
 # Output directories
 *output*
+!goannotate/output.py
 
 # Temporary files
 *.tmp
