@@ -154,6 +154,51 @@ class Module:
         return []
 
 
+def clean_sequence(seq: str) -> str:
+    """Upper case, trailing stop codons removed, internal stops and non-standard letters replaced by X."""
+    s = seq.upper().rstrip("*").replace("*", "X")
+    return _NONSTANDARD.sub("X", s)
+
+
+def physical_cores() -> int:
+    """
+    Number of physical CPU cores (hardware threads counted once), from
+    /proc/cpuinfo on Linux; os.cpu_count() where that is not available.
+    """
+    try:
+        cores = set()
+        phys = core = None
+        with open("/proc/cpuinfo") as fh:
+            for line in fh:
+                if line.startswith("physical id"):
+                    phys = line.split(":", 1)[1].strip()
+                elif line.startswith("core id"):
+                    core = line.split(":", 1)[1].strip()
+                elif not line.strip():
+                    if core is not None:
+                        cores.add((phys, core))
+                    phys = core = None
+        if core is not None:
+            cores.add((phys, core))
+        if cores:
+            return len(cores)
+    except OSError:
+        pass
+    return os.cpu_count() or 1
+
+
+def available_memory_gb():
+    """MemAvailable from /proc/meminfo in GB, or None where it cannot be read."""
+    try:
+        with open("/proc/meminfo") as fh:
+            for line in fh:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) / 1024 ** 2
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
 def write_clean_proteins(records: list, path: Path, max_length: int = 0) -> int:
     """
     Write protein records as (id, sequence) with every non-standard letter
@@ -164,8 +209,7 @@ def write_clean_proteins(records: list, path: Path, max_length: int = 0) -> int:
     n = 0
     with open(path, "w") as fh:
         for seq_id, seq in records:
-            s = seq.upper().rstrip("*").replace("*", "X")
-            s = _NONSTANDARD.sub("X", s)
+            s = clean_sequence(seq)
             if max_length and len(s) > max_length:
                 s = s[:max_length]
             if not s:

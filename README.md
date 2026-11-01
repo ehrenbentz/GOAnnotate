@@ -263,6 +263,9 @@ goannotate \
 | `--check-tools` | off | Report which external tools are available, then exit |
 | `--force-modules` | off | Rerun the module tools even when their results exist |
 | `--signalp-bin`, `--signalp-mode`, `--signalp-features` | `signalp6` on PATH, fast, off | SignalP module settings |
+| `--signalp-min-probability` | 0 (SignalP's call) | Minimum SignalP probability for a signal peptide call |
+| `--signalp-processes` | one per physical core | Parallel `signalp6` processes, one thread each |
+| `--signalp-alt-starts` | off | Flag proteins with a signal peptide from an internal start codon |
 | `--threads` | all CPUs | Threads for Diamond, workers for annotation and threads for the module tools |
 | `--prefix` | output dir name | Prefix for output filenames |
 
@@ -531,17 +534,24 @@ Runs [SignalP 6](https://services.healthtech.dtu.dk/services/SignalP-6.0/) (Teuf
 
 SignalP 6 is distributed under an academic licence: register at the DTU page, download the package (the `fast` model at least; the `slow` models are a separate download), install it with `pip install signalp-6-package/` and copy its model weights into the installed package as the SignalP installation notes describe. The package supports Python up to 3.10 and PyTorch below 2.0, so it will usually live in its own conda environment; point `--signalp-bin` at that environment's `signalp6` executable (for example `~/miniconda3/envs/signalp6/bin/signalp6`). The module is skipped with a note when the executable is not found.
 
-Only the first 70 residues of a protein are used by SignalP, so the proteins are truncated to 200 residues before the run; stop codons and non-standard letters are replaced. `--signalp-mode` chooses the model: `fast` (default), `slow` (the full model, needs more than 14 GB RAM) or `slow-sequential` (the full model within the memory of `fast`, about six times slower). The run uses `--threads` for the model and up to 8 writer processes.
+SignalP reads only the first 70 residues of a protein. GOAnnotate therefore sends it only those 70 residues (stop codons and non-standard letters replaced), predicts each distinct 70-residue N-terminus once, and copies the result to every transcript that shares it; isoforms often do (about a third fewer predictions for the prairie vole). The predictions run as parallel `signalp6` processes on chunks of the input, each with one PyTorch thread: one process per physical core by default, limited by `--threads` and by available memory (about 2.5 GB per process in `fast` mode), or the number set with `--signalp-processes`. Progress is written to `signalp.log` in each chunk directory and summarized in the GOAnnotate log every minute.
+
+`--signalp-mode` chooses the model: `fast` (default), `slow` (the full model, needs more than 14 GB RAM per process) or `slow-sequential` (the full model within the memory of `fast`, about six times slower). A protein is called as having a signal peptide when SignalP calls one; `--signalp-min-probability P` additionally requires a SignalP probability of at least P.
+
+Runtime guide (`fast` mode, Threadripper 3970X, 32 cores): about 15 distinct N-termini per second with 32 processes of one thread each, against 9.6 per second for one process with 32 threads; about 30 minutes for the prairie vole (43,357 proteins, 27,685 distinct N-termini). Predictions are identical for every process and thread arrangement.
+
+**Alternative starts (`--signalp-alt-starts`).** A protein without a signal peptide at its annotated start may have one from a later start codon when the gene model begins too far upstream. With this option, every such protein whose first 60 residues contain an internal methionine followed by a signal-peptide-like hydrophobic core (6 of 8 consecutive hydrophobic residues within the next 30; 98% of the signal peptides SignalP calls in the prairie vole pass this test from their own start) is predicted again from each such methionine, and the first one with a signal peptide is reported. The gate depends on the sequence only, so it also finds secreted proteins without known homologs. It adds about a third to the SignalP runtime (prairie vole: 7,941 additional distinct starts, about 9 minutes on 32 cores). A signal peptide found this way is reported as a flag in `sp_alternative_start` and in a separate report; it does not change the main call or the gene model. Where the transcript's best hit that aligns from the database protein's first residues starts its alignment at or after that methionine, the flag notes this homolog (the residues before the methionine have no counterpart in it).
 
 Outputs:
 
 | Where | Content |
 |-------|---------|
 | gene table | `signal_peptide`: `yes`, `no`, or `yes (1/3 isoforms)` when only some coding isoforms carry one; empty for genes without a scored protein |
-| transcript table | `signal_peptide` (`yes`/`no`), `sp_probability`, `sp_cleavage` (`22-23`: the signal peptidase cleaves between residues 22 and 23) |
-| annotated GFF3 | `goannotate_signal_peptide=yes` on genes and transcripts with a signal peptide, `goannotate_sp_cleavage` on the transcript; with `--signalp-features`, a `sig_peptide` feature (INSDC type, accepted by table2asn) under each such mRNA, with genomic coordinates mapped through the CDS segments (one line per segment when the signal peptide spans an intron) |
+| transcript table | `signal_peptide` (`yes`/`no`), `sp_probability`, `sp_cleavage` (`22-23`: the signal peptidase cleaves between residues 22 and 23); with `--signalp-alt-starts`, `sp_alternative_start` (`M34: SP 0.99, cleavage 55-56; homolog P99999 aligns from residue 34`, positions in the annotated protein) |
+| annotated GFF3 | `goannotate_signal_peptide=yes` on genes and transcripts with a signal peptide, `goannotate_sp_cleavage` on the transcript, `goannotate_sp_alternative_start=M34` on transcripts flagged by `--signalp-alt-starts`; with `--signalp-features`, a `sig_peptide` feature (INSDC type, accepted by table2asn) under each such mRNA, with genomic coordinates mapped through the CDS segments (one line per segment when the signal peptide spans an intron) |
 | `reports/{prefix}_secretome.tsv` | gene_id, transcript_id, symbol, product, sp_probability, cleavage_site, cs_probability for every protein with a signal peptide |
-| `intermediate/{prefix}_signalp/` | SignalP's own `prediction_results.txt`, `output.gff3`, `processed_entries.fasta` (mature proteins) and the run log |
+| `reports/{prefix}_signalp_alternative_starts.tsv` | with `--signalp-alt-starts`: gene_id, transcript_id, symbol, product, sp_probability_annotated_start, alternative_start, sp_probability_alternative_start, cleavage_site, homology_support |
+| `intermediate/{prefix}_signalp/` | `annotated_starts/` (and `alternative_starts/`): the merged `prediction_results.txt` and one directory per chunk with SignalP's own outputs and its log |
 
 No GO terms are added: a signal peptide is not a GO assertion by itself.
 

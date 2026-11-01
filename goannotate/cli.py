@@ -287,6 +287,17 @@ Examples:
     g.add_argument("--signalp-features", action="store_true",
                    help="Also write sig_peptide features (INSDC type) under coding transcripts with a\n"
                         "signal peptide in the annotated GFF3, with genomic coordinates")
+    g.add_argument("--signalp-min-probability", type=float, default=0.0, metavar="P",
+                   help="Signal peptide calls also need a SignalP probability of at least P\n"
+                        "(default: 0, SignalP's own call)")
+    g.add_argument("--signalp-processes", type=int, default=0, metavar="N",
+                   help="Parallel signalp6 processes, one thread each (default: one per physical core,\n"
+                        "limited by --threads and by available memory)")
+    g.add_argument("--signalp-alt-starts", action="store_true",
+                   help="Check proteins without a signal peptide for one at an internal methionine within\n"
+                        "the first 60 residues that is followed by a hydrophobic core (a possible start\n"
+                        "codon error of the gene model). Reported as a flag only; adds about a third to the\n"
+                        "SignalP runtime")
 
     g = parser.add_argument_group("Performance options")
     g.add_argument("--threads", type=int, default=None,
@@ -305,6 +316,10 @@ def validate(args, parser) -> None:
             parse_selection(args.modules)
         except ValueError as e:
             parser.error(f"--modules: {e}")
+    if not 0.0 <= args.signalp_min_probability <= 1.0:
+        parser.error("--signalp-min-probability must be between 0 and 1")
+    if args.signalp_processes < 0:
+        parser.error("--signalp-processes must be 0 (automatic) or a positive number")
     if args.check_tools:
         return
     if not args.output:

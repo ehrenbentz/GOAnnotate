@@ -19,7 +19,9 @@ from goannotate.gff3 import Transcript, Gene  # noqa: E402
 from goannotate.models import GeneUniverse, QueryAnnotation  # noqa: E402
 from goannotate.modules import parse_selection, run_modules, select_modules, ModuleContext  # noqa: E402
 from goannotate.modules.base import protein_to_genomic, write_clean_proteins  # noqa: E402
-from goannotate.modules.signalp import SignalPModule, parse_prediction_results  # noqa: E402
+from goannotate.modules.signalp import (SignalPModule, alternative_start, alternative_starts, hydrophobic_core,  # noqa: E402
+                                        parse_prediction_results, plan_processes)
+from goannotate.models import BlastHit  # noqa: E402
 from goannotate import output  # noqa: E402
 
 failures = 0
@@ -33,8 +35,11 @@ def check(cond, label):
 
 
 FAKE_SIGNALP = """#!/bin/sh
-# Stand-in for signalp6: every sequence whose ID contains 'sec' gets a
-# signal peptide with cleavage after residue 22; the others are OTHER.
+# Stand-in for signalp6, deciding from the sequence (one line per record):
+# LLLL within the first 30 residues: SP, probability 0.987655, cleavage after 22;
+# WLW within the first 30 residues: SP, probability 0.6, cleavage after 18;
+# otherwise OTHER. Writes a tqdm-like progress line and records every input
+# sequence in $SIGNALP_FAKE_LOG when that is set.
 fasta=""; outdir=""
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -48,12 +53,15 @@ mkdir -p "$outdir"
 out="$outdir/prediction_results.txt"
 printf '# SignalP-6.0\\tOrganism: Eukarya\\tTimestamp: test\\n' > "$out"
 printf '# ID\\tPrediction\\tOTHER\\tSP(Sec/SPI)\\tCS Position\\n' >> "$out"
-grep '^>' "$fasta" | sed 's/^>//' | while read -r id; do
-  case "$id" in
-    *sec*) printf '%s\\tSP\\t0.012345\\t0.987655\\tCS pos: 22-23. Pr: 0.9512\\n' "$id" >> "$out" ;;
-    *)     printf '%s\\tOTHER\\t0.999900\\t0.000100\\t\\n' "$id" >> "$out" ;;
-  esac
-done
+n=$(grep -c '^>' "$fasta")
+awk '/^>/{id=substr($0,2); next} {
+  head=substr($0,1,30)
+  if (index(head,"LLLL")) printf "%s\\tSP\\t0.012345\\t0.987655\\tCS pos: 22-23. Pr: 0.9512\\n", id
+  else if (index(head,"WLW")) printf "%s\\tSP\\t0.400000\\t0.600000\\tCS pos: 18-19. Pr: 0.5000\\n", id
+  else printf "%s\\tOTHER\\t0.999900\\t0.000100\\t\\n", id
+}' "$fasta" >> "$out"
+if [ -n "${SIGNALP_FAKE_LOG:-}" ]; then grep -v '^>' "$fasta" >> "$SIGNALP_FAKE_LOG"; fi
+printf 'Predicting: 100%%| %s/%s [00:01<00:00]\\n' "$n" "$n" >&2
 """
 
 
@@ -124,25 +132,43 @@ def test_module_end_to_end(tmp):
     fake.write_text(FAKE_SIGNALP)
     fake.chmod(fake.stat().st_mode | stat.S_IXUSR)
 
+    # g2's isoforms share their first 70 residues (one SignalP input); g4's
+    # annotated start has no signal peptide but an internal Met at residue 34
+    # starts one; g5's signal peptide has probability 0.6.
+    g2_head = "MRLLLLALLAVSSAAEKKPEL" + "A" * 49
+    g4_seq = "MSTWWPNTEKNHVHQPYENRSTDEKQPNGSRDE" + "MFQLLLLAVLLASAQAQSSDEEK"
+    # g6: the first gated Met (residue 11) has no signal peptide, the second (residue 42) has one
+    g6_seq = "MSTDEKPNGS" + "MAVIAVFAGTDEKPNGSRDEQKPNTSRDEQK" + "MFLLLLAVLASAQAQSSDEEK"
     proteins = tmp / "proteins.faa"
     proteins.write_text(">g1_sec_t1 gene=g1\nMKTLLLLAVLLAVAGASAQAQSSDEEKTT*\n"
                         ">g1_t2 gene=g1\nMAAAAKKKDDDEEE\n"
-                        ">g2_sec_t1 gene=g2\nMRLLPLLALLAVSSAAEKKPEL\n"
-                        ">g3_t1 gene=g3\nMSSSSSSSSTTTT\n")
-    universe = GeneUniverse(
-        gene_ids=["g1", "g2", "g3"],
-        transcript_to_gene={"g1_sec_t1": "g1", "g1_t2": "g1", "g2_sec_t1": "g2", "g3_t1": "g3"},
-        gene_to_transcripts={"g1": ["g1_sec_t1", "g1_t2"], "g2": ["g2_sec_t1"], "g3": ["g3_t1"]},
-        coding={"g1": True, "g2": True, "g3": True})
+                        f">g2_sec_t1 gene=g2\n{g2_head}KKK\n"
+                        f">g2_sec_t2 gene=g2\n{g2_head}DDD\n"
+                        ">g3_t1 gene=g3\nMSSSSSSSSTTTT\n"
+                        f">g4_t1 gene=g4\n{g4_seq}\n"
+                        ">g5_t1 gene=g5\nMAWLWAAQSSDEEK\n"
+                        f">g6_t1 gene=g6\n{g6_seq}\n")
+    tx2g = {"g1_sec_t1": "g1", "g1_t2": "g1", "g2_sec_t1": "g2", "g2_sec_t2": "g2", "g3_t1": "g3",
+            "g4_t1": "g4", "g5_t1": "g5", "g6_t1": "g6"}
+    g2t = {}
+    for t, g in tx2g.items():
+        g2t.setdefault(g, []).append(t)
+    universe = GeneUniverse(gene_ids=list(g2t), transcript_to_gene=tx2g, gene_to_transcripts=g2t,
+                            coding={g: True for g in g2t})
     annotations = {g: QueryAnnotation(query_id=g, consensus_symbol=g.upper(), consensus_name=f"protein {g}")
                    for g in universe.gene_ids}
+    # g4's best hit aligns from the homolog's residue 1 to the query's residue 34 (the internal Met)
+    annotations["g4"].hits = [BlastHit("g4_t1", "sp|P99999|TEST_HUMAN", 80.0, 50, 0, 0, 34, 83, 1, 50, 1e-20, 200.0),
+                              BlastHit("g4_t1", "tr|A0A000|X_MOUSE", 60.0, 40, 0, 0, 40, 79, 10, 49, 1e-10, 90.0)]
     work = tmp / "intermediate"
     reports = tmp / "reports"
     work.mkdir()
     reports.mkdir()
+    fake_log = tmp / "fake_inputs.txt"
+    os.environ["SIGNALP_FAKE_LOG"] = str(fake_log)
 
     args = Namespace(modules="signalp", signalp_bin=str(fake), signalp_mode="fast", signalp_features=True,
-                     force_modules=False)
+                     force_modules=False, signalp_alt_starts=True, signalp_min_probability=0.0, signalp_processes=0)
     selected = select_modules(args)
     check(len(selected) == 1 and isinstance(selected[0], SignalPModule), "signalp module selected")
     ctx = ModuleContext(query_fasta=proteins, search_mode="blastp", work_dir=work, reports_dir=reports,
@@ -151,21 +177,59 @@ def test_module_end_to_end(tmp):
     check(len(ran) == 1, "module ran with the stand-in executable")
     m = ran[0]
     check(m.status.available and m.status.version == "6.0h", "version parsed from --version")
-    check(m.counts == {"proteins_scored": 4, "transcripts_with_sp": 2, "genes_with_sp": 2, "genes_tested": 3},
-          f"counts {m.counts}")
+    check(m.processes == 2 and len(list((work / "test_signalp" / "annotated_starts").glob("chunk_*"))) == 2,
+          "two processes for --threads 2, one chunk each")
+    inputs = fake_log.read_text().split()
+    check(len(inputs) == 10 and all(len(s) <= 70 for s in inputs),
+          f"7 distinct annotated starts + 3 alternative starts sent, each at most 70 residues ({len(inputs)})")
+    check(m.counts == {"proteins_scored": 8, "distinct_starts": 7, "transcripts_with_sp": 4, "below_cutoff": 0,
+                       "genes_with_sp": 3, "genes_tested": 6, "alt_candidates": 2, "alt_distinct": 3,
+                       "alt_sp": 2, "alt_supported": 1}, f"counts {m.counts}")
+    check(m._tx_value("g2_sec_t2") == "yes" and m._tx_cleavage("g2_sec_t2") == "22-23",
+          "result copied to the isoform with the same N-terminus")
     check(m._gene_value("g1") == "yes (1/2 isoforms)" and m._gene_value("g2") == "yes"
-          and m._gene_value("g3") == "no" and m._gene_value("g4") == "", "gene column values")
+          and m._gene_value("g3") == "no" and m._gene_value("g9") == "", "gene column values")
     check(m._tx_value("g1_sec_t1") == "yes" and m._tx_probability("g1_sec_t1") == "0.988"
           and m._tx_cleavage("g1_sec_t1") == "22-23" and m._tx_probability("g1_t2") == "", "transcript columns")
+    check(m._tx_value("g4_t1") == "no" and
+          m._tx_alt("g4_t1") == "M34: SP 0.99, cleavage 55-56; homolog P99999 aligns from residue 34",
+          f"alternative start in protein coordinates with homology note: {m._tx_alt('g4_t1')!r}")
     secretome = (reports / "test_secretome.tsv").read_text().splitlines()
-    check(len(secretome) == 3 and secretome[1].startswith("g1\tg1_sec_t1\tG1\tprotein g1\t0.988\t22-23\t0.951"),
+    check(len(secretome) == 5 and secretome[1].startswith("g1\tg1_sec_t1\tG1\tprotein g1\t0.988\t22-23\t0.951"),
           "secretome report")
+    alt_rows = (reports / "test_signalp_alternative_starts.tsv").read_text().splitlines()
+    alt_g4 = [r.split("\t") for r in alt_rows[1:] if r.startswith("g4\t")]
+    check(len(alt_rows) == 3 and alt_g4 and alt_g4[0][5:8] == ["M34", "0.988", "55-56"], "alternative-start report")
+    merged = parse_prediction_results(work / "test_signalp" / "annotated_starts" / "prediction_results.txt")
+    check(len(merged) == 7, "chunk outputs merged")
+
+    # Probability cutoff: g5 (0.6) is no longer called; results reused
+    args_cut = Namespace(**{**vars(args), "signalp_min_probability": 0.7})
+    m3 = SignalPModule(args_cut)
+    m3.detect()
+    m3.run(ctx)
+    m3.integrate(ctx)
+    check(m3.runtime == 0.0, "results reused for the cutoff run")
+    check(m3.counts["transcripts_with_sp"] == 3 and m3.counts["below_cutoff"] == 1 and m3._gene_value("g5") == "no",
+          "cutoff removes the 0.6 call")
 
     # Reuse of existing results
     m2 = SignalPModule(args)
     m2.detect()
     m2.run(ctx)
-    check(m2.runtime == 0.0 and len(m2.results) == 4, "existing results reused without rerunning")
+    check(m2.runtime == 0.0 and len(m2.results) == 8, "existing results reused without rerunning")
+    check(m._tx_alt("g6_t1") == "M42: SP 0.99, cleavage 63-64",
+          f"a later Met is tested when the first gated Met has no signal peptide: {m._tx_alt('g6_t1')!r}")
+
+    # Process planning
+    check(plan_processes(8, "fast", requested=3) == (3, "--signalp-processes"), "requested process count used")
+    n, _ = plan_processes(10_000, "fast")
+    check(1 <= n <= (os.cpu_count() or 1), f"automatic process count within the CPUs ({n})")
+
+    # Alternative-start gate
+    check(alternative_start(g4_seq) == 33 and alternative_start("MSTWWPNTEK" * 8) == -1, "internal Met gate")
+    check(alternative_starts(g6_seq) == [10, 41], f"every gated Met listed: {alternative_starts(g6_seq)}")
+    check(hydrophobic_core("MKLLLLAVLLAVAG") and not hydrophobic_core("MKDEKDEKDEKDEKDE"), "hydrophobic core test")
 
     # Blastx input skips the module
     ctx_nt = ModuleContext(query_fasta=proteins, search_mode="blastx", work_dir=work, reports_dir=reports,
@@ -218,11 +282,15 @@ def test_module_end_to_end(tmp):
     gh = gene_file.read_text().splitlines()
     th = tx_file.read_text().splitlines()
     check(gh[0].endswith("\tgo_terms\tsignal_peptide"), "gene table column appended")
-    check(th[0].endswith("\tgo_terms\tsignal_peptide\tsp_probability\tsp_cleavage"), "transcript table columns appended")
+    check(th[0].endswith("\tgo_terms\tsignal_peptide\tsp_probability\tsp_cleavage\tsp_alternative_start"),
+          "transcript table columns appended")
     g1_row = [l for l in gh if l.startswith("g1\t")][0]
     check(g1_row.endswith("\tyes (1/2 isoforms)"), "gene table value")
     sec_row = [l for l in th if "\tg1_sec_t1\t" in l][0]
-    check(sec_row.endswith("\tyes\t0.988\t22-23"), "transcript table values")
+    check(sec_row.endswith("\tyes\t0.988\t22-23\t"), "transcript table values")
+    g4_row = [l for l in th if "\tg4_t1\t" in l][0]
+    check(g4_row.endswith("\tno\t\t\tM34: SP 0.99, cleavage 55-56; homolog P99999 aligns from residue 34"),
+          "alternative-start column")
 
 
 if __name__ == "__main__":
