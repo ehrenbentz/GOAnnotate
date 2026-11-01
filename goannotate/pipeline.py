@@ -7,7 +7,7 @@ from pathlib import Path
 
 from goannotate import GOAnnotateError
 from goannotate import annotate as annotate_mod
-from goannotate import assign, blast, compare, gff3, mappings, output, reference, search, sequences, taxon
+from goannotate import assign, blast, compare, gff3, mappings, modules, output, reference, search, sequences, taxon
 from goannotate.filters import BadNameFilter, NameAudit, write_name_audit
 from goannotate.go import GOHierarchy, resolve_go_obo
 
@@ -304,6 +304,19 @@ def run(args) -> None:
                               symbol_case_fn=lambda s: annotate_mod.format_symbol(s, args.symbol_case))
 
     ############################################################
+    # Stage 3c: optional modules (SignalP, ...)
+    ############################################################
+    modules_run = []
+    selected = modules.select_modules(args)
+    if selected:
+        ctx = modules.ModuleContext(
+            query_fasta=Path(query_fasta), search_mode=search_mode, work_dir=work_dir,
+            reports_dir=reports_dir, prefix=prefix, threads=args.threads or 0,
+            force=getattr(args, "force_modules", False), universe=universe, genes=genes,
+            annotations=annotations)
+        modules_run = modules.run_modules(selected, ctx, auto=(args.modules or "").strip().lower() == "auto")
+
+    ############################################################
     # Stage 4: comparison with existing annotation
     ############################################################
     comparison = None
@@ -337,7 +350,7 @@ def run(args) -> None:
             protein_lengths[header.split()[0] if header else ""] = len(seq.rstrip("*"))
     output.write_annotation_tables(output_dir, prefix, annotations, universe, genes=genes,
                                    fasta_headers=str(annotated_fasta_source), mode=args.annotation_mode,
-                                   protein_lengths=protein_lengths)
+                                   protein_lengths=protein_lengths, modules=modules_run)
     output.write_mapping_files(annotations, output_dir, prefix, universe=universe, evidence_dir=reports_dir)
 
     # Annotated sequence files, named by content: amino acid (AA), coding
@@ -357,13 +370,13 @@ def run(args) -> None:
     if genes is not None:
         output.write_annotated_gff3(args.gff3, output_dir / f"{prefix}_annotated.gff3",
                                     annotations, genes, mode=args.annotation_mode,
-                                    hypothetical=args.hypothetical)
+                                    hypothetical=args.hypothetical, modules=modules_run)
     output.write_summary(output_dir, prefix, annotations, args, blast_stats=blast_stats,
                          universe=universe, extraction=extraction, gff_stats=gff_stats,
                          comparison=comparison, search_results=str(results_path),
                          assignment=assignment, protein_check=protein_check,
                          coverage=coverage, forbidden_go=forbidden_go, product_audit=product_audit,
-                         word_weights=word_weights)
+                         word_weights=word_weights, modules=selected)
 
 
 # Files of the earlier output layout (everything at the top level)

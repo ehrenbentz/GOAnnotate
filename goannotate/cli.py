@@ -249,7 +249,7 @@ Examples:
                    help="Transcript-level attribute(s) to stratify by (default: graft_protein)")
 
     g = parser.add_argument_group("Output options")
-    g.add_argument("--output", "-o", required=True, metavar="DIR",
+    g.add_argument("--output", "-o", metavar="DIR",
                    help="Output directory (required); its name is the file prefix unless --prefix is given")
     g.add_argument("--prefix", default=None, help="Output file prefix")
     g.add_argument("--annotation-mode", default="fill", choices=["add", "fill", "replace"],
@@ -269,6 +269,25 @@ Examples:
                    help="Do not apply the product_regex naming rules of the pattern file (EC numbers,\n"
                         "molecular weights, species names, \"<SYMBOL> protein\" word order) to products")
 
+    g = parser.add_argument_group("Optional modules (external tools installed separately)")
+    g.add_argument("--modules", default=None, metavar="LIST",
+                   help="Modules to run, comma-separated (signalp), or auto to run every module whose\n"
+                        "tool is found. Default: none. Modules add columns, GFF3 attributes and reports;\n"
+                        "they do not change the symbol, product or GO assignment")
+    g.add_argument("--check-tools", action="store_true",
+                   help="Report which external tools (Diamond and the module tools) are available, then exit")
+    g.add_argument("--force-modules", action="store_true",
+                   help="Rerun the module tools even when their results exist in the output directory")
+    g.add_argument("--signalp-bin", metavar="PATH",
+                   help="signalp6 executable (default: signalp6 on PATH); may point into another\n"
+                        "conda environment")
+    g.add_argument("--signalp-mode", default="fast", choices=["fast", "slow", "slow-sequential"],
+                   help="SignalP 6 model: fast (default), slow (full model, needs more than 14 GB RAM)\n"
+                        "or slow-sequential (full model, memory of fast, about six times slower)")
+    g.add_argument("--signalp-features", action="store_true",
+                   help="Also write sig_peptide features (INSDC type) under coding transcripts with a\n"
+                        "signal peptide in the annotated GFF3, with genomic coordinates")
+
     g = parser.add_argument_group("Performance options")
     g.add_argument("--threads", type=int, default=None,
                    help="Threads for Diamond and workers for annotation (default: all CPUs)")
@@ -280,6 +299,16 @@ Examples:
 
 
 def validate(args, parser) -> None:
+    if args.modules is not None:
+        from goannotate.modules import parse_selection
+        try:
+            parse_selection(args.modules)
+        except ValueError as e:
+            parser.error(f"--modules: {e}")
+    if args.check_tools:
+        return
+    if not args.output:
+        parser.error("--output/-o is required")
     if not args.gff3 and not args.transcripts:
         parser.error("one of --gff3 (with --genome or --proteins) or --transcripts is required")
     if args.gff3 and not args.genome and not args.transcripts and not args.proteins:
@@ -311,12 +340,34 @@ def validate(args, parser) -> None:
         args.threads = os.cpu_count()
 
 
+def check_tools(args) -> int:
+    """Print the availability of Diamond and of every module's tool; exit 0 when all are found."""
+    from goannotate.modules import detect_all
+    from goannotate.search import find_diamond
+
+    print(f"GOAnnotate {__version__}: external tools")
+    all_found = True
+    try:
+        diamond = find_diamond(args.diamond_bin)
+        print(f"  Diamond: {diamond}")
+    except GOAnnotateError as e:
+        print(f"  Diamond: not available ({e})")
+        all_found = False
+    for status in detect_all(args):
+        print("  " + status.describe())
+        all_found = all_found and status.available
+    return 0 if all_found else 1
+
+
 def main(argv=None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     logging.basicConfig(level=getattr(logging, args.log_level),
                         format='%(asctime)s - %(levelname)s - %(message)s')
     validate(args, parser)
+
+    if args.check_tools:
+        return check_tools(args)
 
     logger.info(f"GOAnnotate {__version__}")
     try:

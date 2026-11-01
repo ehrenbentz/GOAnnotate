@@ -16,6 +16,7 @@ GOAnnotate assigns protein names, gene symbols, and Gene Ontology (GO) terms to 
 - [Running GOAnnotate](#running-goannotate)
 - [How It Works](#how-it-works)
 - [Output Files](#output-files)
+- [Optional Modules](#optional-modules)
 - [The bad_names.txt File](#the-bad_namestxt-file)
 - [Parameters](#parameters)
 - [Utility Scripts](#utility-scripts)
@@ -24,6 +25,7 @@ GOAnnotate assigns protein names, gene symbols, and Gene Ontology (GO) terms to 
 
 - Python 3.9+
 - [Diamond](https://github.com/bbuchfink/diamond) 2.x (not needed when precomputed results are supplied with `--blast-results`)
+- Optional, for the modules: SignalP 6 (see Optional Modules)
 
 No Python packages beyond the standard library are required.
 
@@ -257,7 +259,11 @@ goannotate \
 | `--existing-symbol-attr` | gene | Attribute(s) holding an existing gene symbol |
 | `--existing-product-attr` | product description | Attribute(s) holding an existing product name |
 | `--strata-gene`, `--strata-transcript` | graft_status, graft_protein | Attributes the comparison is stratified by |
-| `--threads` | all CPUs | Threads for Diamond and workers for annotation |
+| `--modules` | none | Optional modules to run (`signalp`; `auto` runs every module whose tool is found); see Optional Modules |
+| `--check-tools` | off | Report which external tools are available, then exit |
+| `--force-modules` | off | Rerun the module tools even when their results exist |
+| `--signalp-bin`, `--signalp-mode`, `--signalp-features` | `signalp6` on PATH, fast, off | SignalP module settings |
+| `--threads` | all CPUs | Threads for Diamond, workers for annotation and threads for the module tools |
 | `--prefix` | output dir name | Prefix for output filenames |
 
 ## How It Works
@@ -432,8 +438,8 @@ Two tab-delimited tables for everyday lookup (grep, a spreadsheet, R): one row p
 
 | File | Columns |
 |------|---------|
-| `{prefix}_gene_annotations.tsv` | gene_id, symbol, symbol_aliases, secondary_symbol, product, gene_type, coding, locus, n_transcripts, transcripts, confidence, symbol_source, product_source, uniprot_accession, go_terms |
-| `{prefix}_transcript_annotations.tsv` | gene_id, transcript_id, symbol, symbol_aliases, secondary_symbol, product, transcript_type, coding, locus, cds_locus, protein_length, confidence, symbol_source, product_source, uniprot_accession, go_terms |
+| `{prefix}_gene_annotations.tsv` | gene_id, symbol, symbol_aliases, secondary_symbol, product, gene_type, coding, locus, n_transcripts, transcripts, confidence, symbol_source, product_source, uniprot_accession, go_terms, then one column per module that ran |
+| `{prefix}_transcript_annotations.tsv` | gene_id, transcript_id, symbol, symbol_aliases, secondary_symbol, product, transcript_type, coding, locus, cds_locus, protein_length, confidence, symbol_source, product_source, uniprot_accession, go_terms, then the module columns |
 
 `symbol` and `product` follow `--annotation-mode`, as in the annotated GFF3 and FASTA: with `fill` (default) and `add` the input annotation is kept where it exists and GOAnnotate's result fills the rest; with `replace` GOAnnotate's result is used wherever there is one. `symbol_source` and `product_source` say which (`input` or `goannotate`). Transcript rows keep the input transcript's own product, including its isoform label, under `fill` and `add`; the gene row uses the gene description or the first coding transcript's product without the isoform label. Loci are 1-based and inclusive (`chr1:23246-24202(-)`); `protein_length` is the length of the searched protein. `uniprot_accession` is the best hit of the winning symbol group. Without a GFF3 (transcript FASTA input) the rows come from the FASTA, with input values read from `symbol=`, `product=`, `type=` and `locus=` header fields.
 
@@ -512,6 +518,32 @@ The annotated GFF3 is the input file passed through line by line: every feature,
 ### Summary
 
 `{prefix}_summary.txt` contains a text summary of the run: command, inputs, parameters, GFF3 and extraction statistics, Diamond statistics, annotation coverage, confidence, GO term statistics, concordance statistics, and the comparison summary.
+
+## Optional Modules
+
+Modules wrap external tools that add information to the annotation without changing the symbol, product or GO assignment made by the core pipeline. They are off by default and selected with `--modules NAME[,NAME]`, or `--modules auto` to run every module whose tool is found. The tools are installed separately by the user; `goannotate --check-tools` reports which are available. Modules run after the symbol checks and before the outputs, so that their reports can list the final symbol and product of every gene. Their raw outputs are kept in `intermediate/{prefix}_{module}/` and reused by later runs into the same directory (`--force-modules` reruns them). Modules need protein queries and are skipped for nucleotide (`blastx`) input.
+
+Each module appends its columns to the end of the gene and transcript tables, adds `goannotate_*` attributes (or standard INSDC features) to the annotated GFF3, writes a report to `reports/`, and is summarized in a Modules section of the summary file.
+
+### signalp: signal peptides and the secretome
+
+Runs [SignalP 6](https://services.healthtech.dtu.dk/services/SignalP-6.0/) (Teufel et al. 2022, Nature Biotechnology 40:1023) on the query proteins in eukarya mode and records, for every protein, whether a Sec/SPI signal peptide is predicted, its probability and the cleavage site.
+
+SignalP 6 is distributed under an academic licence: register at the DTU page, download the package (the `fast` model at least; the `slow` models are a separate download), install it with `pip install signalp-6-package/` and copy its model weights into the installed package as the SignalP installation notes describe. The package supports Python up to 3.10 and PyTorch below 2.0, so it will usually live in its own conda environment; point `--signalp-bin` at that environment's `signalp6` executable (for example `~/miniconda3/envs/signalp6/bin/signalp6`). The module is skipped with a note when the executable is not found.
+
+Only the first 70 residues of a protein are used by SignalP, so the proteins are truncated to 200 residues before the run; stop codons and non-standard letters are replaced. `--signalp-mode` chooses the model: `fast` (default), `slow` (the full model, needs more than 14 GB RAM) or `slow-sequential` (the full model within the memory of `fast`, about six times slower). The run uses `--threads` for the model and up to 8 writer processes.
+
+Outputs:
+
+| Where | Content |
+|-------|---------|
+| gene table | `signal_peptide`: `yes`, `no`, or `yes (1/3 isoforms)` when only some coding isoforms carry one; empty for genes without a scored protein |
+| transcript table | `signal_peptide` (`yes`/`no`), `sp_probability`, `sp_cleavage` (`22-23`: the signal peptidase cleaves between residues 22 and 23) |
+| annotated GFF3 | `goannotate_signal_peptide=yes` on genes and transcripts with a signal peptide, `goannotate_sp_cleavage` on the transcript; with `--signalp-features`, a `sig_peptide` feature (INSDC type, accepted by table2asn) under each such mRNA, with genomic coordinates mapped through the CDS segments (one line per segment when the signal peptide spans an intron) |
+| `reports/{prefix}_secretome.tsv` | gene_id, transcript_id, symbol, product, sp_probability, cleavage_site, cs_probability for every protein with a signal peptide |
+| `intermediate/{prefix}_signalp/` | SignalP's own `prediction_results.txt`, `output.gff3`, `processed_entries.fasta` (mature proteins) and the run log |
+
+No GO terms are added: a signal peptide is not a GO assertion by itself.
 
 ## The bad_names.txt File
 
@@ -598,11 +630,13 @@ python3 tests/validate_extraction.py --gff3 Annotations.gff3 --genome Genome.fas
 |------|-------------|
 | `GOAnnotate.py` | Wrapper script; runs the package from a checkout |
 | `goannotate/` | The package: `cli.py`, `pipeline.py`, `gff3.py`, `sequences.py`, `search.py`, `blast.py`, `filters.py`, `annotate.py`, `assign.py`, `reference.py`, `go.py`, `taxon.py`, `mappings.py`, `compare.py`, `output.py`, `models.py` |
+| `goannotate/modules/` | Optional modules: `base.py` (framework), `signalp.py` |
 | `goannotate/data/bad_names.txt` | Default name, symbol and product patterns |
 | `goannotate/data/stop_words.txt` | Default stop words for the name similarity |
 | `build_databases.py` | Database download and build script |
 | `clean_gff3.py` | GFF3 ID cleanup utility |
 | `tests/test_annotation_rules.py` | Checks of the coverage filter, word weighting, GO evidence, taxon constraints, product rules and symbol policy on small inputs |
+| `tests/test_modules.py` | Checks of the module framework and the SignalP module with a stand-in `signalp6` script |
 | `tests/validate_extraction.py` | Extraction validation against an external protein set |
 
 ## License
