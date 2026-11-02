@@ -25,7 +25,10 @@ GOAnnotate assigns protein names, gene symbols, and Gene Ontology (GO) terms to 
 
 - Python 3.9+
 - [Diamond](https://github.com/bbuchfink/diamond) 2.x (not needed when precomputed results are supplied with `--blast-results`)
-- Optional, for the modules: SignalP 6 (see Optional Modules)
+- Optional, for the modules (see Optional Modules):
+  - SignalP 6 (`signalp` module)
+  - InterProScan 6 with Nextflow 25.10.4 or later, Java 17 or later, a container runtime (Docker, Singularity, Apptainer or Podman) and the InterPro data (`interproscan` module)
+  - [OrthoFinder](https://github.com/davidemms/OrthoFinder) and the NCBI [`datasets`](https://www.ncbi.nlm.nih.gov/datasets/docs/v2/command-line-tools/download-and-install/) command-line tool (`orthology` module)
 
 No Python packages beyond the standard library are required.
 
@@ -266,6 +269,23 @@ goannotate \
 | `--signalp-min-probability` | 0 (SignalP's call) | Minimum SignalP probability for a signal peptide call |
 | `--signalp-processes` | one per physical core | Parallel `signalp6` processes, one thread each |
 | `--signalp-alt-starts` | off | Flag proteins with a signal peptide from an internal start codon |
+| `--interproscan-workflow`, `--interproscan-revision` | none | InterProScan 6 workflow: a local clone at a release tag, or the GitHub name with a release |
+| `--interproscan-datadir`, `--interproscan-interpro` | none, the single release found | InterPro data directory and release |
+| `--interproscan-nextflow`, `--interproscan-profile` | `nextflow` on PATH, auto | Nextflow executable and container runtime |
+| `--interproscan-apps` | all except deep-learning analyses | InterProScan analyses to run |
+| `--interproscan-local` | off | Run every analysis locally instead of looking up precalculated matches at EBI |
+| `--interproscan-workers` | half of `--threads` | InterProScan tasks run in parallel |
+| `--interproscan-keep-work` | off | Keep Nextflow's work directory |
+| `--interpro-go` | add | InterPro GO terms: `add` to every gene, `fill` genes without GO, `off` |
+| `--interpro-products` | fill | Name coding genes left without a product from their InterPro domains |
+| `--nxf-home` | `~/.nextflow` | Directory for Nextflow's own files (NXF_HOME) |
+| `--relatives` | 3 | Close relatives chosen automatically for the orthology module |
+| `--relative` | none | Relative to use instead (NCBI assembly accession or taxon ID; repeatable) |
+| `--relative-min-named` | 0.7 | Fraction of a relative's protein-coding genes that must have a symbol |
+| `--same-species` | off | Also use the RefSeq annotation of the query species itself, beyond `--relatives` |
+| `--relatives-dir` | `intermediate/{prefix}_orthology/relatives` | Where relatives' annotations are downloaded |
+| `--orthofinder-bin`, `--orthofinder-threads`, `--datasets-bin` | on PATH, `--threads`, on PATH | OrthoFinder and NCBI datasets settings |
+| `--ortholog-symbol` | fill | Name genes without a symbol (or with a kept lineage symbol) from their one-to-one orthologs in the relatives |
 | `--threads` | all CPUs | Threads for Diamond, workers for annotation and threads for the module tools |
 | `--prefix` | output dir name | Prefix for output filenames |
 
@@ -524,7 +544,7 @@ The annotated GFF3 is the input file passed through line by line: every feature,
 
 ## Optional Modules
 
-Modules wrap external tools that add information to the annotation without changing the symbol, product or GO assignment made by the core pipeline. They are off by default and selected with `--modules NAME[,NAME]`, or `--modules auto` to run every module whose tool is found. The tools are installed separately by the user; `goannotate --check-tools` reports which are available. Modules run after the symbol checks and before the outputs, so that their reports can list the final symbol and product of every gene. Their raw outputs are kept in `intermediate/{prefix}_{module}/` and reused by later runs into the same directory (`--force-modules` reruns them). Modules need protein queries and are skipped for nucleotide (`blastx`) input.
+Modules wrap external tools that add information to the annotation. No module changes a symbol supported by the reference proteome or a product assigned by the core pipeline. The orthology module names genes without a symbol and may replace a lineage symbol kept for lack of a reference ortholog; the InterProScan module adds GO terms and names genes left without a product. Orthology runs before InterProScan, so that a gene named from its orthologs is not given a domain-based name. They are off by default and selected with `--modules NAME[,NAME]`, or `--modules auto` to run every module whose tool is found. The tools are installed separately by the user; `goannotate --check-tools` reports which are available. Modules run after the symbol checks and before the outputs, so that their reports can list the final symbol and product of every gene. Their raw outputs are kept in `intermediate/{prefix}_{module}/` and reused by later runs into the same directory (`--force-modules` reruns them). Modules need protein queries and are skipped for nucleotide (`blastx`) input.
 
 Each module appends its columns to the end of the gene and transcript tables, adds `goannotate_*` attributes (or standard INSDC features) to the annotated GFF3, writes a report to `reports/`, and is summarized in a Modules section of the summary file.
 
@@ -554,6 +574,78 @@ Outputs:
 | `intermediate/{prefix}_signalp/` | `annotated_starts/` (and `alternative_starts/`): the merged `prediction_results.txt` and one directory per chunk with SignalP's own outputs and its log |
 
 No GO terms are added: a signal peptide is not a GO assertion by itself.
+
+### orthology: symbols from close relatives
+
+Finds the orthologs of every gene in the RefSeq annotations of close relatives with [OrthoFinder](https://github.com/davidemms/OrthoFinder) (Emms & Kelly 2019, Genome Biology 20:238), and names genes that the hit-based annotation left without a symbol from them. Symbols of expanded or lineage-specific gene families are often missing from UniProt hits but present in a close relative's annotation, where NCBI's own orthology pipeline assigned them.
+
+**Requirements.** OrthoFinder (for example `conda create -n orthofinder -c bioconda orthofinder`; give its executable with `--orthofinder-bin`, and GOAnnotate puts that environment first on PATH while it runs) and the NCBI `datasets` command-line tool on PATH (or `--datasets-bin`). Relatives' annotations are downloaded from NCBI.
+
+**Choosing relatives.** By default they are chosen from the lineage of `--taxid` (which needs the taxonomy tables of the SQLite database). The lineage is walked outward from the genus; at each level the NCBI reference genomes with a RefSeq annotation are listed, newest annotation first, the query species itself is skipped (see `--same-species`), and each candidate's GFF3 is downloaded to measure the fraction of its protein-coding genes that have a symbol rather than an identifier (LOC numbers and the other symbol patterns). Candidates naming at least `--relative-min-named` (default 0.7) of their genes are accepted until `--relatives` (default 3) are found. Close relatives are not always well named: of the vole relatives, *Microtus oregoni* (RefSeq 2021) names 56% of its protein-coding genes, *M. pennsylvanicus* (2025) 76%, mouse 99.6%. `--relative` names relatives instead (an assembly accession such as `GCF_000001635.27`, or a taxon ID, whose newest annotated reference genome is used). Every candidate examined, with its level, annotation, named fraction and whether it was used, is listed in `reports/{prefix}_orthology_relatives.tsv`. Downloads are kept in `--relatives-dir` and reused.
+
+**Orthologs.** The longest protein of each coding gene of the query and of each relative goes to OrthoFinder (Diamond searches, default settings: DendroBLAST gene trees, no RAxML). `--orthofinder-threads` limits its threads (default `--threads`); its progress lines in the log include the CPU temperature when `sensors` is available.
+
+**Symbols (`--ortholog-symbol fill`).** A gene without a symbol, or with a symbol outside the reference nomenclature that was kept because no reference ortholog was found (`foreign_kept`), takes the symbol of its one-to-one orthologs when the relatives that name them agree (case-insensitive; symbols that differ only by a genome suffix such as `a`/`b` agree, and the most frequent form is used). Such genes are marked `ortholog_fill` in `symbol_status`; a replaced lineage symbol is kept among the aliases. When the gene has no product either, the relatives' product is used (`product_note` `ortholog`). Genes whose orthologs are one-to-many, or whose relatives disagree, are not named. Genes that already have a symbol supported by the reference proteome are not changed; their symbol is compared with the relatives' one-to-one symbol, and the agreement rate is reported in the summary as a check of both.
+
+**Reference nomenclature.** Before they are compared, the relatives' symbols are put in the reference nomenclature in the same way as hit symbols: each relative gene's NCBI GeneID (from its GFF3) is mapped through NCBI gene_orthologs to its ortholog in the reference species, whose symbol is used (with a human reference, mouse `Zfp558` and vole `Znf558` both become `ZNF558`). A gene without a reference ortholog keeps its own symbol. The per-gene report shows both forms (`XP_006509297.1:Zfp558>ZNF558`). `--no-resolve-orthologs` turns this off as it does for hits.
+
+**Previous annotation of the same species (`--same-species`).** When the query species already has a RefSeq annotation (of the same assembly or an earlier one), `--same-species` adds its newest one to the relatives, beyond `--relatives`, so that its symbols carry over to the new annotation. Its one-to-one ortholog's symbol is used when the other relatives agree with it, name no one-to-one ortholog, or disagree among themselves; when they agree on a different symbol, nothing is filled and the gene is counted among the disagreements. Supported core symbols are also compared with the previous annotation, and the agreement is reported as a continuity check. The other check (supported symbols against the other relatives) does not use the same-species annotation.
+
+Outputs:
+
+| Where | Content |
+|-------|---------|
+| gene table | `orthogroup`, `relative_orthologs` (`Microtus_pennsylvanicus:Avp(1:1);...`), `ortholog_symbol` (the agreed one-to-one symbol, used or not) |
+| annotated GFF3 | `goannotate_orthogroup`, `goannotate_ortholog_symbol` on the gene |
+| `reports/{prefix}_orthology.tsv` | per gene: symbol and status, orthogroup, agreed symbol and agreement, the symbol it replaced, and per relative the ortholog type and orthologs with their symbols |
+| `reports/{prefix}_orthology_relatives.tsv` | every candidate relative examined and, for those used, genes used and query genes with one-to-one and any orthologs |
+| `intermediate/{prefix}_orthology/` | OrthoFinder input and results, its log, and the downloaded annotations |
+
+### interproscan: domains, InterPro GO terms and domain-based names
+
+Runs [InterProScan 6](https://github.com/ebi-pf-team/interproscan6) (EMBL-EBI) on the query proteins and adds, for every gene and transcript, the InterPro entries and Pfam families found, the GO terms of those InterPro entries (InterPro2GO), and, for coding genes that the hit-based annotation left without a product, a name built from their InterPro domains.
+
+**Installation.** InterProScan 6 is a Nextflow workflow whose analyses run in containers. It needs Nextflow 25.10.4 or later (which needs Java 17 or later), one container runtime (Docker, Singularity, Apptainer or Podman), the workflow itself, and the InterPro data for one release. InterProScan 5 ended with release 5.78-109.0 (June 2026) and is not supported.
+
+```bash
+# Workflow, pinned at a release
+git clone https://github.com/ebi-pf-team/interproscan6.git /path/to/InterProScan
+git -C /path/to/InterProScan checkout 6.0.3.0
+
+# Data for one InterPro release, downloaded beforehand (about 34 GB unpacked for InterPro 110.0)
+D=/path/to/InterProScan_data
+URL=https://ftp.ebi.ac.uk/pub/software/unix/iprscan/6/6.0
+mkdir -p "$D/.download" && cd "$D/.download"
+get() {
+    name=$1; ver=$2
+    curl -sS -OJ "$URL/$name/$name-$ver.tar.gz" && curl -sS -OJ "$URL/$name/$name-$ver.tar.gz.md5" &&
+    md5sum -c "$name-$ver.tar.gz.md5" && tar -C "$D" -zxf "$name-$ver.tar.gz" &&
+    rm "$name-$ver.tar.gz" "$name-$ver.tar.gz.md5" && echo "done: $name $ver"
+}
+export -f get; export D URL
+printf '%s\n' "interpro 110.0" "antifam 8.0" "cath 4.3.0" "cdd 3.21" "hamap 2026_01" "ncbifam 20.0" \
+    "panther 19.0" "pfam 38.2" "pirsf 3.10" "pirsr 2025_05" "prints 42.0" "prosite 2026_01" "sfld 4" \
+    "smart 9.0" "superfamily 1.75" | xargs -P 4 -L 1 bash -c 'get "$0" "$1"'
+cd "$D" && rmdir .download
+```
+
+The member-database versions for an InterPro release are listed in `interpro/<release>/databases.json`. The data must be in place before GOAnnotate runs: InterProScan 6.0.3.0 can download missing data itself, but its download of databases that share a directory (PROSITE patterns and profiles, CATH-Gene3D and CATH-FunFam) can start a search on an empty directory. GOAnnotate therefore checks that every analysis has its data and does not run InterProScan otherwise.
+
+**Running.** `--modules interproscan --interproscan-workflow /path/to/InterProScan --interproscan-datadir /path/to/InterProScan_data`. GOAnnotate writes the cleaned proteins to `intermediate/{prefix}_interproscan/` and runs Nextflow there (its `work/` directory, logs and run cache stay with the GOAnnotate output; `work/` is deleted after a successful run unless `--interproscan-keep-work` is given), with `--goterms`, the pinned InterPro release, `-resume` (an interrupted run reuses its finished tasks), `--max-workers` set to half of `--threads` (some analyses are multi-threaded; `--interproscan-workers` sets it), and the container profile found (`--interproscan-profile`). Results are reused by later runs into the same output directory. By default InterProScan first looks up precalculated matches at EBI for proteins already in UniParc, sending only sequence checksums; proteins not found are analysed locally. `--interproscan-local` runs every analysis locally (on the 103 test proteins of InterProScan: 7 minutes against 2). `--nxf-home` moves Nextflow's own files out of `~/.nextflow`.
+
+**GO terms (`--interpro-go`).** With `add` (default) the GO terms of a gene's InterPro entries join the terms from its hits, and the most specific terms are recomputed: a term the gene already has, or an ancestor of one of its terms, adds nothing, and a more specific InterPro term replaces its ancestor. Terms outside `--namespace`, root terms and terms excluded by the taxon constraints are not added. With `fill` only genes without GO terms from their hits receive them. InterPro terms carry evidence code IEA; `reports/{prefix}_go_evidence.tsv` gives each term's source (`hits`, `interpro` or `hits+interpro`) and the InterPro entries behind it.
+
+**Products (`--interpro-products`).** A coding gene without a product after the hit-based annotation is named from the InterPro entries of type Domain (then Repeat) of its longest protein, in order of position, at most two: `uncharacterized EGF-like domain-containing protein`, `uncharacterized EGF-like and protein kinase domain-containing protein`, `uncharacterized WD40 repeat-containing protein`. Genes with a product are not changed; family and superfamily entries do not give names. Such genes are marked `interpro_domain` in the evidence table's `product_note`.
+
+Outputs:
+
+| Where | Content |
+|-------|---------|
+| gene table | `interpro` (`IPR000742:EGF-like domain;...`, in order of position), `pfam` (Pfam accessions), `go_from_interpro` (specific GO terms the gene received from InterPro only) |
+| transcript table | `interpro`, `pfam` |
+| annotated GFF3 | `Dbxref=InterPro:...,Pfam:...` on the gene, merged with existing Dbxref values; InterPro GO terms in `Ontology_term` |
+| `reports/{prefix}_interproscan.tsv` | every match: gene_id, transcript_id, analysis, signature, signature_description, start, end, score, interpro, interpro_description, interpro_type, go_terms |
+| `intermediate/{prefix}_interproscan/` | the protein input, InterProScan's TSV, the Nextflow console output and `.nextflow.log` |
 
 ## The bad_names.txt File
 
@@ -640,13 +732,15 @@ python3 tests/validate_extraction.py --gff3 Annotations.gff3 --genome Genome.fas
 |------|-------------|
 | `GOAnnotate.py` | Wrapper script; runs the package from a checkout |
 | `goannotate/` | The package: `cli.py`, `pipeline.py`, `gff3.py`, `sequences.py`, `search.py`, `blast.py`, `filters.py`, `annotate.py`, `assign.py`, `reference.py`, `go.py`, `taxon.py`, `mappings.py`, `compare.py`, `output.py`, `models.py` |
-| `goannotate/modules/` | Optional modules: `base.py` (framework), `signalp.py` |
+| `goannotate/modules/` | Optional modules: `base.py` (framework), `signalp.py`, `orthology.py`, `interproscan.py` |
 | `goannotate/data/bad_names.txt` | Default name, symbol and product patterns |
 | `goannotate/data/stop_words.txt` | Default stop words for the name similarity |
 | `build_databases.py` | Database download and build script |
 | `clean_gff3.py` | GFF3 ID cleanup utility |
 | `tests/test_annotation_rules.py` | Checks of the coverage filter, word weighting, GO evidence, taxon constraints, product rules and symbol policy on small inputs |
 | `tests/test_modules.py` | Checks of the module framework and the SignalP module with a stand-in `signalp6` script |
+| `tests/test_interproscan.py` | Checks of the InterProScan module with a stand-in `nextflow` script and a miniature InterPro data directory |
+| `tests/test_orthology.py` | Checks of the orthology module with stand-in `datasets` and `orthofinder` scripts and a miniature taxonomy |
 | `tests/validate_extraction.py` | Extraction validation against an external protein set |
 
 ## License

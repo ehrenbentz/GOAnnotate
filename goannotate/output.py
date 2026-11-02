@@ -249,17 +249,22 @@ def write_go_evidence(annotations: dict, go_hierarchy, path: Path, forbidden_go:
     logger.info(f"Writing GO evidence to {path}")
     n_rows = n_removed = 0
     with open(path, "w") as f:
-        f.write("gene_id\tgo_id\tname\tnamespace\tstatus\tevidence_codes\tevidence_class\tn_hits\tconstraint\n")
+        f.write("gene_id\tgo_id\tname\tnamespace\tstatus\tevidence_codes\tevidence_class\tn_hits\tsource\t"
+                "interpro_entries\tconstraint\n")
         for gene_id, annot in sorted(annotations.items()):
             for t in sorted(annot.specific_go_terms):
                 codes = annot.go_evidence.get(t, "")
                 cls = best_evidence_class(set(codes.split(",")) if codes else set())
+                from_ipr = annot.go_interpro.get(t)
+                from_hits = annot.go_support.get(t, 0) > 0
+                source = "+".join(s for s, ok in (("hits", from_hits), ("interpro", bool(from_ipr))) if ok)
                 f.write(f"{gene_id}\t{t}\t{go_hierarchy.names.get(t, '')}\t{go_hierarchy.namespace.get(t, '')}\t"
-                        f"specific\t{codes}\t{cls}\t{annot.go_support.get(t, '')}\t\n")
+                        f"specific\t{codes}\t{cls}\t{annot.go_support.get(t, '') if from_hits else ''}\t{source}\t"
+                        f"{','.join(from_ipr) if from_ipr else ''}\t\n")
                 n_rows += 1
             for t in sorted(annot.go_taxon_removed):
                 f.write(f"{gene_id}\t{t}\t{go_hierarchy.names.get(t, '')}\t{go_hierarchy.namespace.get(t, '')}\t"
-                        f"removed_taxon\t\t\t\t{forbidden_go.get(t, '')}\n")
+                        f"removed_taxon\t\t\t\t\t\t{forbidden_go.get(t, '')}\n")
                 n_removed += 1
     logger.info(f"  {n_rows:,} gene-term rows" + (f", {n_removed:,} removed by the taxon constraints" if n_removed else ""))
 
@@ -560,6 +565,10 @@ def _merge_list(pairs: list, key: str, values: list) -> None:
     pairs.append([key, ",".join(encoded)])
 
 
+# GFF3 attributes holding comma-separated lists: module values are merged into them, not overwritten
+_LIST_ATTRIBUTES = {"Dbxref", "Ontology_term"}
+
+
 def write_annotated_gff3(input_gff: str, output_file: Path, annotations: dict, genes: list,
                          mode: str = "fill", hypothetical: bool = True, modules: list = None) -> dict:
     """
@@ -656,7 +665,10 @@ def write_annotated_gff3(input_gff: str, output_file: Path, annotations: dict, g
             counts["genes_annotated"] += 1
         for m in modules:
             for k, v in m.gene_attributes(gene_key).items():
-                _set(pairs, k, v, True)
+                if k in _LIST_ATTRIBUTES:
+                    _merge_list(pairs, k, [x for x in v.split(",") if x])
+                else:
+                    _set(pairs, k, v, True)
 
     def transcript_attrs(pairs, tx_id, feature_type):
         t = tx_decision[tx_id]
@@ -674,7 +686,10 @@ def write_annotated_gff3(input_gff: str, output_file: Path, annotations: dict, g
         if feature_type != "CDS":
             for m in modules:
                 for k, v in m.transcript_attributes(t["tx_key"]).items():
-                    _set(pairs, k, v, True)
+                    if k in _LIST_ATTRIBUTES:
+                        _merge_list(pairs, k, [x for x in v.split(",") if x])
+                    else:
+                        _set(pairs, k, v, True)
 
     def module_features(tx_id) -> list:
         if not modules or tx_id not in tx_objects:

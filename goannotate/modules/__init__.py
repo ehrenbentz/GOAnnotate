@@ -16,9 +16,15 @@ logger = logging.getLogger(__name__)
 
 def registry() -> dict:
     """{module name: class}, in the order modules run."""
+    from goannotate.modules.interproscan import InterProScanModule
+    from goannotate.modules.orthology import OrthologyModule
     from goannotate.modules.signalp import SignalPModule
+    # Orthology runs before InterProScan, so that genes named from relatives' orthologs are not
+    # given a domain-based name first
     return {
         SignalPModule.name: SignalPModule,
+        OrthologyModule.name: OrthologyModule,
+        InterProScanModule.name: InterProScanModule,
     }
 
 

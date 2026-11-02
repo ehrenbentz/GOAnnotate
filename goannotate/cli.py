@@ -271,9 +271,11 @@ Examples:
 
     g = parser.add_argument_group("Optional modules (external tools installed separately)")
     g.add_argument("--modules", default=None, metavar="LIST",
-                   help="Modules to run, comma-separated (signalp), or auto to run every module whose\n"
-                        "tool is found. Default: none. Modules add columns, GFF3 attributes and reports;\n"
-                        "they do not change the symbol, product or GO assignment")
+                   help="Modules to run, comma-separated (signalp, orthology, interproscan), or auto to run\n"
+                        "every module whose tool is found. Default: none. Modules add columns, GFF3 attributes\n"
+                        "and reports; orthology also names genes the core annotation left without a symbol\n"
+                        "(--ortholog-symbol), interproscan adds InterPro GO terms and names genes left without\n"
+                        "a product (--interpro-go, --interpro-products)")
     g.add_argument("--check-tools", action="store_true",
                    help="Report which external tools (Diamond and the module tools) are available, then exit")
     g.add_argument("--force-modules", action="store_true",
@@ -298,6 +300,72 @@ Examples:
                         "the first 60 residues that is followed by a hydrophobic core (a possible start\n"
                         "codon error of the gene model). Reported as a flag only; adds about a third to the\n"
                         "SignalP runtime")
+    g.add_argument("--interproscan-workflow", metavar="PATH",
+                   help="InterProScan 6 workflow: a local clone of github.com/ebi-pf-team/interproscan6 checked\n"
+                        "out at a release tag (recommended), or ebi-pf-team/interproscan6 with\n"
+                        "--interproscan-revision")
+    g.add_argument("--interproscan-revision", metavar="TAG",
+                   help="Release of a remote InterProScan workflow (for example 6.0.3.0)")
+    g.add_argument("--interproscan-datadir", metavar="DIR",
+                   help="InterPro data directory, downloaded beforehand for one InterPro release (see README)")
+    g.add_argument("--interproscan-interpro", metavar="VERSION",
+                   help="InterPro release to use (default: the single release found in the data directory)")
+    g.add_argument("--interproscan-nextflow", metavar="PATH",
+                   help="nextflow executable (default: nextflow on PATH)")
+    g.add_argument("--interproscan-profile", default="auto",
+                   choices=["auto", "docker", "singularity", "apptainer", "podman"],
+                   help="Container runtime for InterProScan (default: auto, Docker when usable, else\n"
+                        "Singularity, Apptainer or Podman)")
+    g.add_argument("--interproscan-apps", metavar="LIST",
+                   help="InterProScan analyses to run, comma-separated (for example Pfam,PANTHER,SMART;\n"
+                        "default: all except the deep-learning analyses)")
+    g.add_argument("--interproscan-local", action="store_true",
+                   help="Run every analysis locally; by default InterProScan looks up precalculated matches at\n"
+                        "EBI for proteins already in UniParc (only sequence checksums are sent)")
+    g.add_argument("--interproscan-workers", type=int, default=0, metavar="N",
+                   help="InterProScan tasks run in parallel (default: half of --threads, because some of its\n"
+                        "analyses are multi-threaded)")
+    g.add_argument("--interproscan-keep-work", action="store_true",
+                   help="Keep Nextflow's work directory after a successful InterProScan run")
+    g.add_argument("--interpro-go", default="add", choices=["add", "fill", "off"],
+                   help="GO terms of the InterPro entries found (default: add)\n"
+                        "  add:  added to every gene's GO terms; terms the gene already has, or ancestors of\n"
+                        "        them, add nothing\n"
+                        "  fill: only for genes without GO terms from their hits\n"
+                        "  off:  not used")
+    g.add_argument("--interpro-products", default="fill", choices=["fill", "off"],
+                   help="Coding genes left without a product are named from their InterPro domains\n"
+                        "(\"uncharacterized EGF-like domain-containing protein\") (default: fill)")
+    g.add_argument("--relatives", type=int, default=3, metavar="N",
+                   help="Close relatives for the orthology module, chosen automatically from the --taxid\n"
+                        "lineage: nearest first, NCBI reference genomes with a RefSeq annotation (default: 3)")
+    g.add_argument("--relative", action="append", default=[], metavar="ACC|TAXID",
+                   help="Relative to use instead of the automatic choice: an NCBI assembly accession\n"
+                        "(GCF_000001635.27) or a taxon ID; may be given more than once")
+    g.add_argument("--relative-min-named", type=float, default=0.7, metavar="F",
+                   help="An automatically chosen relative must give a symbol (not a LOC number or other\n"
+                        "identifier) to at least F of its protein-coding genes (default: 0.7)")
+    g.add_argument("--same-species", action="store_true",
+                   help="Also use the RefSeq annotation of the query species itself (the newest, needs\n"
+                        "--taxid), beyond --relatives, so that a previous annotation's symbols carry over:\n"
+                        "its one-to-one ortholog's symbol is used unless the other relatives agree on a\n"
+                        "different one; supported symbols are also compared with it")
+    g.add_argument("--relatives-dir", metavar="DIR",
+                   help="Directory where relatives' annotations are downloaded and kept for later runs\n"
+                        "(default: intermediate/{prefix}_orthology/relatives)")
+    g.add_argument("--orthofinder-bin", metavar="PATH",
+                   help="orthofinder executable (default: orthofinder on PATH); its directory is put first on\n"
+                        "PATH while it runs, so that it finds its own Python, Diamond and MCL")
+    g.add_argument("--orthofinder-threads", type=int, default=0, metavar="N",
+                   help="Threads for OrthoFinder (default: --threads); fewer keeps CPU temperature down")
+    g.add_argument("--datasets-bin", metavar="PATH",
+                   help="NCBI datasets executable (default: datasets on PATH)")
+    g.add_argument("--ortholog-symbol", default="fill", choices=["fill", "off"],
+                   help="Genes without a symbol, or with a lineage symbol kept for lack of a reference\n"
+                        "ortholog, take the symbol on which their one-to-one orthologs in the relatives\n"
+                        "agree (default: fill); off records the orthologs only")
+    g.add_argument("--nxf-home", metavar="DIR",
+                   help="Directory for Nextflow's own files (sets NXF_HOME; default: ~/.nextflow)")
 
     g = parser.add_argument_group("Performance options")
     g.add_argument("--threads", type=int, default=None,
@@ -318,6 +386,10 @@ def validate(args, parser) -> None:
             parser.error(f"--modules: {e}")
     if not 0.0 <= args.signalp_min_probability <= 1.0:
         parser.error("--signalp-min-probability must be between 0 and 1")
+    if not 0.0 <= args.relative_min_named <= 1.0:
+        parser.error("--relative-min-named must be between 0 and 1")
+    if args.relatives < 1:
+        parser.error("--relatives must be at least 1")
     if args.signalp_processes < 0:
         parser.error("--signalp-processes must be 0 (automatic) or a positive number")
     if args.check_tools:

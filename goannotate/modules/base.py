@@ -61,6 +61,11 @@ class ModuleContext:
     universe: object = None      # GeneUniverse
     genes: list = None           # parsed GFF3 genes, or None
     annotations: dict = field(default_factory=dict)
+    go_hierarchy: object = None  # GOHierarchy, for modules that add GO terms
+    forbidden_go: set = field(default_factory=set)   # GO terms excluded by the taxon constraints
+    namespaces: list = field(default_factory=list)   # GO namespaces in use (--namespace)
+    bad_name_filter: object = None   # BadNameFilter, for modules that take symbols or products from elsewhere
+    symbol_case_fn: object = None    # formats a symbol in the --symbol-case of the run
 
 
 class ModuleError(Exception):

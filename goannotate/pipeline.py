@@ -313,7 +313,9 @@ def run(args) -> None:
             query_fasta=Path(query_fasta), search_mode=search_mode, work_dir=work_dir,
             reports_dir=reports_dir, prefix=prefix, threads=args.threads or 0,
             force=getattr(args, "force_modules", False), universe=universe, genes=genes,
-            annotations=annotations)
+            annotations=annotations, go_hierarchy=go_hierarchy, forbidden_go=set(forbidden_go),
+            namespaces=list(args.namespace), bad_name_filter=bad_name_filter,
+            symbol_case_fn=lambda s: annotate_mod.format_symbol(s, args.symbol_case))
         modules_run = modules.run_modules(selected, ctx, auto=(args.modules or "").strip().lower() == "auto")
 
     ############################################################

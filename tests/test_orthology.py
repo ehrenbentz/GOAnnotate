@@ -1,0 +1,442 @@
+"""
+Checks of the orthology module on small inputs, without OrthoFinder or
+NCBI datasets: stand-in scripts answer `datasets summary`/`download` from
+fixtures and write OrthoFinder result tables; a miniature taxonomy table
+gives the lineage.
+
+Run: python3 tests/test_orthology.py
+"""
+
+import json
+import os
+import sqlite3
+import stat
+import subprocess
+import sys
+import tempfile
+import zipfile
+from argparse import Namespace
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from goannotate.filters import BadNameFilter, default_bad_names_path  # noqa: E402
+from goannotate.models import GeneUniverse, QueryAnnotation  # noqa: E402
+from goannotate.modules import ModuleContext, run_modules, select_modules  # noqa: E402
+from goannotate.modules.orthology import (OrthologyModule, _last_line, agreed_symbol,  # noqa: E402
+                                          parse_orthologs_by_species, parse_refseq_gff, species_label,
+                                          symbol_base)
+
+failures = 0
+
+
+def check(cond, label):
+    global failures
+    print(("ok  " if cond else "FAIL") + " " + label)
+    if not cond:
+        failures += 1
+
+
+def gff(genes, acc=""):
+    """genes: [(gene id, symbol, [(protein id, product, length)])] -> RefSeq-style GFF3."""
+    lines = ["##gff-version 3"]
+    for gid, sym, prots in genes:
+        geneid = GENEIDS.get((acc, gid), "")
+        dbx = f"Dbxref=GeneID:{geneid},Genbank:x;" if geneid else ""
+        lines.append(f"chr1\tRefSeq\tgene\t1\t100\t.\t+\t.\tID=gene-{gid};gene={sym};gene_biotype=protein_coding")
+        for i, (pid, prod, _) in enumerate(prots):
+            lines.append(f"chr1\tGnomon\tmRNA\t1\t100\t.\t+\t.\tID=rna-{pid};Parent=gene-{gid};gene={sym}")
+            lines.append(f"chr1\tGnomon\tCDS\t1\t100\t.\t+\t0\tID=cds-{pid};Parent=rna-{pid};{dbx}gene={sym};"
+                         f"product={prod.replace(' ', '%20') if False else prod};protein_id={pid}")
+    return "\n".join(lines) + "\n"
+
+
+def faa(genes):
+    out = []
+    for _, _, prots in genes:
+        for pid, prod, n in prots:
+            out.append(f">{pid} {prod}\n" + "M" + "A" * (n - 1))
+    return "\n".join(out) + "\n"
+
+
+GENOMES = {
+    # rejected: one of three genes named
+    "GCF_A": ("Microtus a", 111, "2025-08-01", [("Avp", "Avp", [("XP_A1", "vasopressin", 120)]),
+                                                ("LOC1", "LOC1", [("XP_A2", "uncharacterized protein LOC1", 90)]),
+                                                ("LOC2", "LOC2", [("XP_A3", "uncharacterized protein LOC2", 90)])]),
+    # chosen: two of three named; Kcnq5 has two isoforms
+    "GCF_B": ("Microtus b", 112, "2024-01-01", [("Avp", "Avp", [("XP_B1", "vasopressin-neurophysin 2-copeptin", 150)]),
+                                                ("Kcnq5", "Kcnq5", [("XP_B2", "potassium channel KCNQ5 isoform X2", 200),
+                                                                    ("XP_B3", "potassium channel KCNQ5 isoform X1", 900)]),
+                                                ("LOC3", "LOC3", [("XP_B4", "uncharacterized protein LOC3", 80)]),
+                                                ("Zfp558", "Zfp558", [("XP_B5", "zinc finger protein 558", 300)]),
+                                                ("Cdhr18", "Cdhr18", [("XP_B6", "cadherin-related family member 18",
+                                                                       400)])]),
+    "GCF_C": ("Myodes c", 113, "2026-01-01", [("Avp", "Avp", [("XP_C1", "vasopressin-neurophysin 2-copeptin", 150)]),
+                                              ("Kcnq5", "Kcnq5", [("XP_C2", "potassium channel KCNQ5", 900)]),
+                                              ("Grm1", "Grm1", [("XP_C3", "metabotropic glutamate receptor 1", 1100)]),
+                                              ("Znf558", "Znf558", [("XP_C4", "zinc finger protein 558", 300)]),
+                                              ("Tnfaip8l3", "Tnfaip8l3", [("XP_C5", "TNF alpha-induced protein 8-like 3",
+                                                                           200)]),
+                                              ("LOC77", "LOC77", [("XP_C6", "uncharacterized protein LOC77", 200)]),
+                                              ("LOC78", "LOC78", [("XP_C7", "uncharacterized protein LOC78", 150)])]),
+    "GCF_D": ("Myodes d", 114, "2020-01-01", [("Avp", "Avp", [("XP_D1", "vasopressin", 150)])]),
+    # the query species' own annotation (--same-species)
+    "GCF_Q": ("Microtus ochrogaster", 79684, "2026-06-01", [("Avp", "Avp", [("XP_Q1", "vasopressin", 150)]),
+                                                           ("Grm1", "Grm1", [("XP_Q2", "glutamate receptor", 1100)]),
+                                                           ("Oldname", "Oldname", [("XP_Q3", "old protein", 200)]),
+                                                           ("Sstr2", "Sstr2", [("XP_Q4", "somatostatin receptor 2",
+                                                                                 300)]),
+                                                           ("Zfp99", "Zfp99", [("XP_Q5", "zinc finger 99", 300)])]),
+}
+SUMMARY = {"10053": ["GCF_Q", "GCF_A", "GCF_B"], "39087": ["GCF_B", "GCF_C", "GCF_D"], "79684": ["GCF_Q"]}
+# NCBI GeneIDs of the relatives' genes; gene_orthologs links them to human (9606) genes
+GENEIDS = {("GCF_B", "Avp"): "2001", ("GCF_B", "Kcnq5"): "2002", ("GCF_B", "Zfp558"): "2005",
+           ("GCF_B", "Cdhr18"): "2006", ("GCF_C", "Avp"): "3001", ("GCF_C", "Kcnq5"): "3002", ("GCF_C", "Grm1"): "3003", ("GCF_C", "Znf558"): "3004",
+           ("GCF_C", "Tnfaip8l3"): "3005", ("GCF_C", "LOC77"): "3006", ("GCF_C", "LOC78"): "3007",
+           ("GCF_Q", "Avp"): "4001", ("GCF_Q", "Grm1"): "4002", ("GCF_Q", "Zfp99"): "4005"}
+HUMAN = [("9001", "AVP", [("112", "2001"), ("113", "3001"), ("79684", "4001")]),
+         ("9002", "KCNQ5", [("112", "2002"), ("113", "3002")]),
+         ("9005", "ZNF558", [("112", "2005"), ("113", "3004")]),
+         ("9006", "CDHR18P", [("112", "2006")]),
+         ("9007", "TIPE3", [("113", "3005")]),                  # renamed; TNFAIP8L3 is a synonym
+         ("9008", "KLRC4-KLRK1", [("113", "3006")]),            # readthrough
+         ("9009", "KLRC4", []), ("9010", "KLRK1", []),
+         ("9011", "POTEA", [("113", "3007")])]
+
+FAKE_DATASETS = r'''#!/usr/bin/env python3
+import json, os, sys, zipfile
+fix = json.load(open(os.environ["FAKE_DS_FIX"]))
+a = sys.argv[1:]
+if a[:1] == ["--version"]:
+    print("datasets version: 16.35.0"); sys.exit(0)
+if a[:2] == ["summary", "genome"]:
+    accs = fix["summary"].get(a[3], []) if a[2] == "taxon" else [a[3]]
+    for acc in accs:
+        org, taxid, rel, genes = fix["genomes"][acc]
+        print(json.dumps({"accession": acc, "organism": {"organism_name": org, "tax_id": taxid},
+                          "annotation_info": {"name": acc + "-RS", "release_date": rel,
+                                              "stats": {"gene_counts": {"protein_coding": len(genes)}}}}))
+    sys.exit(0)
+if a[:2] == ["download", "genome"]:
+    acc = a[3]; inc = a[a.index("--include") + 1].split(","); fn = a[a.index("--filename") + 1]
+    with open(os.environ["FAKE_DS_LOG"], "a") as log: log.write(acc + " " + ",".join(inc) + "\n")
+    with zipfile.ZipFile(fn, "w") as z:
+        if "gff3" in inc: z.writestr(f"ncbi_dataset/data/{acc}/genomic.gff", fix["gff"][acc])
+        if "protein" in inc: z.writestr(f"ncbi_dataset/data/{acc}/protein.faa", fix["faa"][acc])
+    sys.exit(0)
+sys.exit(1)
+'''
+
+FAKE_ORTHOFINDER = r'''#!/usr/bin/env python3
+import os, shutil, sys
+a = sys.argv[1:]
+if a[:1] == ["-h"]:
+    print("SIMPLE USAGE: Run full OrthoFinder analysis on FASTA format proteomes"); sys.exit(0)
+if a[:1] == ["-v"]:
+    print("\x1b[38;5;136;49mOrthoFinder\x1b[0m\x1b[39;49m:v\x1b[0m\x1b[38;5;38;49m3.\x1b[0m\x1b[1;38;5;38;49m2\x1b[0m")
+    sys.exit(0)
+with open(os.environ["FAKE_OF_ARGS"], "w") as fh: fh.write(" ".join(a))
+indir = a[a.index("-f") + 1]; out = a[a.index("-o") + 1]; name = a[a.index("-n") + 1]
+species = sorted(f[:-4] for f in os.listdir(indir) if f.endswith(".faa"))
+with open(os.environ["FAKE_OF_INPUT"], "w") as fh:
+    for sp in species:
+        ids = [l[1:].strip() for l in open(os.path.join(indir, sp + ".faa")) if l.startswith(">")]
+        fh.write(sp + "\t" + ",".join(ids) + "\n")
+res = os.path.join(out, "Results_" + name)
+src = os.environ["FAKE_OF_FIX"]
+os.makedirs(os.path.join(res, "Orthogroups"))
+shutil.copy(os.path.join(src, "Orthogroups.tsv"), os.path.join(res, "Orthogroups"))
+if os.environ.get("FAKE_OF_FORMAT") == "2":           # OrthoFinder 2: one table per relative
+    os.makedirs(os.path.join(res, "Orthologues", "Orthologues_query"))
+    for f in os.listdir(src):
+        if f.startswith("query__v__"):
+            shutil.copy(os.path.join(src, f), os.path.join(res, "Orthologues", "Orthologues_query"))
+else:                                                 # OrthoFinder 3: one gzipped long table, one row per ortholog
+    import gzip
+    os.makedirs(os.path.join(res, "Orthologs"))
+    with gzip.open(os.path.join(res, "Orthologs", "query.tsv.gz"), "wt") as out_fh:
+        out_fh.write("Orthogroup\tSpecies\tquery\tOrthologs\n")
+        for f in sorted(os.listdir(src)):
+            if f.startswith("query__v__"):
+                sp = f[len("query__v__"):-4]
+                for line in list(open(os.path.join(src, f)))[1:]:
+                    og, q, r = line.rstrip("\n").split("\t")
+                    for gene in r.split(", "):
+                        out_fh.write(f"{og}\t{sp}\t{q}\t{gene}\n")
+'''
+
+
+def setup(tmp: Path):
+    fix = {"genomes": {k: [v[0], v[1], v[2], [g[0] for g in v[3]]] for k, v in GENOMES.items()},
+           "summary": SUMMARY,
+           "gff": {k: gff(v[3], k) for k, v in GENOMES.items()},
+           "faa": {k: faa(v[3]) for k, v in GENOMES.items()}}
+    (tmp / "ds_fix.json").write_text(json.dumps(fix))
+    for name, text in (("datasets", FAKE_DATASETS), ("orthofinder", FAKE_ORTHOFINDER)):
+        p = tmp / name
+        p.write_text(text)
+        p.chmod(p.stat().st_mode | stat.S_IXUSR)
+    of = tmp / "of_fix"
+    of.mkdir()
+    (of / "Orthogroups.tsv").write_text(
+        "Orthogroup\tMicrotus_b\tMyodes_c\tquery\n"
+        "OG1\tXP_B1\tXP_C1\tg1\nOG2\tXP_B3\tXP_C2\tg2, g5b\nOG3\t\tXP_C3\tg3\nOG5\tXP_B1\tXP_C2\tg5\n"
+        "OG6\t\tXP_C1, XP_C3\tg6\nOG7\tXP_B5\tXP_C4\tg7\nOG8\t\tXP_C5\tg8\n")
+    (of / "query__v__Microtus_b.tsv").write_text(
+        "Orthogroup\tquery\tMicrotus_b\nOG1\tg1\tXP_B1\nOG2\tg2\tXP_B3\nOG5\tg5\tXP_B1\nOG7\tg7\tXP_B5\n")
+    (of / "query__v__Myodes_c.tsv").write_text(
+        "Orthogroup\tquery\tMyodes_c\nOG1\tg1\tXP_C1\nOG2\tg2\tXP_C2\nOG3\tg3\tXP_C3\nOG5\tg5\tXP_C2\n"
+        "OG6\tg6\tXP_C1, XP_C3\nOG7\tg7\tXP_C4\nOG8\tg8\tXP_C5\n")
+    (of / "query__v__Microtus_ochrogaster.tsv").write_text(
+        "Orthogroup\tquery\tMicrotus_ochrogaster\nOG1\tg1\tXP_Q1\nOG3\tg3\tXP_Q2\nOG5\tg5\tXP_Q3\n"
+        "OG6\tg6\tXP_Q4\nOG7\tg7\tXP_Q5\n")
+    db = tmp / "tax.sqlite"
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE taxonomy_nodes (tax_id INTEGER, parent_tax_id INTEGER, name TEXT)")
+    conn.executemany("INSERT INTO taxonomy_nodes VALUES (?, ?, ?)",
+                     [(79684, 10053, "Microtus ochrogaster"), (10053, 39087, "Microtus"),
+                      (39087, 1, "Arvicolinae"), (1, 1, "root")])
+    conn.execute("CREATE TABLE ncbi_orthologs (tax_id TEXT, gene_id TEXT, relationship TEXT, other_tax_id TEXT, "
+                 "other_gene_id TEXT)")
+    conn.execute("CREATE TABLE ncbi_geneinfo (gene_id TEXT, symbol TEXT, type TEXT)")
+    conn.execute("CREATE TABLE ncbi_gene_symbols (tax_id TEXT, symbol TEXT, gene_id TEXT, kind TEXT)")
+    conn.execute("INSERT INTO ncbi_gene_symbols VALUES ('9606', 'tnfaip8l3', '9007', 'synonym')")
+    for hid, sym, others in HUMAN:
+        conn.execute("INSERT INTO ncbi_geneinfo VALUES (?, ?, ?)",
+                     (hid, sym, "pseudo" if sym == "CDHR18P" else "protein-coding"))
+        conn.execute("INSERT INTO ncbi_gene_symbols VALUES ('9606', ?, ?, 'symbol')", (sym.lower(), hid))
+        conn.executemany("INSERT INTO ncbi_orthologs VALUES ('9606', ?, 'Ortholog', ?, ?)",
+                         [(hid, t, g) for t, g in others])
+    conn.commit()
+    conn.close()
+    os.environ.update({"FAKE_DS_FIX": str(tmp / "ds_fix.json"), "FAKE_DS_LOG": str(tmp / "ds_log.txt"),
+                       "FAKE_OF_ARGS": str(tmp / "of_args.txt"), "FAKE_OF_INPUT": str(tmp / "of_input.txt"),
+                       "FAKE_OF_FIX": str(of)})
+    return db
+
+
+def test_helpers():
+    check(species_label("Peromyscus maniculatus bairdii") == "Peromyscus_maniculatus_bairdii", "species label")
+    check(symbol_base("foxo3b") == "FOXO3" and symbol_base("dhdh.2") == "DHDH" and symbol_base("AVP") == "AVP",
+          "suffix-free symbol")
+    check(agreed_symbol(["Avp", "AVP"]) == ("Avp", "agree"), "agreement is case-insensitive")
+    check(agreed_symbol(["foxo3b", "foxo3b", "foxo3"]) == ("foxo3b", "agree_base"), "most frequent form")
+    check(agreed_symbol(["foxo3a", "foxo3b"]) == ("FOXO3", "agree_base"), "tie gives the suffix-free form")
+    check(agreed_symbol(["Avp", "Kcnq5"]) == ("", "disagree") and agreed_symbol([]) == ("", "none"),
+          "disagreement and no symbol")
+
+
+def test_orthofinder3_table(tmp: Path):
+    import gzip
+    path = tmp / "query.tsv.gz"
+    with gzip.open(path, "wt") as fh:
+        fh.write("Orthogroup\tSpecies\tquery\tOrthologs\n"
+                 "OG1\tSp_b\tq1\tb1\n"                    # 1:1
+                 "OG2\tSp_b\tq2\tb2\nOG2\tSp_b\tq2\tb3\n"   # 1:many split over two rows
+                 "OG3\tSp_b\tq3, q4\tb4\n"                # many:1
+                 "OG1\tSp_c\tq1\tc1, c2\n")               # 1:many in one row
+    rows = parse_orthologs_by_species(path)
+    b = {r[1][0]: r for r in rows["Sp_b"]}
+    check(b["q1"] == ("OG1", ["q1"], ["b1"]), "OrthoFinder 3: 1:1")
+    check(b["q2"] == ("OG2", ["q2"], ["b2", "b3"]), "OrthoFinder 3: orthologs split over rows regrouped")
+    check(b["q3"] == ("OG3", ["q3", "q4"], ["b4"]) and b["q4"] == ("OG3", ["q4", "q3"], ["b4"]),
+          "OrthoFinder 3: co-orthologs in the query, the gene itself first")
+    check(rows["Sp_c"] == [("OG1", ["q1"], ["c1", "c2"])], "OrthoFinder 3: species kept apart")
+
+
+def test_progress_line(tmp: Path):
+    log = tmp / "orthofinder.log"
+    log.write_text("\x1b[1;36;49m2026\x1b[0m-11-01 17:40:14 : Scheduling species tree\n"
+                   "Processing... \u2501\u2501\u2501   16/16 0:03:08\r\n"
+                   "-------------------------------\n=====\n", encoding="utf-8")
+    check(_last_line(log) == "Processing... 16/16 0:03:08", "progress line without colour codes and rules")
+    log.write_text("\x1b[1;36;49m2026\x1b[0m-11-01 17:40:14 : Scheduling species tree\n------\n",
+                   encoding="utf-8")
+    check(_last_line(log) == "2026-11-01 17:40:14 : Scheduling species tree", "colour codes removed")
+    check(_last_line(tmp / "missing.log") == "", "missing log")
+
+
+def test_gff(tmp: Path):
+    p = tmp / "b.gff"
+    p.write_text(gff(GENOMES["GCF_B"][3], "GCF_B"))
+    info = parse_refseq_gff(p)
+    check(info["XP_B3"] == ("gene-Kcnq5", "Kcnq5", "potassium channel KCNQ5 isoform X1", "protein_coding", "2002"),
+          f"CDS traced to its gene and GeneID: {info['XP_B3']}")
+
+
+def test_module(tmp: Path, db: Path):
+    proteins = tmp / "q.faa"
+    names = ["g1", "g2", "g3", "g5", "g6", "g7", "g8"]
+    proteins.write_text("".join(f">{g}_t1\nM{'A' * 99}\n" for g in names) + ">g2_t2\nM" + "A" * 299 + "\n")
+    tx2g = {f"{g}_t1": g for g in names}
+    tx2g["g2_t2"] = "g2"
+    g2t = {}
+    for t, g in tx2g.items():
+        g2t.setdefault(g, []).append(t)
+    universe = GeneUniverse(gene_ids=names, transcript_to_gene=tx2g, gene_to_transcripts=g2t,
+                            coding={g: True for g in names})
+    ann = {g: QueryAnnotation(query_id=g) for g in names}
+    ann["g2"].consensus_symbol, ann["g2"].symbol_status = "kcnq5b", "foreign_kept"
+    ann["g2"].consensus_name = "potassium voltage-gated channel subfamily KQT member 5"
+    ann["g3"].consensus_symbol, ann["g3"].symbol_status = "GRM1", "vote_supported"
+    ann["g8"].consensus_symbol, ann["g8"].symbol_status = "TNFAIP8L3", "rbh"
+    bf = BadNameFilter(str(default_bad_names_path()))
+    os.chdir(tmp)
+    work, reports = Path("intermediate"), Path("reports")
+    work.mkdir()
+    reports.mkdir()
+    args = Namespace(modules="orthology", orthofinder_bin=str(tmp / "orthofinder"), datasets_bin=str(tmp / "datasets"),
+                     relatives=2, relative=[], relative_min_named=0.6, relatives_dir=None, orthofinder_threads=48,
+                     ortholog_symbol="fill", taxid=79684, db=str(db), force_modules=False, same_species=False,
+                     reference_taxid="9606", ortholog_anchor_taxid="9606", no_resolve_orthologs=False)
+    mods = select_modules(args)
+    check(len(mods) == 1 and isinstance(mods[0], OrthologyModule), "orthology module selected")
+    ctx = ModuleContext(query_fasta=Path("q.faa"), search_mode="blastp", work_dir=work, reports_dir=reports,
+                        prefix="p", threads=60, universe=universe, annotations=ann, bad_name_filter=bf,
+                        symbol_case_fn=str.upper)
+    ran = run_modules(mods, ctx)
+    check(len(ran) == 1, "module ran with the stand-in tools")
+    m = ran[0]
+    check(m.status.version == "OrthoFinder 3.2, datasets 16.35.0", f"versions: {m.status.version}")
+    check([(r.accession, r.status) for r in m.candidates] == [("GCF_A", "rejected_named"), ("GCF_B", "chosen"),
+                                                            ("GCF_C", "chosen")],
+          f"candidates: query species skipped, A rejected for naming, D not needed: "
+          f"{[(r.accession, r.status) for r in m.candidates]}")
+    check([r.level for r in m.relatives] == ["Microtus", "Arvicolinae"], "levels recorded")
+    check(abs(m.candidates[0].named - 1 / 3) < 1e-9 and abs(m.relatives[0].named - 4 / 5) < 1e-9, "named fractions")
+    dl = (tmp / "ds_log.txt").read_text().split("\n")
+    check("GCF_D gff3" not in dl and "GCF_B gff3,protein" in dl and "GCF_A gff3,protein" not in dl,
+          f"only chosen relatives' proteins downloaded: {dl}")
+    of_args = (tmp / "of_args.txt").read_text().split()
+    check(of_args[of_args.index("-t") + 1] == "48" and of_args[of_args.index("-a") + 1] == "12"
+          and of_args[of_args.index("-f") + 1].startswith("/"), f"OrthoFinder threads and absolute paths: {of_args}")
+    inputs = dict(l.split("\t") for l in (tmp / "of_input.txt").read_text().splitlines())
+    check(inputs["Microtus_b"] == "XP_B1,XP_B3,XP_B4,XP_B5,XP_B6" and inputs["query"] == "g1,g2,g3,g5,g6,g7,g8",
+          f"one protein per gene, the longest: {inputs}")
+    # Symbols
+    check(ann["g1"].consensus_symbol == "AVP" and ann["g1"].symbol_status == "ortholog_fill"
+          and ann["g1"].consensus_name == "vasopressin-neurophysin 2-copeptin" and ann["g1"].product_note == "ortholog",
+          f"unnamed gene filled: {ann['g1'].consensus_symbol} / {ann['g1'].consensus_name}")
+    check(ann["g2"].consensus_symbol == "KCNQ5" and "kcnq5b" in ann["g2"].symbol_aliases
+          and ann["g2"].consensus_name == "potassium voltage-gated channel subfamily KQT member 5",
+          "lineage symbol replaced, kept as alias; product kept")
+    check(ann["g3"].consensus_symbol == "GRM1" and m.check["compared"] == 2 and m.check["same"] == 1,
+          "supported symbol checked, not changed")
+    check(ann["g5"].consensus_symbol == "" and m.check["relatives_disagree"] == 1, "disagreeing relatives fill nothing")
+    check(ann["g6"].consensus_symbol == "" and m.gene_symbol["g6"] == ("", "none"), "1:many gives no symbol")
+    check(ann["g7"].consensus_symbol == "ZNF558" and m.gene_symbol["g7"] == ("ZNF558", "agree")
+          and ann["g7"].consensus_name == "zinc finger protein 558",
+          f"mouse-style Zfp558 and Znf558 agree in the reference nomenclature: {m.gene_symbol['g7']}")
+    check(m.normalized == {"same": 5, "changed": 2, "no_reference_ortholog": 1, "reference_pseudogene": 1,
+                           "identifier_replaced": 1}, f"normalization counts {m.normalized}")
+    pc = m.relatives[1].proteins
+    check(pc["XP_C5"].ref_symbol == "TIPE3", "a former name is updated to the reference gene's symbol")
+    check(m.gene_symbol["g8"] == ("TIPE3", "agree") and ann["g8"].consensus_symbol == "TNFAIP8L3"
+          and m.check["synonym"] == 1,
+          f"the core's former name of the same gene agrees (TNFAIP8L3 / TIPE3): {m.check}")
+    check(pc["XP_C6"].ref_symbol == "LOC77", "a readthrough reference ortholog is not used")
+    check(pc["XP_C7"].ref_symbol == "POTEA", "a LOC identifier takes its reference ortholog's symbol")
+    check(m.relatives[0].proteins["XP_B6"].ref_symbol == "Cdhr18", "a pseudogene reference ortholog is not used")
+    check(m.counts["symbols_filled"] == 3 and m.counts["filled_unnamed"] == 2 and m.counts["filled_foreign_kept"] == 1
+          and m.counts["products_filled"] == 2, f"counts {m.counts}")
+    rel_rows = (reports / "p_orthology_relatives.tsv").read_text().splitlines()
+    check(len(rel_rows) == 4 and rel_rows[2].split("\t")[8:] == ["chosen", "5", "4", "4"],
+          f"relatives report: {rel_rows[2].split(chr(9))[8:]}")
+    rep = {r.split("\t")[0]: r.split("\t") for r in (reports / "p_orthology.tsv").read_text().splitlines()[1:]}
+    check(rep["g2"][4:7] == ["Kcnq5", "agree", "kcnq5b"] and rep["g1"][6] == "(none)", "per-gene report")
+    check(rep["g7"][8] == "XP_B5:Zfp558>ZNF558" and rep["g7"][10] == "XP_C4:Znf558",
+          f"report shows the relative's symbol and its reference form: {rep['g7'][8:]}")
+    check(any("Relatives' symbols" in l and "2 put in the reference nomenclature" in l for l in m.summary_lines()),
+          "summary normalization line")
+    check(m._orthologs_text("g6") == "Myodes_c:Avp,Grm1(1:many)", f"orthologs column: {m._orthologs_text('g6')}")
+    check(any("Check, supported symbols" in l and "2 of 2 agree" in l for l in m.summary_lines()), "summary check line")
+
+    # Reuse: same relatives and query, OrthoFinder not rerun, downloads reused
+    (tmp / "of_args.txt").unlink()
+    (tmp / "ds_log.txt").write_text("")
+    m2 = OrthologyModule(args)
+    m2.detect()
+    m2.run(ctx)
+    check(not (tmp / "of_args.txt").exists() and (tmp / "ds_log.txt").read_text() == "",
+          "OrthoFinder results and downloads reused")
+    check(m2.orthologs == m.orthologs, "reused results read the same")
+
+    # OrthoFinder 2 layout gives the same orthologs as OrthoFinder 3
+    os.environ["FAKE_OF_FORMAT"] = "2"
+    v2 = tmp / "of2"
+    subprocess.run([str(tmp / "orthofinder"), "-f", str(work / "p_orthology" / "input"), "-o", str(v2),
+                    "-n", "goannotate"], check=True)
+    del os.environ["FAKE_OF_FORMAT"]
+    m5 = OrthologyModule(args)
+    m5.relatives = m.relatives
+    m5._read_results(v2 / "Results_goannotate")
+    check(m5.orthologs == m.orthologs and m5.orthologs, "OrthoFinder 2 and 3 tables agree")
+
+    # Manual relative by accession
+    m3 = OrthologyModule(Namespace(**{**vars(args), "relative": ["GCF_D"], "taxid": None}))
+    s = m3.detect()
+    check(s.available, "manual relative needs no --taxid")
+    m3._choose_relatives(ctx, work / "p_orthology" / "relatives", bf.is_bad_symbol)
+    check([r.accession for r in m3.relatives] == ["GCF_D"] and m3.relatives[0].level == "--relative",
+          "manual relative used")
+    # No taxid and no relative
+    m4 = OrthologyModule(Namespace(**{**vars(args), "taxid": None}))
+    check(not m4.detect().available, "automatic choice needs --taxid")
+    m4b = OrthologyModule(Namespace(**{**vars(args), "taxid": None, "relative": ["GCF_D"], "same_species": True}))
+    check(not m4b.detect().available, "--same-species needs --taxid")
+
+    # Without the reference tables the relatives' own symbols are used
+    m7 = OrthologyModule(Namespace(**{**vars(args), "no_resolve_orthologs": True}))
+    m7.relatives = m.relatives
+    for r in m7.relatives:
+        for g in r.proteins.values():
+            g.ref_symbol = g.symbol
+    m7._normalize_symbols()
+    check(not m7.normalized and m.relatives[0].proteins["XP_B5"].ref_symbol == "Zfp558",
+          "--no-resolve-orthologs keeps the relatives' symbols")
+
+    # --same-species: the query species' own annotation, beyond --relatives
+    ann2 = {g: QueryAnnotation(query_id=g) for g in names}
+    ann2["g3"].consensus_symbol, ann2["g3"].symbol_status = "GRM1", "vote_supported"
+    ctx2 = ModuleContext(query_fasta=Path("q.faa"), search_mode="blastp", work_dir=work, reports_dir=reports,
+                         prefix="s", threads=60, universe=universe, annotations=ann2, bad_name_filter=bf,
+                         symbol_case_fn=str.upper)
+    m6 = OrthologyModule(Namespace(**{**vars(args), "same_species": True}))
+    ran = run_modules([m6], ctx2)
+    check(len(ran) == 1 and m6.same is not None and m6.same.accession == "GCF_Q"
+          and [r.accession for r in m6.relatives] == ["GCF_B", "GCF_C", "GCF_Q"],
+          f"same-species annotation added beyond --relatives: {[r.accession for r in m6.relatives]}")
+    inputs = dict(l.split("\t") for l in (tmp / "of_input.txt").read_text().splitlines())
+    check("Microtus_ochrogaster" in inputs, "same-species proteome given to OrthoFinder")
+    check(m6.gene_symbol["g1"] == ("Avp", "agree_same_species"), f"agrees with the relatives: {m6.gene_symbol['g1']}")
+    check(m6.gene_symbol["g5"] == ("Oldname", "same_species") and ann2["g5"].consensus_symbol == "OLDNAME"
+          and ann2["g5"].consensus_name == "old protein",
+          f"used when the other relatives disagree: {m6.gene_symbol['g5']}")
+    check(m6.gene_symbol["g6"] == ("Sstr2", "same_species") and ann2["g6"].consensus_symbol == "SSTR2",
+          f"used when the other relatives have no 1:1 ortholog: {m6.gene_symbol['g6']}")
+    check(m6.gene_symbol["g7"] == ("", "same_species_disagree") and ann2["g7"].consensus_symbol == "",
+          f"not used when the other relatives agree on another symbol: {m6.gene_symbol['g7']}")
+    check(m6.same_check == {"compared": 1, "same": 1} and m6.check["compared"] == 1,
+          f"continuity check of supported symbols: {m6.same_check}")
+    check(any("Check, previous annotation" in l and "1 of 1" in l for l in m6.summary_lines())
+          and any("same species, beyond --relatives" in l for l in m6.summary_lines()), "same-species summary lines")
+    rel_rows = (reports / "s_orthology_relatives.tsv").read_text().splitlines()
+    check(rel_rows[-1].split("\t")[3] == "same species" and rel_rows[-1].split("\t")[8] == "chosen",
+          f"same species in the relatives report: {rel_rows[-1]}")
+
+
+if __name__ == "__main__":
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        db = setup(tmp)
+        test_helpers()
+        test_progress_line(tmp)
+        test_orthofinder3_table(tmp)
+        test_gff(tmp)
+        test_module(tmp, db)
+    print()
+    if failures:
+        print(f"{failures} check(s) failed")
+        sys.exit(1)
+    print("All checks passed")

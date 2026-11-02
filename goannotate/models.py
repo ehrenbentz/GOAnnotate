@@ -161,6 +161,7 @@ class QueryAnnotation:
     secondary_symbol: str = ""  # symbol in the secondary nomenclature (unambiguous reciprocal best hit)
     symbol_aliases: list = field(default_factory=list)  # other symbols of the same gene (hits' GN= symbols,
                                                         # the replaced voted symbol, reference-species synonyms)
+    go_interpro: dict = field(default_factory=dict)     # GO ID -> InterPro entries that carry it (InterProScan module)
 
 
 @dataclass
