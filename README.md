@@ -2,7 +2,7 @@
 
 Functional annotation of gene models using Diamond searches against UniProt.
 
-GOAnnotate assigns protein names, gene symbols, and Gene Ontology (GO) terms to genes from Diamond hits against SwissProt and TrEMBL. Starting from a GFF3 and a genome, it extracts and translates the coding sequences itself, runs the Diamond searches, aggregates hits across isoforms, clusters them by protein name similarity, and uses a voting/scoring system to pick the best annotation for each gene. Genomes that already carry functional annotation (for example from EGAPx) are compared gene by gene with the GOAnnotate result, and the existing annotation is kept in the output.
+GOAnnotate assigns protein names, gene symbols, and Gene Ontology (GO) terms to genes from Diamond hits against SwissProt and TrEMBL. Starting from a GFF3 and a genome, it extracts and translates the coding sequences itself, runs the Diamond searches, aggregates hits across isoforms, clusters them by protein name similarity, and uses a voting/scoring system to pick the best annotation for each gene. Optional modules add orthologs in close relatives (OrthoFinder, run before the vote so that well-supported orthologs decide it), signal peptides (SignalP 6), and protein domains with their GO terms (InterProScan 6). Every symbol is checked against the proteome of a reference species, and the reference gene's curated GO terms are added. Genomes that already carry functional annotation (for example from EGAPx) are compared gene by gene with the GOAnnotate result, and the existing annotation is kept in the output.
 
 **Author:** E. J. Bentz (2025-2026)
 
@@ -262,7 +262,7 @@ goannotate \
 | `--existing-symbol-attr` | gene | Attribute(s) holding an existing gene symbol |
 | `--existing-product-attr` | product description | Attribute(s) holding an existing product name |
 | `--strata-gene`, `--strata-transcript` | graft_status, graft_protein | Attributes the comparison is stratified by |
-| `--modules` | none | Optional modules to run (`signalp`; `auto` runs every module whose tool is found); see Optional Modules |
+| `--modules` | none | Optional modules to run (`signalp`, `orthology`, `interproscan`; `auto` runs every module whose tool is found); see Optional Modules |
 | `--check-tools` | off | Report which external tools are available, then exit |
 | `--force-modules` | off | Rerun the module tools even when their results exist |
 | `--signalp-bin`, `--signalp-mode`, `--signalp-features` | `signalp6` on PATH, fast, off | SignalP module settings |
@@ -281,7 +281,9 @@ goannotate \
 | `--nxf-home` | `~/.nextflow` | Directory for Nextflow's own files (NXF_HOME) |
 | `--relatives` | 3 | Close relatives chosen automatically for the orthology module |
 | `--relative` | none | Relative to use instead (NCBI assembly accession or taxon ID; repeatable) |
-| `--relative-min-named` | 0.7 | Fraction of a relative's protein-coding genes that must have a symbol |
+| `--relative-min-named` | 0.2 | Lowest informative fraction of a relative's protein-coding genes (symbol, or a link to a named reference gene) |
+| `--relative-named-ratio` | 0.75 | A relative must reach this fraction of the best candidate at its level or closer |
+| `--relative-named-margin` | 0.10 | Per lineage level, how much better named a farther relative must be to rank above a closer one |
 | `--same-species` | off | Also use the RefSeq annotation of the query species itself, beyond `--relatives` |
 | `--relatives-dir` | `intermediate/{prefix}_orthology/relatives` | Where relatives' annotations are downloaded |
 | `--orthofinder-bin`, `--orthofinder-threads`, `--datasets-bin` | on PATH, `--threads`, on PATH | OrthoFinder and NCBI datasets settings |
@@ -292,6 +294,21 @@ goannotate \
 | `--prefix` | output dir name | Prefix for output filenames |
 
 ## How It Works
+
+### Workflow overview
+
+The stages run in this order (modules only when selected with `--modules`):
+
+1. **Input** (Phase 0): gene universe and query proteins from the GFF3 and genome, or from FASTA files.
+2. **Diamond search** (Phase 1): query proteins against SwissProt and TrEMBL, or precomputed results with `--blast-results`.
+3. **Orthology module, first part**: relatives are chosen from the query's lineage, their RefSeq annotations downloaded, and OrthoFinder run on the query and relatives. Each gene's one-to-one ortholog symbol, and whether close relatives support it, is passed to the vote.
+4. **Per-gene vote** (Phases 2 to 8): hit cleaning, isoform aggregation, clustering, cluster and symbol selection, GO terms from the hits, symbol propagation. A symbol supported by close relatives decides the vote; a distant relative's symbol counts as one more vote.
+5. **Reference checks** (Phase 8b): reciprocal best hits and sequence support against the reference proteome, the secondary nomenclature, symbol aliases.
+6. **Orthology module, second part**: the close relatives' symbols are applied (`confirmed`, `refined`, `taken`, `conflict_kept`, `filled`, `kept`), with orthology evidence added to the confidence.
+7. **Reference-gene GO**: GO terms of the reference gene named by each supported symbol (Phase 7, `--reference-go`).
+8. **SignalP and InterProScan modules**: signal peptides; InterPro entries, InterPro GO terms, and domain-based products for genes left without one.
+9. **Concordance and confidence** of the final annotation (Phase 9).
+10. **Comparison** with an existing annotation in the GFF3 (Phase 10), and the output files.
 
 ### Phase 0: Input Parsing
 
@@ -402,11 +419,11 @@ Several genes may carry the same symbol. Paralogs, recent duplicates and retroco
 
 **Pseudogenes, readthroughs and weakly evidenced paralogs.** A readthrough locus of the reference species (an official symbol made of two official symbols: IQCJ-SCHIP1, KLRC4-KLRK1) never names a gene. A reference pseudogene symbol (NCBI type `pseudo`) does not win the vote when only reference-species hits carry it (FAM90A27P); when hits of other species carry it, it names their functional gene and stays (rodent Uox, Gucy1b2, Fer1l4, whose human orthologs are pseudogenes). Neither is ever a reciprocal best hit or a replacement. After the checks, a symbol whose reference proteins have only weak UniProt protein evidence (PE 2 to 5) is replaced by the established reference gene (PE=1) it is named after (its symbol begins with that gene's symbol) when the gene covers it and hits it at least 0.95 as well: a retrocopy or a recent human duplicate scoring almost like its parent gives way to the parent (NANOGP8 to NANOG, CD8B2 to CD8B). The replaced symbol is kept in `voted_symbol` and among the aliases.
 
-**Ortholog symbols.** With the orthology module, the relatives' ortholog symbols enter the vote in Phase 6 (a close relative's symbol decides it, a distant one is one more vote) and are applied after these checks: a close relative's symbol is taken even over a supported core symbol (`ortholog`; such conflicts are listed for review), a distant one fills what is left (`ortholog_fill`). See [orthology](#orthology-symbols-from-relatives-weighted-by-their-closeness).
+**Ortholog symbols.** With the orthology module, OrthoFinder runs before the vote, the relatives' ortholog symbols enter the vote in Phase 6 (a close relative's symbol decides it, a distant one is one more vote), and they are applied after these checks: the close relatives' own form of the same gene is used (`refined`); a close relatives' symbol for another gene is taken over a supported core symbol (`ortholog`, decision `taken`, listed for review) unless a single close relative alone names it against a reciprocal best hit (`conflict_kept`); a distant one fills what is left (`ortholog_fill`). See [orthology](#orthology-symbols-from-relatives-weighted-by-their-closeness).
 
 ### Phase 9: Confidence
 
-Each gene receives a confidence score in [0, 1] and a label:
+Each gene receives a confidence score in [0, 1] and a label, computed once the annotation is final (after the reference checks and the modules) from the concordance of the final symbol and product with the gene's hits:
 
 ```
 score = 0.45 * name_concordance
@@ -555,7 +572,7 @@ The annotated GFF3 is the input file passed through line by line: every feature,
 
 ## Optional Modules
 
-Modules wrap external tools that add information to the annotation. No module changes a symbol supported by the reference proteome or a product assigned by the core pipeline. The orthology module names genes without a symbol and may replace a lineage symbol kept for lack of a reference ortholog; the InterProScan module adds GO terms and names genes left without a product. Orthology runs before InterProScan, so that a gene named from its orthologs is not given a domain-based name. They are off by default and selected with `--modules NAME[,NAME]`, or `--modules auto` to run every module whose tool is found. The tools are installed separately by the user; `goannotate --check-tools` reports which are available. Modules run after the symbol checks and before the outputs, so that their reports can list the final symbol and product of every gene. Their raw outputs are kept in `intermediate/{prefix}_{module}/` and reused by later runs into the same directory (`--force-modules` reruns them). Modules need protein queries and are skipped for nucleotide (`blastx`) input.
+Modules wrap external tools that add information to the annotation. The orthology module weighs the symbols of close relatives' orthologs against the hit-based vote (see below); SignalP adds signal peptide calls and no symbols, products or GO terms; the InterProScan module adds GO terms and names genes left without a product. They are off by default and selected with `--modules NAME[,NAME]`, or `--modules auto` to run every module whose tool is found. The tools are installed separately by the user; `goannotate --check-tools` reports which are available. The orthology module runs OrthoFinder before the vote, so that the relatives' symbols can steer it, and applies its symbols after the symbol checks; SignalP and InterProScan run after the symbol checks and the reference-gene GO terms, so that their reports list the final symbol and product of every gene, and a gene named from its orthologs is not given a domain-based name. Their raw outputs are kept in `intermediate/{prefix}_{module}/` and reused by later runs into the same directory (`--force-modules` reruns them). Modules need protein queries and are skipped for nucleotide (`blastx`) input.
 
 Each module appends its columns to the end of the gene and transcript tables, adds `goannotate_*` attributes (or standard INSDC features) to the annotated GFF3, writes a report to `reports/`, and is summarized in a Modules section of the summary file.
 
@@ -592,7 +609,7 @@ Finds the orthologs of every gene in the RefSeq annotations of relatives with [O
 
 **Requirements.** OrthoFinder (for example `conda create -n orthofinder -c bioconda orthofinder`; give its executable with `--orthofinder-bin`, and GOAnnotate puts that environment first on PATH while it runs) and the NCBI `datasets` command-line tool on PATH (or `--datasets-bin`). Relatives' annotations are downloaded from NCBI.
 
-**Choosing relatives.** By default they are chosen from the lineage of `--taxid` (which needs the taxonomy tables of the SQLite database). The lineage is walked outward from the genus; at each level the NCBI reference genomes with a RefSeq annotation are listed, newest annotation first, the query species itself is skipped (see `--same-species`), and each candidate's GFF3 is downloaded to measure the fraction of its protein-coding genes that have a symbol rather than an identifier (LOC numbers and the other symbol patterns). Candidates naming at least `--relative-min-named` (default 0.7) of their genes are accepted until `--relatives` (default 3) are found. Close relatives are not always well named: of the vole relatives, *Microtus oregoni* (RefSeq 2021) names 56% of its protein-coding genes, *M. pennsylvanicus* (2025) 76%, mouse 99.6%. `--relative` names relatives instead (an assembly accession such as `GCF_000001635.27`, or a taxon ID, whose newest annotated reference genome is used). Every candidate examined, with its level, annotation, named fraction and whether it was used, is listed in `reports/{prefix}_orthology_relatives.tsv`. Downloads are kept in `--relatives-dir` and reused.
+**Choosing relatives.** By default they are chosen from the lineage of `--taxid` (which needs the taxonomy tables of the SQLite database), closest first. The lineage is walked outward from the genus; at each level up to 10 NCBI reference genomes with a RefSeq annotation are listed, newest annotation first, the query species itself is skipped (see `--same-species`), and each candidate's GFF3 is downloaded to measure its informative fraction: the protein-coding genes that have a symbol rather than an identifier (LOC numbers and the other symbol patterns), plus those whose NCBI GeneID links through gene_orthologs to a named reference gene. The second part matters for older annotations without symbols: the paper wasp *Polistes canadensis* (RefSeq 2015) has no symbols but is 39.8% informative through its Drosophila orthologs. A candidate is rejected only below a low floor, `--relative-min-named` (default 0.2), or below `--relative-named-ratio` (default 0.75) of the best candidate at its level or closer. The remaining candidates are ranked by informative fraction less `--relative-named-margin` (default 0.10) per lineage level step, so a farther relative is preferred only when it is clearly better named, and the best `--relatives` (default 3) are used. When no candidate is usable, the module is skipped with a warning and the annotation rests on the Diamond vote alone. `--relative` names relatives instead (an assembly accession such as `GCF_000001635.27`, or a taxon ID, whose newest annotated reference genome is used). Every candidate examined, with its level, annotation, symbol and informative fractions and whether it was used (`chosen`, `not_needed`, `rejected_named`, `rejected_ratio`), is listed in `reports/{prefix}_orthology_relatives.tsv`. Downloads are kept in `--relatives-dir` and reused.
 
 **Orthologs.** The longest protein of each coding gene of the query and of each relative goes to OrthoFinder (Diamond searches, default settings: DendroBLAST gene trees, no RAxML). `--orthofinder-threads` limits its threads (default `--threads`); its progress lines in the log include the CPU temperature when `sensors` is available.
 
