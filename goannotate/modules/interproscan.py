@@ -33,6 +33,26 @@ logger = logging.getLogger(__name__)
 DEFAULT_WORKFLOW = "ebi-pf-team/interproscan6"
 PROGRESS_INTERVAL = 60
 OUTPREFIX = "interproscan"
+RESOURCES_CONFIG = "goannotate_resources.config"
+
+# CPUs requested by the InterProScan steps that run several threads although the workflow
+# requests one CPU per task (MobiDB-lite runs several disorder predictors at once).
+# Nextflow counts these CPUs against --max-workers, so the parallel tasks fit the threads given.
+STEP_CPUS = {"RUN_MOBIDBLITE": 4}
+# Container runtimes that take --cpus: each task's container is held to the CPUs it requested
+CPU_LIMIT_RUNTIMES = ("docker", "podman")
+
+
+def resources_config(profile: str) -> str:
+    """Nextflow configuration with the CPUs of the multi-threaded steps and, for Docker and
+    Podman, a CPU limit on each task's container equal to the CPUs it requested."""
+    lines = ["// Written by GOAnnotate: CPUs of the InterProScan steps", "process {"]
+    for step, cpus in STEP_CPUS.items():
+        lines.append(f"    withName: '{step}' {{ cpus = {cpus} }}")
+    if profile in CPU_LIMIT_RUNTIMES:
+        lines.append('    containerOptions = { "--cpus ${task.cpus}" }')
+    lines.append("}")
+    return "\n".join(lines) + "\n"
 DOMAIN_TYPES = ("Domain", "Repeat")       # InterPro entry types used for product names
 MAX_NAMED_DOMAINS = 2
 
@@ -338,15 +358,19 @@ class InterProScanModule(Module):
             except (json.JSONDecodeError, OSError):
                 pass
 
+        # CPUs: --max-workers is the CPU budget of Nextflow's local executor (--threads by default).
+        # Most tasks request one CPU; the multi-threaded steps request their real use (STEP_CPUS)
+        # and, with Docker or Podman, each container is limited to the CPUs it requested, so the
+        # load stays within the budget. The configuration is added with Nextflow's -c option.
+        profile = self._profile()
+        workers = self.workers or max(1, ctx.threads or 2)
+        resources = out_dir / RESOURCES_CONFIG
+        resources.write_text(resources_config(profile))
         local = self._local_workflow()
-        cmd = [self.status.path, "run", str(local) if local else self.workflow]
+        cmd = [self.status.path, "-c", str(resources), "run", str(local) if local else self.workflow]
         if not local:
             cmd += ["-r", self.revision]
-        # Parallel tasks: half of --threads by default, because some InterProScan steps are
-        # multi-threaded (MobiDB-lite's disorder predictors reached 500% CPU on the vole); with 60
-        # tasks on a 64-thread machine the load exceeded the hardware threads.
-        workers = self.workers or max(1, (ctx.threads or 2) // 2)
-        cmd += ["-profile", self._profile(), "-ansi-log", "false", "-w", str(out_dir / "work"),
+        cmd += ["-profile", profile, "-ansi-log", "false", "-w", str(out_dir / "work"),
                 "-resume",            # an interrupted run reuses its finished tasks (same work directory)
                 "--input", str(fasta), "--datadir", str(Path(self.datadir).resolve()), "--interpro", self.interpro,
                 "--goterms", "--formats", "tsv", "--outdir", str(out_dir), "--outprefix", OUTPREFIX,

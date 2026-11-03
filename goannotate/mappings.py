@@ -536,6 +536,18 @@ class ReferenceNomenclature:
     def is_pseudogene(self, symbol: str) -> bool:
         return bool(symbol) and symbol.lower() in self.pseudogenes
 
+    def is_readthrough(self, symbol: str) -> bool:
+        """
+        A readthrough locus of the reference species: an official symbol made
+        of two official symbols joined by a hyphen (IQCJ-SCHIP1, KLRC4-KLRK1).
+        HLA-A and similar are not, since their parts are not symbols.
+        """
+        return is_readthrough_symbol(symbol, self.official)
+
+    def is_excluded(self, symbol: str) -> bool:
+        """Pseudogenes and readthroughs never name a gene of the query species."""
+        return self.is_pseudogene(symbol) or self.is_readthrough(symbol)
+
     def __bool__(self):
         return bool(self.official)
 
@@ -550,6 +562,44 @@ class ReferenceNomenclature:
         if s in self.official:
             return self.official[s]
         return self.renamed.get(s, "")
+
+
+# Genome-duplication and copy suffixes of gene symbols (.2, a, b, l, la, lb, l2)
+_GENOME_SUFFIX = re.compile(r"(?:\.\d+|L?[AB]|L\d*)$", re.I)
+
+
+def symbol_base(symbol: str) -> str:
+    """Upper case without a genome suffix (.2, a, b, l, la, lb, l2): foxo3b -> FOXO3."""
+    s = symbol.upper()
+    stripped = _GENOME_SUFFIX.sub("", s)
+    return stripped or s
+
+
+_SUFFIX_FORMS = (re.compile(r"\.\d+$"), re.compile(r"[AB]$", re.I), re.compile(r"L[AB]$", re.I),
+                 re.compile(r"L\d*$", re.I))
+
+
+def symbol_bases(symbol: str) -> set:
+    """
+    Upper-case forms of a symbol without one genome suffix, each suffix read
+    separately: glula -> {GLUL, GLU}, foxo3b -> {FOXO3}, krt18a.1 -> {KRT18A}.
+    A gene named in one of these forms is the gene the copy belongs to.
+    """
+    s = symbol.upper()
+    out = set()
+    for pattern in _SUFFIX_FORMS:
+        stripped = pattern.sub("", s)
+        if stripped and stripped != s:
+            out.add(stripped)
+    return out
+
+
+def is_readthrough_symbol(symbol: str, official) -> bool:
+    """symbol is official and made of two or more official symbols joined by hyphens (official: lowercase keys)."""
+    if not symbol or "-" not in symbol:
+        return False
+    parts = symbol.lower().split("-")
+    return symbol.lower() in official and len(parts) >= 2 and all(p in official for p in parts)
 
 
 _SYMBOL_LIKE = re.compile(r"^[a-z0-9][a-z0-9._@/-]*$")
@@ -661,6 +711,11 @@ class SymbolResolver:
     def is_reference_symbol(self, symbol: str) -> bool:
         """True when a symbol, in any case, is an official symbol of the reference species (il15 -> IL15)."""
         return bool(symbol) and symbol.lower() in self.reference_symbols
+
+    def is_excluded(self, symbol: str) -> bool:
+        """A reference pseudogene (CMAHP) or readthrough (IQCJ-SCHIP1) symbol: never names a query gene."""
+        return bool(symbol) and (symbol.lower() in self.reference_pseudogenes
+                                 or is_readthrough_symbol(symbol, self.reference_symbols))
 
     @property
     def has_ncbi(self) -> bool:

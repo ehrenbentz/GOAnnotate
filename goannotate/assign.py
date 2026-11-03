@@ -47,7 +47,9 @@ from collections import Counter, defaultdict
 from pathlib import Path
 
 from goannotate import GOAnnotateError
+from goannotate.mappings import symbol_bases
 from goannotate.search import find_diamond
+
 
 logger = logging.getLogger(__name__)
 
@@ -141,6 +143,27 @@ def read_reference_symbols(proteome: Path) -> tuple:
     return symbols, descriptions
 
 
+def read_reference_existence(proteome: Path) -> dict:
+    """
+    Upper-case symbol -> best UniProt protein existence level (PE=1 evidence
+    at protein level ... 5 uncertain) among the reference proteins carrying
+    it. Used to prefer an established gene over a retrocopy or a recent
+    duplicate with weaker evidence that scores almost alike (NANOG PE=1 over
+    NANOGP8 PE=2, CD8B over CD8B2 PE=3).
+    """
+    existence = {}
+    with open(proteome) as fh:
+        for line in fh:
+            if not line.startswith(">"):
+                continue
+            g = re.search(r"GN=(\S+)", line)
+            pe = re.search(r"PE=(\d)", line)
+            if g and pe:
+                key = g.group(1).upper()
+                existence[key] = min(existence.get(key, 9), int(pe.group(1)))
+    return existence
+
+
 ####################
 # SEARCHES
 ####################
@@ -226,7 +249,8 @@ def assign_symbols(annotations: dict, universe, forward: Path, reverse: Path, re
                    support_fraction: float = 0.9, min_coverage: float = 0.5,
                    symbol_policy: str = "ortholog", nomenclature=None,
                    drop_unmatched: bool = False, min_query_coverage: float = 0.8,
-                   rbh_margin: float = 0.9) -> dict:
+                   rbh_margin: float = 0.9, existence: dict = None, established_margin: float = 0.95,
+                   name_threshold: float = 0.5) -> dict:
     """
     Apply reciprocal-best-hit confirmation and the sequence-support check
     to the annotations in place. Sets annot.symbol_status on every gene with
@@ -250,8 +274,63 @@ def assign_symbols(annotations: dict, universe, forward: Path, reverse: Path, re
     "any" keeps it.
     nomenclature: mappings.ReferenceNomenclature (official symbols and
     synonyms of the reference species) for the synonym evidence.
+    existence: upper-case symbol -> UniProt protein existence level of its
+    reference proteins (read_reference_existence). After the checks, a
+    gene's reference symbol whose protein existence is weaker than PE=1 is
+    replaced by an established (PE=1) reference symbol the gene covers and
+    hits at least established_margin as well (NANOGP8 -> NANOG, CD8B2 ->
+    CD8B), when the weak symbol is named after it (begins with its symbol);
+    the replaced symbol is kept in voted_symbol.
+    Reference pseudogenes and readthrough loci (nomenclature.is_excluded)
+    never name a gene.
+    Product: when the reference symbol confirms the gene's own symbol (rbh,
+    a copy form of the RBH symbol, rbh_added, vote_supported), the reference
+    protein's name replaces the voted name unless SwissProt hits of other
+    species carry the voted name and none carries the reference name (names
+    matching at name_threshold): a reference species' own gene name
+    ("minidiscs", "polychaetoid" for a Drosophila reference) then leaves the
+    hits' name; a curated name is otherwise kept (confirm_name). When
+    the reference check changes the symbol to another gene, its reference
+    name is used.
     """
     ref_descriptions = ref_descriptions or {}
+    from goannotate.annotate import name_similarity, normalize_gene_name
+    name_stats = Counter()
+
+    def confirm_name(annot, symbol):
+        """
+        Reference name for a confirmed symbol. It replaces the voted name unless curated
+        (SwissProt) entries of other species than the reference name the protein as the hits do
+        and none of them uses the reference name: the reference name is then the reference
+        species' own gene name (minidiscs, polychaetoid with a Drosophila reference, where other
+        species say Y+L amino acid transporter 2, Tight junction protein ZO-2), and the hits'
+        name stays. A curated name is kept wherever nothing shows that (Eukaryotic initiation
+        factor 4A-III over the automatic family name RNA helicase).
+        """
+        desc = ref_descriptions.get(symbol)
+        if not desc:
+            return
+        if not annot.consensus_name or desc == annot.consensus_name:
+            annot.consensus_name = desc
+            return
+        curated = getattr(annot, "hit_curated_names", {}) or {}
+        if curated:
+            ref_norm = normalize_gene_name(desc)
+            vote_norm = normalize_gene_name(annot.consensus_name)
+            own = symbol.upper()
+
+            def other_reference_gene(syms):
+                # an entry of another reference gene (a paralog: UCP2 for UCP3) does not speak for this one
+                return any(s in reference_symbols and s != own and own not in symbol_bases(s) for s in syms)
+
+            if (not any(name_similarity(ref_norm, h) >= name_threshold for h in curated)
+                    and any(name_similarity(vote_norm, h) >= name_threshold and not other_reference_gene(syms)
+                            for h, syms in curated.items())):
+                name_stats["reference_name_not_supported"] += 1
+                return
+        annot.consensus_name = desc
+        name_stats["reference_name_used"] += 1
+
     rev = best_hits(reverse)       # ref protein -> (query transcript, bits)
     tx2gene = universe.transcript_to_gene
 
@@ -303,7 +382,11 @@ def assign_symbols(annotations: dict, universe, forward: Path, reverse: Path, re
     # never given to a gene by the checks below; a functional gene whose human
     # counterpart is a pseudogene keeps its own symbol (CMAH).
     def is_pseudo(symbol):
-        return bool(nomenclature) and nomenclature.is_pseudogene(symbol)
+        if not nomenclature:
+            return False
+        if hasattr(nomenclature, "is_excluded"):
+            return nomenclature.is_excluded(symbol)
+        return nomenclature.is_pseudogene(symbol)
 
     rbh = {}
     for gene, hits in gene_forward_all.items():
@@ -313,7 +396,13 @@ def assign_symbols(annotations: dict, universe, forward: Path, reverse: Path, re
             rbh[gene] = max(reciprocal)[1]
 
     stats = Counter()
-    # Step 1 and 2: confirmation and RBH override
+    reference_symbols = {s.upper() for s in ref_symbols.values()}
+    # Step 1 and 2: confirmation and RBH override. A voted symbol outside the
+    # reference nomenclature whose suffix-free form is the RBH symbol (a close
+    # relative's or another species' copy form: adgrl1a, kdm2aa) names the
+    # same gene: the RBH confirms it ('rbh'), the reference symbol is used
+    # here and the voted form is kept in voted_symbol (the orthology module
+    # restores the close relatives' form afterwards).
     for gene, annot in annotations.items():
         voted = annot.consensus_symbol.upper() if annot.consensus_symbol else ""
         rbh_symbol = rbh.get(gene)
@@ -326,8 +415,7 @@ def assign_symbols(annotations: dict, universe, forward: Path, reverse: Path, re
                 # a reciprocal best hit names a gene the vote left unnamed
                 annot.consensus_symbol = symbol_case_fn(rbh_symbol)
                 annot.symbol_status = "rbh_added"
-                if ref_descriptions.get(rbh_symbol):
-                    annot.consensus_name = ref_descriptions[rbh_symbol]
+                confirm_name(annot, rbh_symbol)
             continue
         if rbh_symbol is None:
             if annot.symbol_status != "propagated":
@@ -336,9 +424,15 @@ def assign_symbols(annotations: dict, universe, forward: Path, reverse: Path, re
             annot.symbol_status = "rbh"
             # The symbol is confirmed by orthology; the reference protein's
             # curated name replaces the voted name, which often comes from an
-            # automatically named TrEMBL entry ("Serine/threonine-protein").
-            if ref_descriptions.get(rbh_symbol):
-                annot.consensus_name = ref_descriptions[rbh_symbol]
+            # automatically named TrEMBL entry ("Serine/threonine-protein"),
+            # unless it is the reference species' own gene name (confirm_name).
+            confirm_name(annot, rbh_symbol)
+        elif voted not in reference_symbols and rbh_symbol in symbol_bases(voted):
+            annot.voted_symbol = annot.consensus_symbol
+            annot.consensus_symbol = symbol_case_fn(rbh_symbol)
+            annot.symbol_status = "rbh"
+            stats["rbh_same_gene_form"] += 1
+            confirm_name(annot, rbh_symbol)
         else:
             cluster_symbols = {s.upper() for s in annot.winning_cluster_symbols if s}
             if rbh_symbol in cluster_symbols:
@@ -363,7 +457,6 @@ def assign_symbols(annotations: dict, universe, forward: Path, reverse: Path, re
     # symbol of its closest reference protein instead. Genes without any
     # hit to the reference proteome (lineage-specific families) keep the
     # vote, since nothing in the reference contradicts it.
-    reference_symbols = {s.upper() for s in ref_symbols.values()}
 
     def covers(gene, symbol):
         """
@@ -500,8 +593,7 @@ def assign_symbols(annotations: dict, universe, forward: Path, reverse: Path, re
         if is_supported(gene, voted, best_bits):
             supported += 1
             annot.symbol_status = annot.symbol_status if annot.symbol_status != "vote" else "vote_supported"
-            if ref_descriptions.get(voted):
-                annot.consensus_name = ref_descriptions[voted]
+            confirm_name(annot, voted)
             continue
         annot.voted_symbol = annot.consensus_symbol
         candidates = [(bits, sym) for sym, bits in fwd_hits.items()
@@ -521,6 +613,41 @@ def assign_symbols(annotations: dict, universe, forward: Path, reverse: Path, re
             annot.symbol_status = "unsupported_removed"
             removed += 1
 
+    # Established genes over weakly evidenced near-identical paralogs (retrocopies, recent duplicates)
+    existence = existence or {}
+    established = 0
+    if existence:
+        for gene, annot in annotations.items():
+            sym = annot.consensus_symbol.upper() if annot.consensus_symbol else ""
+            if not sym or existence.get(sym, 1) <= 1:
+                continue
+            hits = gene_forward_all.get(gene) or {}
+            bits = hits.get(sym, 0.0)
+            if bits <= 0:
+                continue
+            # only the gene the weak symbol is named after (NANOG for NANOGP8, CD8B for CD8B2,
+            # PRAME for PRAMEF14), not another member of a family (OR4F6 and OR4F3)
+            better = [(b, s) for s, b in hits.items() if s != sym and existence.get(s, 9) == 1
+                      and sym.startswith(s) and b >= established_margin * bits and covers(gene, s)
+                      and not is_pseudo(s)]
+            if not better:
+                continue
+            target = max(better)[1]
+            if not annot.voted_symbol:
+                annot.voted_symbol = annot.consensus_symbol
+            if annot.consensus_symbol not in annot.symbol_aliases:
+                annot.symbol_aliases = list(annot.symbol_aliases) + [annot.consensus_symbol]
+            annot.consensus_symbol = symbol_case_fn(target)
+            if ref_descriptions.get(target):
+                annot.consensus_name = ref_descriptions[target]
+            established += 1
+    stats["established_preferred"] = established
+    stats.update(name_stats)
+    if name_stats:
+        logger.info(f"  Reference names for confirmed symbols: {name_stats['reference_name_used']:,} used, "
+                    f"{name_stats['reference_name_not_supported']:,} not supported by the gene's hits "
+                    f"(the hits' name kept)")
+
     stats["vote_supported"] = supported
     stats["vote_no_reference_hit"] = no_reference
     stats["vote_foreign_symbol"] = foreign_kept
@@ -538,7 +665,8 @@ def assign_symbols(annotations: dict, universe, forward: Path, reverse: Path, re
     copies = Counter(symbols)
     shared = sum(1 for n in copies.values() if n > 1)
     logger.info(f"Symbol assignment: {len(rbh):,} reciprocal best hits; "
-                f"confirmed={stats['rbh']:,}, rbh override={stats['rbh_override']:,}, "
+                f"confirmed={stats['rbh']:,} ({stats['rbh_same_gene_form']:,} of them a copy form of the RBH "
+                f"symbol), rbh override={stats['rbh_override']:,}, "
                 f"rbh added={stats['rbh_added']:,}")
     logger.info(f"  Voted reference symbols checked against the reference proteome: {supported:,} supported, "
                 f"{replaced:,} replaced by the closest supported reference protein, "
@@ -554,6 +682,9 @@ def assign_symbols(annotations: dict, universe, forward: Path, reverse: Path, re
     else:
         logger.info(f"  Symbols outside the reference nomenclature: {foreign_replaced:,} replaced by the closest "
                     f"covered reference protein, {foreign_removed:,} removed (--symbol-policy reference)")
+    if established:
+        logger.info(f"  {established:,} symbols with weak protein evidence (PE>1) replaced by an established "
+                    f"reference gene scoring at least {established_margin:.2f} as well (NANOGP8 -> NANOG)")
     logger.info(f"  {len(symbols):,} symbols on {len(copies):,} distinct values; "
                 f"{shared:,} symbols are carried by more than one gene")
     return dict(stats)
@@ -632,6 +763,45 @@ def secondary_symbols(annotations: dict, universe, forward: Path, reverse: Path,
 # of the hits behind the vote name the same gene
 _VOTE_KEPT = {"vote", "vote_supported", "rbh", "propagated", "foreign_kept", "foreign_ortholog",
               "vote_rbh_conflict"}
+
+
+def secondary_names(annotations: dict, secondary_descriptions: dict, ref_descriptions: dict,
+                    name_threshold: float = 0.5) -> dict:
+    """
+    Products from the secondary nomenclature, in place: a gene whose product is
+    its primary reference protein's name, where none of the gene's hits uses
+    that name (a reference species' own gene name: larval translucida, LD43551p
+    without a curated name of another species to check it against), takes the
+    name of its secondary reference protein (annot.secondary_symbol, an
+    unambiguous reciprocal best hit) when at least one of its hits uses that
+    name. Returns counts.
+    """
+    from goannotate.annotate import name_similarity, normalize_gene_name
+    n = 0
+    examples = []
+    for annot in annotations.values():
+        if not (annot.secondary_symbol and annot.consensus_symbol and annot.hit_names):
+            continue
+        primary = ref_descriptions.get(annot.consensus_symbol.upper())
+        if not primary or annot.consensus_name != primary:
+            continue
+        secondary = secondary_descriptions.get(annot.secondary_symbol.upper())
+        if not secondary or secondary == primary:
+            continue
+        p_norm, s_norm = normalize_gene_name(primary), normalize_gene_name(secondary)
+        if any(name_similarity(p_norm, h) >= name_threshold for h in annot.hit_names):
+            continue
+        if not any(name_similarity(s_norm, h) >= name_threshold for h in annot.hit_names):
+            continue
+        annot.consensus_name = secondary
+        annot.product_note = "secondary_reference"
+        n += 1
+        if len(examples) < 5:
+            examples.append(f"{primary} -> {secondary}")
+    if n:
+        logger.info(f"  Products from the secondary reference: {n:,} genes whose primary reference name no hit "
+                    f"uses (e.g. {'; '.join(examples[:3])})")
+    return {"secondary_names": n}
 
 
 def _alias_key(symbol: str) -> str:
@@ -716,8 +886,8 @@ def strip_paralog_designators(annotations: dict, ref_descriptions: dict, normali
     examples = Counter()
     for annot in annotations.values():
         name = annot.consensus_name
-        if not name or annot.symbol_status in from_reference:
-            continue
+        if not name or (annot.symbol_status in from_reference and normalize_fn(name) in ref_names):
+            continue        # a product taken from the reference proteome
         pool = {normalize_fn(n) for n in annot.winning_cluster_names if n}
         for form in _DESIGNATOR_FORMS:
             m = form.match(name)

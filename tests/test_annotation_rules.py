@@ -179,6 +179,49 @@ with tempfile.TemporaryDirectory() as d:
     plant_lineage = [3702, 33090, 2759, 131567, 1]
     forb = taxon.forbidden_go_terms(cons, unions, plant_lineage, hier)
     check(set(forb) == {"GO:0000004"}, f"plant: lactation excluded only: {sorted(forb)}")
+    # GO terms from the reference gene of the final symbol
+    print("\n# Reference-gene GO terms")
+    import sqlite3
+    db = d / "ref.sqlite"
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE go_mapping (accession TEXT, go_terms TEXT)")
+    conn.executemany("INSERT INTO go_mapping VALUES (?, ?)",
+                     [("P_AVP1", "GO:0000004:IDA;GO:0000001:IEA;GO:0000005:IDA"),      # lactation, its root-ish
+                      ("P_AVP2", "GO:0000004:IEA;GO:0000003:IMP"),                      # ancestor, forbidden term
+                      ("P_OXT", "GO:0000003:IDA")])
+    conn.commit()
+    conn.close()
+    ref_symbols = {"P_AVP1": "AVP", "P_AVP2": "AVP", "P_OXT": "OXT", "P_X": "GRM1"}
+    annots = {g: QueryAnnotation(query_id=g) for g in ("a", "b", "c", "e", "f")}
+    annots["a"].consensus_symbol, annots["a"].symbol_status = "AVP", "rbh"            # gets lactation, root kept out
+    annots["b"].consensus_symbol, annots["b"].symbol_status = "OXT", "ortholog"       # forbidden term only: nothing
+    annots["c"].consensus_symbol, annots["c"].symbol_status = "AVP", "vote"           # vote only: not eligible
+    annots["e"].consensus_symbol, annots["e"].symbol_status = "GRM1", "vote_supported"  # no GO on its proteins
+    annots["f"].consensus_symbol, annots["f"].symbol_status = "AVP", "ortholog_fill"
+    annots["f"].go_terms = {"GO:0000004"}
+    annots["f"].specific_go_terms = {"GO:0000004"}
+    annots["f"].go_evidence = {"GO:0000004": "IEA"}
+    annots["f"].go_support = {"GO:0000004": 2}
+    from goannotate import refgo
+    annots["g"] = QueryAnnotation(query_id="g", consensus_symbol="avpb", symbol_status="ortholog", voted_symbol="AVP")
+    forbidden = {"GO:0000003": "x", "GO:0000005": "y"}
+    st = refgo.add_reference_go(annots, ref_symbols, str(db), hier, set(forbidden), [], "all", "add")
+    check(annots["a"].specific_go_terms == {"GO:0000004"} and annots["a"].go_evidence["GO:0000004"] == "IDA,IEA"
+          and annots["a"].go_reference["GO:0000004"] == ["P_AVP1", "P_AVP2"],
+          f"terms of the reference gene's proteins, ancestors and forbidden terms left out: {annots['a'].specific_go_terms}")
+    check(not annots["b"].go_terms and not annots["c"].go_terms and not annots["e"].go_terms,
+          "forbidden-only, vote-only and GO-less symbols receive nothing")
+    check(annots["f"].go_evidence["GO:0000004"] == "IEA" and annots["f"].go_reference["GO:0000004"]
+          and annots["f"].specific_go_terms == {"GO:0000004"}, "a term the hits gave keeps its evidence, gains the source")
+    check(st["genes_eligible"] == 5 and st["genes_added"] == 2 and annots["g"].specific_go_terms == {"GO:0000004"},
+          f"counts {st}; a relatives' own form (avpb) reaches the reference gene through the replaced symbol")
+    annots2 = {"a": QueryAnnotation(query_id="a", consensus_symbol="AVP", symbol_status="rbh",
+                                    go_terms={"GO:0000002"}, specific_go_terms={"GO:0000002"})}
+    st = refgo.add_reference_go(annots2, ref_symbols, str(db), hier, set(), [], "all", "fill")
+    check(annots2["a"].specific_go_terms == {"GO:0000002"} and st["genes_added"] == 0, "fill leaves genes with GO alone")
+    st = refgo.add_reference_go(annots2, ref_symbols, str(db), hier, set(), [], "all", "off")
+    check(st["mode"] == "off" and st["genes_eligible"] == 0, "off")
+
     (d / "nodes.dmp").write_text("1\t|\t1\t|\tno rank\t|\n2759\t|\t1\t|\tdomain\t|\n40674\t|\t2759\t|\tclass\t|\n"
                                  "79684\t|\t40674\t|\tspecies\t|\n")
     (d / "merged.dmp").write_text("99999\t|\t79684\t|\n")
@@ -207,6 +250,233 @@ check(bnf.clean_name("Ras-related protein Rab-11b, tandem duplicate 1") == "Ras-
       "tandem duplicate stripped from hit names (qualifier)")
 check(bnf.process_name("Not available") is None and bnf.process_name("NA") is None, "'not available' placeholder")
 
+# ---------------------------------------------------------- ortholog prior
+print("\n# Ortholog symbols in the vote")
+
+
+def hwn(symbol, bits, name=None, tx="t1"):
+    """(hit, name, symbol, origin, source transcripts) as annotate_single_gene receives them."""
+    h = hit(bits=bits, sid=f"sp|{symbol}{bits:.0f}|X_HUMAN")
+    return (h, name or f"{symbol} protein", symbol, "uniprot", (tx,))
+
+
+# Three hits say KCNQ4 (mean 300), two say KCNQ5 (mean 250): KCNQ4 wins the plain vote
+pool = [hwn("KCNQ4", 320), hwn("KCNQ4", 300), hwn("KCNQ4", 280), hwn("KCNQ5", 260), hwn("KCNQ5", 240)]
+idx = list(range(len(pool)))
+name, sym, origin, _ = annotate.select_name_and_symbol(idx, pool, bnf)
+check(sym == "KCNQ4" and origin == "uniprot", f"plain vote: {sym}")
+name, sym, origin, _ = annotate.select_name_and_symbol(idx, pool, bnf, prior=("Kcnq5", True))
+check(sym == "KCNQ5" and origin == "relative" and name == "KCNQ5 protein", f"close ortholog decides: {sym} ({origin})")
+name, sym, origin, _ = annotate.select_name_and_symbol(idx, pool, bnf, prior=("Kcnq5", False))
+check(sym == "KCNQ5" and origin == "uniprot", f"distant ortholog wins within the margin (250/300): {sym}")
+weak = pool + [hwn("KCNQ3", 100)]
+name, sym, origin, _ = annotate.select_name_and_symbol(list(range(len(weak))), weak, bnf, prior=("KCNQ3", False))
+check(sym == "KCNQ4", f"distant ortholog below the margin does not win: {sym}")
+name, sym, origin, _ = annotate.select_name_and_symbol(idx, pool, bnf, prior=("OXT", True))
+check(sym == "KCNQ4", f"a prior symbol absent from the hits changes nothing here: {sym}")
+
+# The close prior also picks the cluster: two clusters, the prior's symbol only in the weaker one
+annotate._init_worker({}, None, bnf, mappings.SymbolResolver())
+far = [hwn("ACTB", 500, "Actin, cytoplasmic 1"), hwn("ACTB", 480, "Actin, cytoplasmic 1"),
+       hwn("OXT", 200, "Oxytocin-neurophysin 1")]
+gid, res = annotate.annotate_single_gene("g", far, 0.5, [], "upper", "mean", prior=("Oxt", True))
+check(res["consensus_symbol"] == "OXT" and res["symbol_source"] == "relative"
+      and res["consensus_name"] == "Oxytocin-neurophysin 1", f"close prior selects the cluster: {res['consensus_symbol']}")
+gid, res = annotate.annotate_single_gene("g", far, 0.5, [], "upper", "mean", prior=("Oxt", False))
+check(res["consensus_symbol"] == "ACTB", f"distant prior does not change the cluster: {res['consensus_symbol']}")
+gid, res = annotate.annotate_single_gene("g", far, 0.5, [], "upper", "mean")
+check(res["consensus_symbol"] == "ACTB", "no prior")
+
+# ------------------------------------------------- excluded and weak reference symbols
+print("\n# Pseudogenes, readthroughs and weakly evidenced paralogs")
+from goannotate import assign as assign_ref  # noqa: E402
+nom = mappings.ReferenceNomenclature()
+for sym in ("NANOG", "NANOGP8", "IQCJ", "SCHIP1", "IQCJ-SCHIP1", "HLA-A", "CDHR18P"):
+    nom.official[sym.lower()] = sym
+nom.pseudogenes.add("cdhr18p")
+check(nom.is_readthrough("IQCJ-SCHIP1") and not nom.is_readthrough("HLA-A") and nom.is_excluded("CDHR18P")
+      and not nom.is_excluded("NANOGP8"), "readthrough and pseudogene recognition")
+res = mappings.SymbolResolver()
+res.reference_symbols = frozenset(nom.official)
+res.reference_pseudogenes = frozenset(nom.pseudogenes)
+pool = [hwn("IQCJ-SCHIP1", 330), hwn("IQCJ-SCHIP1", 320), hwn("SCHIP1", 300), hwn("SCHIP1", 290)]
+name, sym, origin, _ = annotate.select_name_and_symbol(list(range(4)), pool, bnf, resolver=res)
+check(sym == "SCHIP1", f"a readthrough group does not win the vote: {sym}")
+nom.official["uox"] = "UOX"
+nom.pseudogenes.add("uox")
+res.reference_symbols = frozenset(nom.official)
+res.reference_pseudogenes = frozenset(nom.pseudogenes)
+mouse = hit(bits=400, sid="sp|P_UOX|URIC_MOUSE", title="sp|P_UOX|URIC_MOUSE Uricase OS=Mus musculus OX=10090 GN=Uox PE=1 SV=1")
+human = hit(bits=400, sid="sp|P_U2|X_HUMAN", title="sp|P_U2|X_HUMAN Uricase OS=Homo sapiens OX=9606 GN=UOX PE=5 SV=1")
+pool = [(mouse, "Uricase", "Uox", "uniprot", ("t1",)), (mouse, "Uricase", "Uox", "uniprot", ("t1",)),
+        hwn("ABC1", 200), hwn("ABC1", 190)]
+name, sym, origin, _ = annotate.select_name_and_symbol(list(range(4)), pool, bnf, resolver=res)
+check(sym == "Uox", f"a pseudogene symbol carried by other species' hits names their functional gene: {sym}")
+pool = [(human, "Uricase", "UOX", "uniprot", ("t1",)), (human, "Uricase", "UOX", "uniprot", ("t1",)),
+        hwn("ABC1", 200), hwn("ABC1", 190)]
+name, sym, origin, _ = annotate.select_name_and_symbol(list(range(4)), pool, bnf, resolver=res)
+check(sym == "ABC1", f"a pseudogene symbol carried only by reference-species hits does not win: {sym}")
+with tempfile.TemporaryDirectory() as d:
+    d = Path(d)
+    (d / "fwd.tsv").write_text("t1\tsp|P_NP8|X\t95\t300\t0\t400\t300\t300\n"
+                               "t1\tsp|P_NANOG|X\t94\t300\t0\t390\t300\t305\n"
+                               "t2\tsp|P_IQ|X\t90\t400\t0\t500\t400\t420\n"
+                               "t2\tsp|P_SCH|X\t90\t390\t0\t480\t400\t400\n")
+    (d / "rev.tsv").write_text("sp|P_NP8|X\tt1\t95\t300\t0\t400\t300\t300\n"
+                               "sp|P_NANOG|X\tt1\t94\t300\t0\t390\t305\t300\n"
+                               "sp|P_IQ|X\tt2\t90\t400\t0\t500\t420\t400\n"
+                               "sp|P_SCH|X\tt2\t90\t390\t0\t480\t400\t400\n")
+    ref = {"P_NP8": "NANOGP8", "P_NANOG": "NANOG", "P_IQ": "IQCJ-SCHIP1", "P_SCH": "SCHIP1"}
+    uni = type("U", (), {"transcript_to_gene": {"t1": "g1", "t2": "g2"}})()
+    ann = {"g1": QueryAnnotation(query_id="g1", consensus_symbol="NANOGP8", hits=[hit()]),
+           "g2": QueryAnnotation(query_id="g2", hits=[hit()])}
+    ann["g1"].symbol_status = "vote"
+    st = assign_ref.assign_symbols(ann, uni, d / "fwd.tsv", d / "rev.tsv", ref, str.upper,
+                                   ref_descriptions={"NANOG": "Homeobox protein NANOG"}, nomenclature=nom,
+                                   existence={"NANOGP8": 2, "NANOG": 1, "IQCJ-SCHIP1": 1, "SCHIP1": 1})
+    check(ann["g1"].consensus_symbol == "NANOG" and ann["g1"].voted_symbol == "NANOGP8"
+          and ann["g1"].consensus_name == "Homeobox protein NANOG" and st["established_preferred"] == 1,
+          f"established gene preferred over a weakly evidenced near-identical paralog: {ann['g1'].consensus_symbol}")
+    check(ann["g2"].consensus_symbol == "SCHIP1" and ann["g2"].symbol_status == "rbh_added",
+          f"a readthrough is never the reciprocal best hit: {ann['g2'].consensus_symbol}")
+    ann["g1"].consensus_symbol, ann["g1"].voted_symbol, ann["g1"].symbol_status = "NANOGP8", "", "vote"
+    assign_ref.assign_symbols(ann, uni, d / "fwd.tsv", d / "rev.tsv", ref, str.upper, nomenclature=nom,
+                              existence={"NANOGP8": 2, "NANOG": 1}, established_margin=0.99)
+    check(ann["g1"].consensus_symbol == "NANOGP8", "not replaced when the established gene scores below the margin")
+
+# ------------------------------------------------- copy forms and propagation
+print("\n# Copy forms of the RBH symbol and symbol propagation")
+with tempfile.TemporaryDirectory() as d:
+    d = Path(d)
+    (d / "fwd.tsv").write_text("t1\tsp|P_ADG|X\t90\t400\t0\t500\t400\t400\n"
+                               "t2\tsp|P_AG1|X\t90\t400\t0\t500\t400\t400\n")
+    (d / "rev.tsv").write_text("sp|P_ADG|X\tt1\t90\t400\t0\t500\t400\t400\n"
+                               "sp|P_AG1|X\tt2\t90\t400\t0\t500\t400\t400\n")
+    ref = {"P_ADG": "ADGRL1", "P_AG1": "AGPAT1", "P_AG2": "AGPAT2"}
+    uni = type("U", (), {"transcript_to_gene": {"t1": "g1", "t2": "g2"}})()
+    ann = {"g1": QueryAnnotation(query_id="g1", consensus_symbol="adgrl1a", hits=[hit()]),
+           "g2": QueryAnnotation(query_id="g2", consensus_symbol="AGPAT2", hits=[hit()])}
+    ann["g2"].winning_cluster_symbols = ["AGPAT2", "AGPAT1"]
+    st = assign_ref.assign_symbols(ann, uni, d / "fwd.tsv", d / "rev.tsv", ref, str.upper,
+                                   ref_descriptions={"ADGRL1": "Adhesion G protein-coupled receptor L1"})
+    check(ann["g1"].symbol_status == "rbh" and ann["g1"].consensus_symbol == "ADGRL1"
+          and ann["g1"].voted_symbol == "adgrl1a" and st["rbh_same_gene_form"] == 1 and st["rbh_override"] == 1,
+          f"a copy form of the RBH symbol is a confirmation, another gene an override: "
+          f"{ann['g1'].symbol_status} {st['rbh_same_gene_form']} {st['rbh_override']}")
+sib = lambda sym: (hit(), "Glutamine synthetase", sym, "uniprot", ("t1",))
+ann = {"a": QueryAnnotation(query_id="a", consensus_name="Glutamine synthetase", consensus_symbol="glula"),
+       "b": QueryAnnotation(query_id="b", consensus_name="Glutamine synthetase", consensus_symbol="glula"),
+       "c": QueryAnnotation(query_id="c", consensus_name="Glutamine synthetase"),
+       "d": QueryAnnotation(query_id="d", consensus_name="Glutamine synthetase")}
+n, ids = annotate.propagate_symbols(ann, {"c": [sib("GLUL"), sib("gs")], "d": [sib("CA2")]}, "lower")
+check(n == 1 and ann["c"].consensus_symbol == "glul" and not ann["d"].consensus_symbol,
+      f"propagation gives the hits' reference form of a relative's copy form, never a symbol the hits lack: "
+      f"{ann['c'].consensus_symbol!r} {ann['d'].consensus_symbol!r}")
+ann["c"].consensus_symbol = ""
+ann["a"].consensus_symbol = "glul"
+n, ids = annotate.propagate_symbols(ann, {"c": [sib("GLUL")]}, "lower")
+check(ann["c"].consensus_symbol == "glul", "a sibling symbol the hits carry is taken as it is")
+
+# ------------------------------------------------------ confidence with orthology
+print("\n# Confidence with orthology evidence")
+a = QueryAnnotation(query_id="c", hits=[hit()], consensus_symbol="X", name_concordance=0.6, n_cluster_hits=5,
+                    symbol_concordance=0.5)
+base = annotate.compute_confidence(a)[1]
+check(abs(annotate.compute_confidence(a, "close_confirmed")[1] - min(1.0, base + 0.15)) < 1e-9
+      and abs(annotate.compute_confidence(a, "conflict")[1] - (base - 0.15)) < 1e-9,
+      f"confirmation adds, a kept conflict subtracts (base {base})")
+check(annotate.compute_confidence(a, "close_taken")[0] == "medium", "taken symbols are medium")
+check(annotate.compute_confidence(QueryAnnotation(query_id="n"), "close_filled") == ("medium", 0.55)
+      and annotate.compute_confidence(QueryAnnotation(query_id="n")) == ("none", 0.0), "a fill gives a gene without hits a score")
+
+# ------------------------------------------------------ reference names of confirmed symbols
+print("\n# Reference names and clone names")
+with tempfile.TemporaryDirectory() as d:
+    d = Path(d)
+    (d / "fwd.tsv").write_text("t1\tsp|P_MND|X\t90\t400\t0\t500\t400\t400\n"
+                               "t2\tsp|P_PAK|X\t90\t400\t0\t500\t400\t400\n")
+    (d / "rev.tsv").write_text("sp|P_MND|X\tt1\t90\t400\t0\t500\t400\t400\n"
+                               "sp|P_PAK|X\tt2\t90\t400\t0\t500\t400\t400\n")
+    ref = {"P_MND": "MND", "P_PAK": "PAK1"}
+    uni = type("U", (), {"transcript_to_gene": {"t1": "g1", "t2": "g2"}})()
+    ann = {"g1": QueryAnnotation(query_id="g1", consensus_symbol="MND", hits=[hit()],
+                                 consensus_name="Y+L amino acid transporter 2",
+                                 hit_names={"y+l amino acid transporter 2": 9, "minidiscs": 1}),
+           "g2": QueryAnnotation(query_id="g2", consensus_symbol="PAK1", hits=[hit()],
+                                 consensus_name="Serine/threonine-protein kinase",
+                                 hit_names={"serine/threonine-protein kinase pak 1": 6, "serine/threonine-protein kinase": 4})}
+    st = assign_ref.assign_symbols(ann, uni, d / "fwd.tsv", d / "rev.tsv", ref, str.upper,
+                                   ref_descriptions={"MND": "Minidiscs", "PAK1": "Serine/threonine-protein kinase PAK 1"})
+    check(ann["g1"].consensus_name == "Minidiscs" and ann["g2"].consensus_name == "Serine/threonine-protein kinase PAK 1",
+          f"without curated names of other species the reference name is used: {ann['g1'].consensus_name}")
+    ann = {"g1": QueryAnnotation(query_id="g1", consensus_symbol="MND", hits=[hit()],
+                                 consensus_name="Y+L amino acid transporter 2",
+                                 hit_names={"y+l amino acid transporter 2": 9, "minidiscs": 1},
+                                 hit_curated_names={"y+l amino acid transporter 2": ["SLC7A6"]}),
+           "g2": QueryAnnotation(query_id="g2", consensus_symbol="PAK1", hits=[hit()], consensus_name="RNA helicase",
+                                 hit_names={"rna helicase": 30, "eukaryotic initiation factor 4a-iii": 2},
+                                 hit_curated_names={"eukaryotic initiation factor 4a-iii": ["EIF4A3"]}),
+           "g3": QueryAnnotation(query_id="g3", consensus_symbol="KLK13", hits=[hit()], consensus_name="Chymotrypsin",
+                                 hit_names={"chymotrypsin": 30}, hit_curated_names={"kallikrein 1-related peptidase b3": ["KLK1B3"]})}
+    (d / "fwd.tsv").write_text((d / "fwd.tsv").read_text() + "t3\tsp|P_KLK|X\t90\t400\t0\t500\t400\t400\n")
+    (d / "rev.tsv").write_text((d / "rev.tsv").read_text() + "sp|P_KLK|X\tt3\t90\t400\t0\t500\t400\t400\n")
+    ref["P_KLK"] = "KLK13"
+    uni.transcript_to_gene["t3"] = "g3"
+    assign_ref.assign_symbols(ann, uni, d / "fwd.tsv", d / "rev.tsv", ref, str.upper,
+                              ref_descriptions={"MND": "Minidiscs", "PAK1": "Eukaryotic initiation factor 4A-III",
+                                                "KLK13": "Kallikrein-13"})
+    check(ann["g1"].consensus_name == "Y+L amino acid transporter 2"
+          and ann["g2"].consensus_name == "Eukaryotic initiation factor 4A-III"
+          and ann["g3"].consensus_name == "Kallikrein-13",
+          f"a curated name of other species decides: {ann['g1'].consensus_name} / {ann['g2'].consensus_name}")
+with tempfile.TemporaryDirectory() as d:
+    d = Path(d)
+    (d / "fwd.tsv").write_text("t1\tsp|P_U3|X\t90\t400\t0\t500\t400\t400\nt1\tsp|P_U2|X\t80\t400\t0\t450\t400\t400\n")
+    (d / "rev.tsv").write_text("sp|P_U3|X\tt1\t90\t400\t0\t500\t400\t400\n")
+    uni = type("U", (), {"transcript_to_gene": {"t1": "g1"}})()
+    ann = {"g1": QueryAnnotation(query_id="g1", consensus_symbol="UCP3", hits=[hit()], consensus_name="Dicarboxylate carrier UCP2",
+                                 hit_names={"dicarboxylate carrier ucp2": 9},
+                                 hit_curated_names={"dicarboxylate carrier ucp2": ["UCP2"]})}
+    assign_ref.assign_symbols(ann, uni, d / "fwd.tsv", d / "rev.tsv", {"P_U3": "UCP3", "P_U2": "UCP2"}, str.upper,
+                              ref_descriptions={"UCP3": "Mitochondrial uncoupling protein 3"})
+    check(ann["g1"].consensus_name == "Mitochondrial uncoupling protein 3",
+          f"curated entries of a paralog do not keep the hits' name: {ann['g1'].consensus_name}")
+g = QueryAnnotation(query_id="s", consensus_symbol="TRET1", consensus_name="Nebulosa", secondary_symbol="SLC2A8",
+                    hit_names={"facilitated trehalose transporter tret1": 5, "solute carrier family 2, facilitated glucose transporter member 8": 2})
+g2 = QueryAnnotation(query_id="s2", consensus_symbol="MND", consensus_name="Minidiscs", secondary_symbol="SLC7A6",
+                     hit_names={"minidiscs": 1, "y+l amino acid transporter 2": 5})
+r = assign_ref.secondary_names({"s": g, "s2": g2},
+                               {"SLC2A8": "Solute carrier family 2, facilitated glucose transporter member 8",
+                                "SLC7A6": "Y+L amino acid transporter 2"},
+                               {"TRET1": "Nebulosa", "MND": "Minidiscs"})
+check(g.consensus_name.startswith("Solute carrier family 2") and g.product_note == "secondary_reference"
+      and g2.consensus_name == "Minidiscs" and r["secondary_names"] == 1,
+      f"secondary reference name when no hit uses the primary one: {g.consensus_name} / {g2.consensus_name}")
+check(not bnf.clean_name("Protein CG4768-like protein") or bnf.is_bad_name(bnf.clean_name("Protein CG4768-like protein")),
+      "an identifier-only -like name leaves a placeholder")
+check(bnf.is_bad_name("protein -like protein") and bnf.is_bad_name("Protein, protein")
+      and not bnf.is_bad_name("Ras-like protein"), "'protein like protein' is a placeholder")
+check(bnf.clean_name("LD33793p") in (None, "") and bnf.clean_name("FI18136p1") in (None, "")
+      and bnf.clean_name("GEO02646p1") in (None, "") and bnf.clean_name("bcDNA.GH11023") in (None, "") and bnf.clean_name("Ubiquitin-like protein RH60221p") == "Ubiquitin-like protein",
+      "BDGP cDNA clone names are identifiers")
+
+# ------------------------------------------------------ final concordance
+print("\n# Concordance with the final annotation")
+fh = lambda: hit()
+a = QueryAnnotation(query_id="k", hits=[fh()], consensus_symbol="kdm2aa", voted_symbol="KDM2A",
+                    consensus_name="Lysine-specific demethylase 2A", n_cluster_hits=10,
+                    hit_symbols={"KDM2A": 6, "KDM2AA": 2, "KDM2B": 2}, hit_names={"lysine specific demethylase 2a": 8,
+                                                                                "f-box protein": 2})
+t = QueryAnnotation(query_id="t", hits=[fh()], consensus_symbol="agpat2", voted_symbol="AGPAT1",
+                    symbol_aliases=["AGPAT1"], consensus_name="1-acyl-sn-glycerol-3-phosphate acyltransferase beta",
+                    hit_symbols={"AGPAT1": 9, "AGPAT2": 1}, ortholog_evidence="close_taken")
+n = QueryAnnotation(query_id="n", consensus_symbol="abc1", ortholog_evidence="close_filled")
+st = annotate.final_concordance({"k": a, "t": t, "n": n}, consensus_threshold=0.5)
+check(abs(a.symbol_concordance - 0.8) < 1e-9 and abs(a.name_concordance - 0.8) < 1e-9,
+      f"a refined copy form counts the hits of its gene: {a.symbol_concordance} {a.name_concordance}")
+check(abs(t.symbol_concordance - 0.1) < 1e-9, f"a taken symbol counts only hits of its own gene: {t.symbol_concordance}")
+check(st["symbol"]["n"] == 2 and n.confidence == "medium", f"genes without hits are left out: {st['symbol']}")
+
 # ------------------------------------------------------ paralog designators
 print("\n# Paralog designators")
 norm = bnf.normalize_for_comparison
@@ -231,9 +501,9 @@ check(annots["g0"].consensus_name == "Forkhead box protein O3" and annots["g0"].
 check(annots["g1"].consensus_name == "Protein kinase C beta type", "trailing ' a' stripped (reference name)")
 check(annots["g2"].consensus_name == "Cytochrome b", "Cytochrome b untouched")
 check(annots["g3"].consensus_name == "Annexin A", "Annexin A untouched (uppercase)")
-check(annots["g4"].consensus_name == "Forkhead box protein O3-B", "reference-derived products untouched")
+check(annots["g4"].consensus_name == "Forkhead box protein O3", "a hits' name kept on a confirmed gene is stripped too")
 check(annots["g5"].consensus_name == "Olfactory receptor 2", "2b -> 2 when the base name is among the hits")
-check(r["designators_stripped"] == 3, f"3 products changed ({r})")
+check(r["designators_stripped"] == 4, f"4 products changed ({r})")
 
 print()
 if failures:

@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
 GOAnnotate: functional annotation of gene models using Diamond searches against UniProt.
-Written by E. J. Bentz
 
 This script is a thin wrapper around the goannotate package so that
 ./GOAnnotate.py keeps working from a checkout. Run ./GOAnnotate.py --help

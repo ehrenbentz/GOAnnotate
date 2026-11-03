@@ -323,8 +323,8 @@ Examples:
                    help="Run every analysis locally; by default InterProScan looks up precalculated matches at\n"
                         "EBI for proteins already in UniParc (only sequence checksums are sent)")
     g.add_argument("--interproscan-workers", type=int, default=0, metavar="N",
-                   help="InterProScan tasks run in parallel (default: half of --threads, because some of its\n"
-                        "analyses are multi-threaded)")
+                   help="CPUs for InterProScan's parallel tasks (default: --threads); its multi-threaded\n"
+                        "analyses count their CPUs against it")
     g.add_argument("--interproscan-keep-work", action="store_true",
                    help="Keep Nextflow's work directory after a successful InterProScan run")
     g.add_argument("--interpro-go", default="add", choices=["add", "fill", "off"],
@@ -342,9 +342,16 @@ Examples:
     g.add_argument("--relative", action="append", default=[], metavar="ACC|TAXID",
                    help="Relative to use instead of the automatic choice: an NCBI assembly accession\n"
                         "(GCF_000001635.27) or a taxon ID; may be given more than once")
-    g.add_argument("--relative-min-named", type=float, default=0.7, metavar="F",
+    g.add_argument("--relative-min-named", type=float, default=0.2, metavar="F",
                    help="An automatically chosen relative must give a symbol (not a LOC number or other\n"
-                        "identifier) to at least F of its protein-coding genes (default: 0.7)")
+                        "identifier), or a reference ortholog with one, to at least F of its protein-coding\n"
+                        "genes (default: 0.2)")
+    g.add_argument("--relative-named-ratio", type=float, default=0.75, metavar="F",
+                   help="And at least F of the best candidate's fraction at its lineage level or closer\n"
+                        "(default: 0.75)")
+    g.add_argument("--relative-named-margin", type=float, default=0.10, metavar="F",
+                   help="Closer relatives are preferred; a candidate one lineage level farther out is taken\n"
+                        "first only when its fraction is higher by F (default: 0.10, per level)")
     g.add_argument("--same-species", action="store_true",
                    help="Also use the RefSeq annotation of the query species itself (the newest, needs\n"
                         "--taxid), beyond --relatives, so that a previous annotation's symbols carry over:\n"
@@ -360,10 +367,25 @@ Examples:
                    help="Threads for OrthoFinder (default: --threads); fewer keeps CPU temperature down")
     g.add_argument("--datasets-bin", metavar="PATH",
                    help="NCBI datasets executable (default: datasets on PATH)")
-    g.add_argument("--ortholog-symbol", default="fill", choices=["fill", "off"],
-                   help="Genes without a symbol, or with a lineage symbol kept for lack of a reference\n"
-                        "ortholog, take the symbol on which their one-to-one orthologs in the relatives\n"
-                        "agree (default: fill); off records the orthologs only")
+    g.add_argument("--ortholog-symbol", default="weighted", choices=["weighted", "fill", "off"],
+                   help="How the symbol on which a gene's one-to-one orthologs in the relatives agree is\n"
+                        "used (default: weighted):\n"
+                        "  weighted: from close relatives (see --ortholog-close-rank) it is the primary\n"
+                        "            evidence: it decides the Diamond vote and is taken when the vote or\n"
+                        "            the reference check chose another symbol (symbol_status ortholog;\n"
+                        "            the core's symbol becomes an alias and is listed for review);\n"
+                        "            from distant relatives it is one more vote and fills genes left\n"
+                        "            without a supported symbol (ortholog_fill)\n"
+                        "  fill:     fills only, no influence on the vote\n"
+                        "  off:      records the orthologs and the checks only")
+    g.add_argument("--ortholog-close-rank", default="family", metavar="RANK",
+                   choices=["genus", "subfamily", "family", "superfamily", "order"],
+                   help="A relative is close when its lowest common ancestor with the query species is at\n"
+                        "or below this rank (default: family); needs --taxid and the taxonomy tables")
+    g.add_argument("--reference-go", default="add", choices=["add", "fill", "off"],
+                   help="GO terms of the reference gene named by a gene's supported symbol (its UniProt\n"
+                        "entries in the reference proteome, under --go-evidence): add to every such gene\n"
+                        "without redundancy (default), fill only genes without GO terms from hits, or off")
     g.add_argument("--nxf-home", metavar="DIR",
                    help="Directory for Nextflow's own files (sets NXF_HOME; default: ~/.nextflow)")
 
@@ -388,6 +410,10 @@ def validate(args, parser) -> None:
         parser.error("--signalp-min-probability must be between 0 and 1")
     if not 0.0 <= args.relative_min_named <= 1.0:
         parser.error("--relative-min-named must be between 0 and 1")
+    if not 0.0 <= args.relative_named_ratio <= 1.0:
+        parser.error("--relative-named-ratio must be between 0 and 1")
+    if not 0.0 <= args.relative_named_margin <= 1.0:
+        parser.error("--relative-named-margin must be between 0 and 1")
     if args.relatives < 1:
         parser.error("--relatives must be at least 1")
     if args.signalp_processes < 0:

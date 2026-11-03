@@ -22,7 +22,8 @@ from goannotate.gff3 import Gene, Transcript  # noqa: E402
 from goannotate.models import GeneUniverse, QueryAnnotation  # noqa: E402
 from goannotate.modules import ModuleContext, run_modules, select_modules  # noqa: E402
 from goannotate.modules.interproscan import (InterProScanModule, domain_label, domain_product,  # noqa: E402
-                                             parse_applications_config, parse_tsv)
+                                             parse_applications_config, parse_tsv,
+                                             resources_config, RESOURCES_CONFIG)
 
 failures = 0
 
@@ -192,6 +193,8 @@ def test_helpers(tmp: Path):
     check(domain_product([(5, "WD40 repeat", "Repeat"), (50, "SH2 domain", "Domain")])
           == "uncharacterized SH2 domain and WD40 repeat-containing protein", "domain before repeat")
     check(domain_product([(5, "Some family", "Family")]) == "", "families give no name")
+    check("--cpus" not in resources_config("singularity") and "cpus = 4" in resources_config("singularity"),
+          "no container CPU limit for Singularity; step CPUs kept")
     m = parse_tsv(tmp / "fake.tsv")
     check(len(m["t1"]) == 3 and m["t1"][1]["go"] == ["GO:0007154", "GO:0016020"] and m["t2"][2]["interpro"] == "",
           "TSV parsed")
@@ -238,9 +241,12 @@ def test_module(tmp: Path, data, workflow, fake, tsv, obo):
           f"status: {m.status.version}")
     argv = (tmp / "args.txt").read_text().split()
     check("--goterms" in argv and "-resume" in argv and "--max-workers" in argv
-          and argv[argv.index("--max-workers") + 1] == "2"
+          and argv[argv.index("--max-workers") + 1] == "4"
           and "--no-matches-api" not in argv and argv[argv.index("--interpro") + 1] == "110.0"
           and argv[argv.index("-profile") + 1] == "docker", f"command line: {' '.join(argv)}")
+    conf = Path(argv[argv.index("-c") + 1])
+    check(conf.name == RESOURCES_CONFIG and "withName: 'RUN_MOBIDBLITE' { cpus = 4 }" in conf.read_text()
+          and '--cpus ${task.cpus}' in conf.read_text(), "resources configuration passed with -c")
 
     # GO: g1 keeps signal transduction; cell communication (its ancestor) adds nothing;
     # calcium ion binding and membrane are added

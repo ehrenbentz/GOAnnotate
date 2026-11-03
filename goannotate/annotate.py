@@ -13,7 +13,7 @@ from difflib import SequenceMatcher
 from goannotate.blast import merge_hits_by_gene
 from goannotate.filters import BadNameFilter
 from goannotate.go import GOHierarchy, ELECTRONIC_CODES, GO_ROOT_TERMS
-from goannotate.mappings import SymbolResolver, collect_go_evidence, get_go_terms_for_hits
+from goannotate.mappings import SymbolResolver, collect_go_evidence, get_go_terms_for_hits, symbol_bases
 from goannotate.models import QueryAnnotation
 
 logger = logging.getLogger(__name__)
@@ -353,11 +353,23 @@ def symbol_group_score(bitscores: list, method: str) -> float:
     return mean
 
 
+ORTHOLOG_VOTE_MARGIN = 0.75     # a distant ortholog symbol wins when its group scores this fraction of the best
+
+
+def _symbol_group_result(idxs: list, hits_with_names: list, bad_name_filter: BadNameFilter, origin: str = None):
+    """(protein_name, symbol, origin, indices) of one symbol group: the most specific name, the best hit's symbol."""
+    best_idx = max(idxs, key=lambda i: hits_with_names[i][HIT].bitscore)
+    name_idx = _best_name_index(idxs, hits_with_names, bad_name_filter)
+    return (hits_with_names[name_idx][NAME], hits_with_names[best_idx][SYMBOL],
+            origin or hits_with_names[best_idx][ORIGIN], idxs)
+
+
 def select_name_and_symbol(winning_indices: list,
                            hits_with_names: list,
                            bad_name_filter: BadNameFilter,
                            resolver: SymbolResolver = None,
-                           score_method: str = "mean") -> tuple:
+                           score_method: str = "mean",
+                           prior: tuple = None) -> tuple:
     """
     Select the protein name and gene symbol from the winning cluster.
 
@@ -366,6 +378,11 @@ def select_name_and_symbol(winning_indices: list,
     name (from that group's best hit). A single-hit group can only win when
     no other group has 2+ hits, and a lone symbol representing <10% of a
     cluster of 10+ hits is rejected.
+
+    prior: (symbol, close) from the orthology module. A close relatives'
+    symbol decides: its group wins whenever the cluster has one (origin
+    "relative"). A distant relatives' symbol is one more vote: its group
+    wins when it scores at least ORTHOLOG_VOTE_MARGIN of the best group.
 
     Returns (protein_name, gene_symbol, symbol_origin, winning_symbol_indices).
     """
@@ -379,6 +396,28 @@ def select_name_and_symbol(winning_indices: list,
         symbol_groups[key].append(idx)
 
     symbol_groups.pop("", [])
+    # Reference readthrough symbols (IQCJ-SCHIP1) never name the gene, and a reference pseudogene symbol
+    # (FAM90A27P) does not when only reference-species hits carry it. A pseudogene symbol carried by hits
+    # of other species names their functional gene (rodent Uox, Gucy1b2, whose human orthologs are
+    # pseudogenes) and stays. The hits stay in the cluster and its other symbol groups decide.
+    if resolver is not None and symbol_groups and hasattr(resolver, "is_excluded"):
+        ref_taxid = str(getattr(resolver, "reference_taxid", ""))
+        for key in [k for k in symbol_groups if resolver.is_excluded(k)]:
+            readthrough = key.lower() not in getattr(resolver, "reference_pseudogenes", ())
+            other_species = any(str(hits_with_names[i][HIT].taxid) != ref_taxid for i in symbol_groups[key])
+            if readthrough or not other_species:
+                symbol_groups.pop(key)
+
+    if prior and prior[0] and symbol_groups:
+        prior_key = prior[0].lower()
+        if prior_key in symbol_groups:
+            idxs = symbol_groups[prior_key]
+            if prior[1]:
+                return _symbol_group_result(idxs, hits_with_names, bad_name_filter, "relative")
+            scores = {s: symbol_group_score([hits_with_names[i][HIT].bitscore for i in g], score_method)
+                      for s, g in symbol_groups.items()}
+            if scores[prior_key] >= ORTHOLOG_VOTE_MARGIN * max(scores.values()):
+                return _symbol_group_result(idxs, hits_with_names, bad_name_filter)
 
     # With ortholog resolution, a symbol is "in nomenclature" when it was
     # resolved to the reference species, comes from a reference-species
@@ -452,7 +491,18 @@ def select_name_and_symbol(winning_indices: list,
 # CONFIDENCE
 ####################
 
-def compute_confidence(annot: QueryAnnotation) -> tuple:
+# Orthology evidence in the confidence score (orthology module decisions)
+ORTHOLOG_CONFIDENCE = {
+    "close_confirmed": ("add", 0.15),     # close relatives' one-to-one orthologs name the same gene
+    "distant_confirmed": ("add", 0.05),
+    "close_taken": ("range", 0.55, 0.69),  # symbol from close orthologs against the hits: medium, review
+    "close_filled": ("floor", 0.55),       # no symbol from the hits; close orthologs name the gene
+    "distant_filled": ("floor", 0.4),
+    "conflict": ("add", -0.15),            # one close relative disagrees with a reciprocal best hit
+}
+
+
+def compute_confidence(annot: QueryAnnotation, ortholog: str = None) -> tuple:
     """
     Per-gene confidence in the assigned annotation.
 
@@ -464,10 +514,19 @@ def compute_confidence(annot: QueryAnnotation) -> tuple:
     minus 0.1 when no hit of the gene passed the hit coverage filter and
     the annotation rests on partial alignments (coverage status fallback).
 
-    Labels: none (no hits), low (<0.4), medium (<0.7), high (>=0.7).
-    Returns (label, score).
+    ortholog: the orthology module's evidence for the gene's symbol
+    (ORTHOLOG_CONFIDENCE; annot.ortholog_evidence when not given): close-relative confirmation adds 0.15, distant
+    0.05; a symbol taken from close relatives against the hits is placed in
+    0.55-0.69 (medium, for review); a filled symbol is at least 0.55 (close)
+    or 0.4 (distant), also for genes without hits; a kept conflict
+    subtracts 0.15.
+
+    Labels: none (no hits and no ortholog evidence), low (<0.4), medium
+    (<0.7), high (>=0.7). Returns (label, score).
     """
-    if not annot.hits:
+    if ortholog is None:
+        ortholog = annot.ortholog_evidence or None
+    if not annot.hits and ortholog not in ("close_filled", "distant_filled", "close_taken"):
         return "none", 0.0
     score = (0.45 * annot.name_concordance
              + 0.25 * min(1.0, annot.n_cluster_hits / 10.0)
@@ -475,6 +534,15 @@ def compute_confidence(annot: QueryAnnotation) -> tuple:
              + 0.15 * annot.symbol_concordance)
     if annot.coverage_status == "fallback":
         score = max(0.0, score - 0.1)
+    rule = ORTHOLOG_CONFIDENCE.get(ortholog)
+    if rule:
+        if rule[0] == "add":
+            score = score + rule[1]
+        elif rule[0] == "floor":
+            score = max(score, rule[1])
+        else:
+            score = min(max(score, rule[1]), rule[2])
+        score = min(1.0, max(0.0, score))
     if score >= 0.7:
         label = "high"
     elif score >= 0.4:
@@ -494,13 +562,15 @@ _worker_bad_name_filter = None
 _worker_resolver = None
 _worker_forbidden_go = frozenset()
 _worker_go_iea_min_hits = 1
+_worker_reference_taxid = ""
 
 
 def _init_worker(go_mapping, go_hierarchy, bad_name_filter, resolver, word_weights=None,
-                 forbidden_go=None, go_iea_min_hits=1):
+                 forbidden_go=None, go_iea_min_hits=1, reference_taxid=""):
     """Initialize shared read-only data in each worker process."""
     global _worker_go_mapping, _worker_go_hierarchy, _worker_bad_name_filter, _worker_resolver
-    global _worker_word_weights, _worker_forbidden_go, _worker_go_iea_min_hits
+    global _worker_word_weights, _worker_forbidden_go, _worker_go_iea_min_hits, _worker_reference_taxid
+    _worker_reference_taxid = str(reference_taxid or "")
     _worker_go_mapping = go_mapping
     _worker_go_hierarchy = go_hierarchy
     _worker_bad_name_filter = bad_name_filter
@@ -529,9 +599,15 @@ def _apply_go_evidence_rules(term_codes: dict, term_support: dict, iea_min_hits:
 
 def annotate_single_gene(gene_id: str, hits_with_names: list,
                          consensus_threshold: float, namespaces: list,
-                         symbol_case: str = "upper", symbol_score: str = "mean") -> tuple:
+                         symbol_case: str = "upper", symbol_score: str = "mean",
+                         prior: tuple = None) -> tuple:
     """
     Full annotation of a single gene (runs in a worker process).
+
+    prior: (ortholog symbol, close) from the orthology module, or None. A
+    close relatives' symbol also steers the cluster choice: when some
+    cluster carries a hit with that symbol, the winning cluster is chosen
+    among those clusters.
 
     Returns (gene_id, result_dict).
     """
@@ -566,6 +642,9 @@ def annotate_single_gene(gene_id: str, hits_with_names: list,
             'go_taxon_removed': set(),
             'best_query_coverage': 0.0,
             'best_subject_coverage': 0.0,
+            'hit_names': {},
+            'hit_symbols': {},
+            'hit_curated_names': {},
         }
 
         if not hits_with_names:
@@ -575,10 +654,28 @@ def annotate_single_gene(gene_id: str, hits_with_names: list,
         result['n_isoforms'] = len(set(tx for t in hits_with_names for tx in _isoforms(t)))
         result['hits'] = sorted([t[HIT] for t in hits_with_names],
                                 key=lambda h: h.bitscore, reverse=True)
+        result['hit_names'] = dict(Counter(normalize_gene_name(t[NAME]) for t in hits_with_names if t[NAME]))
+        result['hit_symbols'] = dict(Counter(t[SYMBOL].upper() for t in hits_with_names if t[SYMBOL]))
+        # curated (SwissProt) names given by other species than the reference: the names a reference
+        # protein's name is checked against (assign.assign_symbols)
+        curated = defaultdict(set)      # name -> symbols of the entries carrying it
+        for t in hits_with_names:
+            if t[NAME] and t[HIT].is_swissprot and t[HIT].taxid != _worker_reference_taxid:
+                syms = curated[normalize_gene_name(t[NAME])]
+                for sym in (t[SYMBOL], t[HIT].gene_symbol):
+                    if sym:
+                        syms.add(sym.upper())
+        result['hit_curated_names'] = {name: sorted(syms) for name, syms in curated.items()}
 
         # Cluster and select the winning cluster
         clusters = cluster_hits_agglomerative(hits_with_names,
                                               similarity_threshold=consensus_threshold)
+        if prior and prior[0] and prior[1]:
+            key = prior[0].lower()
+            with_prior = [c for c in clusters
+                          if any(hits_with_names[i][SYMBOL] and hits_with_names[i][SYMBOL].lower() == key for i in c)]
+            if with_prior:
+                clusters = with_prior
         winning_indices, cluster_fraction = select_winning_cluster(clusters, hits_with_names)
         result['cluster_fraction'] = cluster_fraction
         result['n_cluster_hits'] = len(winning_indices)
@@ -592,7 +689,7 @@ def annotate_single_gene(gene_id: str, hits_with_names: list,
         # Select name and symbol
         protein_name, gene_symbol, symbol_origin, winning_symbol_indices = select_name_and_symbol(
             winning_indices, hits_with_names, bad_name_filter, resolver=resolver,
-            score_method=symbol_score)
+            score_method=symbol_score, prior=prior)
 
         result['consensus_name'] = protein_name
         result['consensus_symbol'] = format_symbol(gene_symbol, symbol_case)
@@ -603,7 +700,8 @@ def annotate_single_gene(gene_id: str, hits_with_names: list,
             result['had_symbol'] = True
             result['symbol_source'] = symbol_origin
 
-        # Concordance against the full merged hit pool
+        # Concordance of the voted name and symbol with the full merged hit pool (recomputed for the
+        # final annotation by final_concordance)
         if protein_name and hits_with_names:
             final_name_norm = normalize_gene_name(protein_name)
             name_match_count = sum(
@@ -692,6 +790,119 @@ def _annotate_task(task):
     return annotate_single_gene(*task)
 
 
+def final_concordance(annotations: dict, consensus_threshold: float = 0.5) -> dict:
+    """
+    Concordance of each gene's final annotation with its own hits, computed
+    after every step that changes a symbol or product (reference checks,
+    orthology, InterProScan products), and the confidence recomputed from it.
+
+    Name concordance: fraction of the gene's hits whose name matches the
+    final product (name similarity at least consensus_threshold).
+    Symbol concordance: fraction of the gene's hits that carry a symbol and
+    name the gene of the final symbol: the symbol itself, a copy form of it
+    or the gene it is a copy form of (one genome suffix: kdm2aa, KDM2A), the
+    replaced voted symbol, or one of the gene's aliases (hit symbols of the
+    same gene, reference-species synonyms). Hits without a symbol say nothing
+    about the symbol and are not counted.
+    Genes without hits get 0 and are left out of the statistics.
+    Returns the statistics for the summary.
+    """
+    names, symbols = [], []
+    for annot in annotations.values():
+        annot.name_concordance = 0.0
+        annot.symbol_concordance = 0.0
+        if annot.hits and annot.consensus_name and annot.hit_names:
+            final = normalize_gene_name(annot.consensus_name)
+            total = sum(annot.hit_names.values())
+            match = sum(n for name, n in annot.hit_names.items()
+                        if name_similarity(final, name) >= consensus_threshold)
+            annot.name_concordance = match / total if total else 0.0
+            names.append(annot.name_concordance)
+        if annot.hits and annot.consensus_symbol:
+            final = annot.consensus_symbol.upper()
+            same = {final} | symbol_bases(final)
+            if annot.ortholog_evidence != "close_taken":
+                # a symbol taken from close relatives names another gene than the vote:
+                # the replaced symbol and the vote's aliases are not the same gene
+                same |= {a.upper() for a in annot.symbol_aliases if a}
+                if annot.voted_symbol:
+                    same.add(annot.voted_symbol.upper())
+            total = sum(annot.hit_symbols.values())
+            match = sum(n for sym, n in annot.hit_symbols.items()
+                        if sym in same or final in symbol_bases(sym))
+            annot.symbol_concordance = match / total if total else 0.0
+            symbols.append(annot.symbol_concordance)
+        annot.confidence, annot.confidence_score = compute_confidence(annot)
+
+    def describe(values):
+        if not values:
+            return {}
+        return {"n": len(values), "mean": statistics.mean(values), "median": statistics.median(values),
+                "min": min(values), "max": max(values)}
+    stats = {"name": describe(names), "symbol": describe(symbols),
+             "confidence": dict(Counter(a.confidence for a in annotations.values()))}
+    for label, d in (("Name", stats["name"]), ("Symbol", stats["symbol"])):
+        if d:
+            logger.info(f"  {label} concordance with the final annotation ({d['n']:,} genes with hits): "
+                        f"mean={d['mean']:.2f}, median={d['median']:.2f}")
+    return stats
+
+
+def propagate_symbols(annotations: dict, gene_hits: dict, symbol_case: str = "upper") -> tuple:
+    """
+    Symbol propagation: genes sharing an identical normalized protein name
+    receive the most common symbol among them that their own hits carry, when
+    they lack one. Returns (number propagated, propagated gene IDs).
+    """
+    name_to_genes = defaultdict(list)
+    for gene_id, annot in annotations.items():
+        if annot.consensus_name:
+            name_to_genes[normalize_gene_name(annot.consensus_name)].append(gene_id)
+
+    symbols_propagated = 0
+    propagated_gene_ids = []
+    for norm_name, gene_id_list in name_to_genes.items():
+        if len(gene_id_list) < 2:
+            continue
+        existing_symbols = [annotations[gid].consensus_symbol for gid in gene_id_list
+                            if annotations[gid].consensus_symbol]
+        if not existing_symbols:
+            continue
+        genes_without = [gid for gid in gene_id_list if not annotations[gid].consensus_symbol]
+        if not genes_without:
+            continue
+        ranked = [s for s, _ in Counter(existing_symbols).most_common()]
+        for gid in genes_without:
+            # Only a symbol the gene's own hits carry: identical product names
+            # alone ("disks large 5") are not evidence that two genes are
+            # copies of the same gene. The genes sharing the name may carry a
+            # close relative's form (glula) that the hits give in the
+            # reference form (GLUL); the hit's form is then given, since the
+            # relatives' suffix designates one copy and this gene is another.
+            hit_symbols = {}
+            for t in gene_hits.get(gid, []):
+                if t[SYMBOL]:
+                    hit_symbols.setdefault(t[SYMBOL].lower(), t[SYMBOL])
+            chosen = ""
+            for s in ranked:
+                if s.lower() in hit_symbols:
+                    chosen = s
+                    break
+            if not chosen:
+                for s in ranked:
+                    bases = symbol_bases(s)
+                    forms = [h for h in hit_symbols.values() if h.upper() in bases]
+                    if forms:
+                        chosen = format_symbol(forms[0], symbol_case)
+                        break
+            if not chosen:
+                continue
+            annotations[gid].consensus_symbol = chosen
+            symbols_propagated += 1
+            propagated_gene_ids.append(gid)
+    return symbols_propagated, propagated_gene_ids
+
+
 def annotate_queries(resolved_transcript_hits: dict,
                      transcript_to_gene: dict,
                      go_mapping: dict,
@@ -709,7 +920,8 @@ def annotate_queries(resolved_transcript_hits: dict,
                      word_weights: WordWeights = None,
                      forbidden_go: set = None,
                      go_iea_min_hits: int = 1,
-                     coverage_status: dict = None) -> dict:
+                     coverage_status: dict = None,
+                     ortholog_prior: dict = None, reference_taxid: str = "") -> dict:
     """
     Main annotation pipeline: merge isoform hits, cluster, select name/symbol,
     collect GO terms. Per-gene annotation runs in parallel via multiprocessing,
@@ -725,6 +937,8 @@ def annotate_queries(resolved_transcript_hits: dict,
     electronic (IEA) before it is assigned (1: no requirement).
     coverage_status: transcript -> "pass" / "fallback" from the hit coverage
     filter; a gene is "pass" when any of its transcripts passed.
+    ortholog_prior: gene -> (ortholog symbol, close) from the orthology
+    module, steering the symbol choice (see select_name_and_symbol).
 
     Returns: dict of gene_id -> QueryAnnotation
     """
@@ -769,14 +983,21 @@ def annotate_queries(resolved_transcript_hits: dict,
                 f"({n_genes_with_hits:,} have filtered hits) "
                 f"using {n_workers} workers...")
 
-    tasks = [(gene_id, gene_hits.get(gene_id, []), consensus_threshold, namespaces, symbol_case, symbol_score)
+    ortholog_prior = ortholog_prior or {}
+    if ortholog_prior:
+        n_close = sum(1 for _, close in ortholog_prior.values() if close)
+        logger.info(f"Ortholog symbols steer the vote for {len(ortholog_prior):,} genes "
+                    f"({n_close:,} from close relatives decide, the rest count as one more vote)")
+    tasks = [(gene_id, gene_hits.get(gene_id, []), consensus_threshold, namespaces, symbol_case, symbol_score,
+              ortholog_prior.get(gene_id))
              for gene_id in all_gene_ids]
 
     start_time = time.time()
 
     # The main process uses the same globals (normalize_gene_name reads the
     # bad-name filter for comparison-only normalization during propagation).
-    init_args = (go_mapping, go_hierarchy, bad_name_filter, resolver, word_weights, forbidden_go, go_iea_min_hits)
+    init_args = (go_mapping, go_hierarchy, bad_name_filter, resolver, word_weights, forbidden_go, go_iea_min_hits,
+                 reference_taxid)
     _init_worker(*init_args)
     if n_workers == 1:
         results = [annotate_single_gene(*task) for task in tasks]
@@ -812,6 +1033,7 @@ def annotate_queries(resolved_transcript_hits: dict,
         'symbols_from_uniprot': 0,
         'symbols_from_ortholog': 0,
         'symbols_from_ncbi': 0,
+        'symbols_from_relative': 0,
         'genes_with_taxon_removed': 0,
         'terms_taxon_removed': 0,
     }
@@ -826,6 +1048,9 @@ def annotate_queries(resolved_transcript_hits: dict,
         annot.specific_go_terms = result_dict['specific_go_terms']
         annot.name_concordance = result_dict['name_concordance']
         annot.symbol_concordance = result_dict['symbol_concordance']
+        annot.hit_names = result_dict.get('hit_names', {})
+        annot.hit_symbols = result_dict.get('hit_symbols', {})
+        annot.hit_curated_names = result_dict.get('hit_curated_names', {})
         annot.n_isoforms = result_dict['n_isoforms']
         annot.n_cluster_hits = result_dict['n_cluster_hits']
         annot.winning_cluster_names = result_dict['winning_cluster_names']
@@ -861,41 +1086,14 @@ def annotate_queries(resolved_transcript_hits: dict,
                 stats['symbols_from_ortholog'] += 1
             elif result_dict['symbol_source'] == 'ncbi':
                 stats['symbols_from_ncbi'] += 1
+            elif result_dict['symbol_source'] == 'relative':
+                stats['symbols_from_relative'] += 1
         if result_dict['go_terms']:
             stats['genes_with_go_terms'] += 1
         if result_dict['cluster_fraction'] > 0:
             cluster_fractions.append(result_dict['cluster_fraction'])
 
-    # Symbol propagation: genes sharing an identical normalized protein name
-    # receive the most common symbol among them when they lack one.
-    name_to_genes = defaultdict(list)
-    for gene_id, annot in annotations.items():
-        if annot.consensus_name:
-            name_to_genes[normalize_gene_name(annot.consensus_name)].append(gene_id)
-
-    symbols_propagated = 0
-    propagated_gene_ids = []
-    for norm_name, gene_id_list in name_to_genes.items():
-        if len(gene_id_list) < 2:
-            continue
-        existing_symbols = [annotations[gid].consensus_symbol for gid in gene_id_list
-                            if annotations[gid].consensus_symbol]
-        if not existing_symbols:
-            continue
-        genes_without = [gid for gid in gene_id_list if not annotations[gid].consensus_symbol]
-        if not genes_without:
-            continue
-        best_symbol = Counter(existing_symbols).most_common(1)[0][0]
-        best_lower = best_symbol.lower()
-        for gid in genes_without:
-            # Only when the gene's own hits carry the symbol: identical
-            # product names alone ("disks large 5") are not evidence that
-            # two genes are copies of the same gene.
-            if not any(t[SYMBOL] and t[SYMBOL].lower() == best_lower for t in gene_hits.get(gid, [])):
-                continue
-            annotations[gid].consensus_symbol = best_symbol
-            symbols_propagated += 1
-            propagated_gene_ids.append(gid)
+    symbols_propagated, propagated_gene_ids = propagate_symbols(annotations, gene_hits, symbol_case)
 
     stats['symbols_from_propagation'] = symbols_propagated
     if symbols_propagated > 0:
@@ -903,14 +1101,7 @@ def annotate_queries(resolved_transcript_hits: dict,
                     f"from genes with identical protein names")
 
     for gid in propagated_gene_ids:
-        annot = annotations[gid]
-        annot.symbol_status = "propagated"
-        hits_pool = gene_hits.get(gid, [])
-        if annot.consensus_symbol and hits_pool:
-            final_sym_lower = annot.consensus_symbol.lower()
-            match_count = sum(1 for t in hits_pool
-                              if t[SYMBOL] and t[SYMBOL].lower() == final_sym_lower)
-            annot.symbol_concordance = match_count / len(hits_pool)
+        annotations[gid].symbol_status = "propagated"
 
     # Confidence
     confidence_counts = Counter()
@@ -927,7 +1118,7 @@ def annotate_queries(resolved_transcript_hits: dict,
     logger.info(f"  Coding genes with protein name: {stats['genes_with_protein_name']:,} "
                 f"({100*stats['genes_with_protein_name']/coding:.1f}%)")
     total_symbols = (stats['symbols_from_uniprot'] + stats['symbols_from_ortholog']
-                     + stats['symbols_from_ncbi'] + stats['symbols_from_propagation'])
+                     + stats['symbols_from_ncbi'] + stats['symbols_from_propagation'] + stats['symbols_from_relative'])
     logger.info(f"  Coding genes with gene symbol: {total_symbols:,} ({100*total_symbols/coding:.1f}%)")
     if stats['symbols_from_ortholog'] > 0:
         logger.info(f"    - From reference-species ortholog: {stats['symbols_from_ortholog']:,}")
@@ -935,6 +1126,9 @@ def annotate_queries(resolved_transcript_hits: dict,
         logger.info(f"    - From UniProt GN= field: {stats['symbols_from_uniprot']:,}")
     if stats['symbols_from_ncbi'] > 0:
         logger.info(f"    - From NCBI cross-reference: {stats['symbols_from_ncbi']:,}")
+    if stats['symbols_from_relative'] > 0:
+        logger.info(f"    - Decided by a close relative's ortholog (hits carrying its symbol): "
+                    f"{stats['symbols_from_relative']:,}")
     if stats['symbols_from_propagation'] > 0:
         logger.info(f"    - From name-based propagation: {stats['symbols_from_propagation']:,}")
     logger.info(f"  Coding genes with GO terms: {stats['genes_with_go_terms']:,} "
@@ -953,16 +1147,5 @@ def annotate_queries(resolved_transcript_hits: dict,
         logger.info(f"  Winning cluster fraction: mean={statistics.mean(cluster_fractions):.2f}, "
                     f"median={statistics.median(cluster_fractions):.2f}, "
                     f"min={min(cluster_fractions):.2f}, max={max(cluster_fractions):.2f}")
-
-    name_concordances = [a.name_concordance for a in annotations.values() if a.consensus_name]
-    symbol_concordances = [a.symbol_concordance for a in annotations.values() if a.consensus_symbol]
-    if name_concordances:
-        logger.info(f"  Name concordance: mean={statistics.mean(name_concordances):.2f}, "
-                    f"median={statistics.median(name_concordances):.2f}, "
-                    f"min={min(name_concordances):.2f}, max={max(name_concordances):.2f}")
-    if symbol_concordances:
-        logger.info(f"  Symbol concordance: mean={statistics.mean(symbol_concordances):.2f}, "
-                    f"median={statistics.median(symbol_concordances):.2f}, "
-                    f"min={min(symbol_concordances):.2f}, max={max(symbol_concordances):.2f}")
 
     return annotations

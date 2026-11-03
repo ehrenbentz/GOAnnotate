@@ -136,8 +136,14 @@ class QueryAnnotation:
     consensus_symbol: str = ""
     go_terms: set = field(default_factory=set)
     specific_go_terms: set = field(default_factory=set)
-    name_concordance: float = 0.0
-    symbol_concordance: float = 0.0
+    name_concordance: float = 0.0     # fraction of the gene's hits whose name matches the final product
+    symbol_concordance: float = 0.0   # fraction of the gene's hits with a symbol that name the final symbol's gene
+    hit_names: dict = field(default_factory=dict)    # normalized hit name -> number of hits (for concordance)
+    hit_symbols: dict = field(default_factory=dict)  # upper-case hit symbol -> number of hits (for concordance)
+    hit_curated_names: dict = field(default_factory=dict)  # normalized names of SwissProt hits of other species
+                                                           # than the reference -> their upper-case symbols
+    ortholog_reference_symbol: str = ""  # close relatives' symbol in the reference nomenclature (orthology module)
+    ortholog_evidence: str = ""  # orthology module's evidence for the symbol (annotate.ORTHOLOG_CONFIDENCE key)
     n_isoforms: int = 0
     n_cluster_hits: int = 0
     winning_cluster_names: list = field(default_factory=list)
@@ -148,7 +154,8 @@ class QueryAnnotation:
     confidence_score: float = 0.0
     symbol_status: str = ""     # rbh, rbh_override, rbh_added, vote_supported, reference_best_hit,
                                 # vote (no reference hit), vote_rbh_conflict, propagated,
-                                # foreign_ortholog, foreign_kept, foreign_replaced, foreign_removed, none
+                                # foreign_ortholog, foreign_kept, foreign_replaced, foreign_removed, none;
+                                # orthology module: ortholog (close relatives' symbol taken), ortholog_fill
     voted_symbol: str = ""      # the voted symbol, when the reference check replaced it
     coverage_status: str = ""   # "" (filter off or no hits), pass (hits passed the coverage filter),
                                 # fallback (no hit passed; the unfiltered hits were used)
@@ -162,6 +169,7 @@ class QueryAnnotation:
     symbol_aliases: list = field(default_factory=list)  # other symbols of the same gene (hits' GN= symbols,
                                                         # the replaced voted symbol, reference-species synonyms)
     go_interpro: dict = field(default_factory=dict)     # GO ID -> InterPro entries that carry it (InterProScan module)
+    go_reference: dict = field(default_factory=dict)    # GO ID -> reference proteins of the gene's symbol carrying it
 
 
 @dataclass

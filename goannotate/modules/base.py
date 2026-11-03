@@ -66,10 +66,15 @@ class ModuleContext:
     namespaces: list = field(default_factory=list)   # GO namespaces in use (--namespace)
     bad_name_filter: object = None   # BadNameFilter, for modules that take symbols or products from elsewhere
     symbol_case_fn: object = None    # formats a symbol in the --symbol-case of the run
+    reference_descriptions: dict = None  # upper-case reference symbol -> reference protein name (Stage 3b)
 
 
 class ModuleError(Exception):
     """A module could not complete; the pipeline continues without it."""
+
+
+class ModuleSkipped(ModuleError):
+    """A module found nothing to work with (no usable relative); the pipeline continues without it."""
 
 
 class Module:
@@ -78,6 +83,7 @@ class Module:
     name = ""
     description = ""
     needs_proteins = True        # skip for blastx (nucleotide) input
+    runs_before_vote = False     # run() before the Diamond vote (Stage 3), integrate() after Stage 3b
 
     def __init__(self, args):
         self.args = args
@@ -122,6 +128,10 @@ class Module:
         raise NotImplementedError
 
     def integrate(self, ctx: ModuleContext) -> dict:
+        return {}
+
+    def prior(self) -> dict:
+        """{gene: (symbol, close)} for the Diamond vote, from a module that runs before it."""
         return {}
 
     # ---- outputs ----------------------------------------------------------

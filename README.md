@@ -274,7 +274,7 @@ goannotate \
 | `--interproscan-nextflow`, `--interproscan-profile` | `nextflow` on PATH, auto | Nextflow executable and container runtime |
 | `--interproscan-apps` | all except deep-learning analyses | InterProScan analyses to run |
 | `--interproscan-local` | off | Run every analysis locally instead of looking up precalculated matches at EBI |
-| `--interproscan-workers` | half of `--threads` | InterProScan tasks run in parallel |
+| `--interproscan-workers` | `--threads` | CPUs for InterProScan's parallel tasks |
 | `--interproscan-keep-work` | off | Keep Nextflow's work directory |
 | `--interpro-go` | add | InterPro GO terms: `add` to every gene, `fill` genes without GO, `off` |
 | `--interpro-products` | fill | Name coding genes left without a product from their InterPro domains |
@@ -285,7 +285,9 @@ goannotate \
 | `--same-species` | off | Also use the RefSeq annotation of the query species itself, beyond `--relatives` |
 | `--relatives-dir` | `intermediate/{prefix}_orthology/relatives` | Where relatives' annotations are downloaded |
 | `--orthofinder-bin`, `--orthofinder-threads`, `--datasets-bin` | on PATH, `--threads`, on PATH | OrthoFinder and NCBI datasets settings |
-| `--ortholog-symbol` | fill | Name genes without a symbol (or with a kept lineage symbol) from their one-to-one orthologs in the relatives |
+| `--ortholog-symbol` | weighted | How the relatives' ortholog symbols are used: `weighted` (close relatives decide, distant ones vote and fill), `fill` (fill only), `off` |
+| `--ortholog-close-rank` | family | A relative is close when its common ancestor with the query species is at or below this rank |
+| `--reference-go` | add | GO terms of the reference gene named by a gene's supported symbol: `add`, `fill` (genes without GO from hits), `off` |
 | `--threads` | all CPUs | Threads for Diamond, workers for annotation and threads for the module tools |
 | `--prefix` | output dir name | Prefix for output filenames |
 
@@ -365,19 +367,23 @@ GO terms are collected in two steps:
 
 **Evidence.** Databases built by the current `build_databases.py` store the GO evidence codes behind every accession-term pair. `--go-evidence` chooses which annotations are used: `all` (default; every code except ND, whose terms are the ontology roots), `non-electronic` (no IEA annotations), or `experimental` (EXP, IDA, IPI, IMP, IGI, IEP and the high-throughput codes). `--go-iea-min-hits N` additionally requires a term whose only evidence is electronic to be carried by at least N of the hits it is collected from. The codes behind each assigned term, its strongest evidence class and the number of supporting hits are written to `reports/{prefix}_go_evidence.tsv`; the evidence table summarizes them per gene (`go_evidence_classes`).
 
+**From the reference gene.** Once the symbols are final (after Phase 8b and the orthology module), a gene whose symbol is supported (`rbh`, `rbh_override`, `rbh_added`, `vote_supported`, `reference_best_hit`, `foreign_ortholog`, `ortholog`, `ortholog_fill`) also receives the GO terms of the reference gene that symbol names: the terms of the reference proteome's proteins carrying the symbol, under the same `--go-evidence` policy, taxon constraints and namespaces. With `--reference-go add` (default) they join the gene's terms without redundancy (a term already present, or an ancestor of one, adds nothing); `fill` gives them only to genes without GO terms from hits; `off` leaves GO to the hits and InterProScan. For a human reference these are the curated GOA annotations of the human gene; `reports/{prefix}_go_evidence.tsv` marks their source (`reference`) and lists the proteins behind each term.
+
 **Taxon constraints.** The Gene Ontology states for many terms the taxa they apply to (`in_taxon`, `never_in_taxon`; constraints pass to subtypes and parts). With `--taxid` (the NCBI taxon of the organism being annotated) GOAnnotate computes the organism's lineage from the taxonomy tables of the database (or `--taxdump`), expands GO's taxon union classes, and removes every GO term that a constraint on it or on one of its ancestors excludes for that lineage: photosynthesis terms from a mammal, lactation from a fish. The constraints come from the database tables or from `--taxon-constraints-obo` and `--taxon-groupings-obo`; removed terms are listed in `reports/{prefix}_go_evidence.tsv` with the constraint that removed them. `--taxon-constraints off` disables the step; without `--taxid` it is skipped.
 
 After collection, GO terms are filtered by namespace (BP, MF, CC) and then reduced to the most specific terms by removing redundant ancestor terms using the GO hierarchy from the OBO file. For example, if a gene has both GO:0005634 (nucleus) and GO:0005737 (cytoplasm), both are kept because neither is an ancestor of the other. But if it has both GO:0005634 (nucleus) and GO:0005622 (intracellular anatomical structure, a parent of nucleus), the parent is removed.
 
 ### Phase 8: Symbol Propagation
 
-After all genes are annotated independently, a post-annotation pass looks for genes that share the same normalized protein name. If some of those genes have a gene symbol and others do not, the most common symbol is propagated to a symbol-less sibling when that symbol also occurs among the sibling's own hits. This fills in gaps where the vote for a particular gene left it without a symbol although its hits carry one. Identical product names alone are not used: TrEMBL names such as "Disks large homolog 5-like" are shared by unrelated genes that resemble one domain of the named protein.
+After all genes are annotated independently, a post-annotation pass looks for genes that share the same normalized protein name. If some of those genes have a gene symbol and others do not, the most common symbol that also occurs among a symbol-less sibling's own hits is propagated to it. When the siblings carry a copy form (a close relative's ohnolog symbol such as glula) that the sibling's hits give only in the form of the gene it belongs to (GLUL), that form is given: the copy suffix designates another gene. This fills in gaps where the vote for a particular gene left it without a symbol although its hits carry one. Identical product names alone are not used: TrEMBL names such as "Disks large homolog 5-like" are shared by unrelated genes that resemble one domain of the named protein.
 
 ### Phase 8b: Symbol Checks Against the Reference Proteome
 
 The vote decides identity from many database hits, but its naming can be wrong in two ways: a gene that shares a domain with a well-studied protein can be named after it, and for paralog pairs the better-studied sibling tends to win the vote. A second pass checks every voted symbol against the complete reference-species proteome (the SwissProt entries of the reference taxon, which for human cover essentially every protein-coding gene; extracted from the SwissProt Diamond database with `diamond getseq`, or given with `--reference-proteome`). The reference proteome is searched against the query proteins and the query proteins against it; both searches take seconds. A gene is the reciprocal best hit (RBH) of reference symbol X when X's protein has that gene as its best query hit and X is among the gene's hits.
 
 - A voted symbol equal to the RBH symbol is confirmed (`rbh`), and the reference protein's name becomes the product.
+- Product of a confirmed symbol (`rbh`, a copy form of the RBH symbol, `rbh_added`, `vote_supported`): the reference protein's name replaces the voted name, which often comes from an automatic family name of TrEMBL ("RNA helicase" for eIF4A3). The exception is a reference species' own gene name: when SwissProt hits of other species than the reference carry the voted name and none carries the reference name ("minidiscs" and "polychaetoid" with a Drosophila reference, where other species say "Y+L amino acid transporter 2" and "Tight junction protein ZO-2"), the hits' name stays. Curated entries of another reference gene (a paralog: UCP2 entries for a UCP3 gene) do not count for the hits' name. When the check changes the symbol to another gene, that gene's reference name is used.
+- A voted symbol outside the reference nomenclature that is a copy form of the RBH symbol (one genome suffix: adgrl1a, kdm2aa, glula for ADGRL1, KDM2A, GLUL) names the same gene: the RBH confirms it (`rbh`, counted separately in the summary), the reference symbol is used and the voted form is kept in `voted_symbol`; the orthology module restores the close relatives' own form afterwards.
 - An RBH symbol that differs from the vote but occurs among the resolved symbols of the winning cluster replaces it (`rbh_override`). A gene the vote left unnamed takes its RBH symbol (`rbh_added`).
 - Any other voted reference symbol must be supported by the gene's own sequence: the gene's hit to that symbol's reference protein must score at least 0.9 of its best reference hit (`--symbol-support`) and cover at least half of the reference protein (`--symbol-min-coverage`). Supported votes are kept (`vote_supported`). Unsupported votes are replaced by the closest supported reference protein (`reference_best_hit`; the original is kept in the `voted_symbol` column), or removed when no reference protein is covered, as for a shared domain or a fragment (`unsupported_removed`); the product name is kept either way.
 - Genes without any reference hit keep their vote (`vote`).
@@ -388,11 +394,15 @@ The vote decides identity from many database hits, but its naming can be wrong i
 
 **Reference species by lineage.** NCBI gene_orthologs converts symbols only through its anchor species: human for vertebrates, Drosophila melanogaster for insects, Saccharomyces cerevisiae for fungi, and a few others. Human anchor rows contain no insect genes, so an insect annotated against human keeps the symbols of its hits, mostly genome-project locus tags. With `--reference-taxid auto` (default) the reference is chosen from the lineage of `--taxid` (taxonomy tables of the database, or `--taxdump`). For a reference species with fewer than 10,000 SwissProt proteins (Drosophila: about 3,900) the reference proteome also takes the species' TrEMBL entries. In a test on the paper wasp Polistes fuscatus, Drosophila as reference raised the share of coding genes with a symbol from 66.8% (human) to 73.9%, with 28% of hits converted to the reference against 1%.
 
-**Second nomenclature.** When the reference species is not human, every gene also receives, in the `secondary_symbol` column (tables, evidence file, GFF3 `goannotate_secondary_symbol`), the symbol of its human ortholog when there is an unambiguous one: the gene is the reciprocal best hit of a human protein, that protein is its best human hit, the second-best scores below `--rbh-margin` of it, and the alignment covers the protein or the gene. An insect gene can then carry Dad (FlyBase) and SMAD6 (human). `--secondary-reference-taxid` chooses another species or disables it.
+**Second nomenclature.** When the reference species is not human, every gene also receives, in the `secondary_symbol` column (tables, evidence file, GFF3 `goannotate_secondary_symbol`), the symbol of its human ortholog when there is an unambiguous one: the gene is the reciprocal best hit of a human protein, that protein is its best human hit, the second-best scores below `--rbh-margin` of it, and the alignment covers the protein or the gene. An insect gene can then carry Dad (FlyBase) and SMAD6 (human). `--secondary-reference-taxid` chooses another species or disables it. The secondary reference also names products: a gene whose product is its primary reference protein's name, used by none of its hits (a reference species' own gene name such as "larval translucida" in Drosophila), takes the name of its secondary reference protein when at least one of its hits uses that name (`product_note` `secondary_reference`).
 
 **Paralog designators.** Other genomes' nomenclatures add designators to the names of their own duplicates: teleost `a`/`b` ("Forkhead box protein O3-B", "protein kinase C beta a"), ", tandem duplicate 1". These mean nothing in the genome being annotated. ", tandem duplicate N" is stripped from hit names like any qualifier. A trailing ` a`/` b`, a letter glued to a trailing number ("O3b") or `-A`/`-B` after a number ("O3-B") is removed from a voted product name only when the name without it is a reference protein name or a name carried by the gene's own hits, so that "Cytochrome b" and "Annexin A" are left alone (`product_note` = `designator_stripped` in the evidence table; `--keep-paralog-designators` disables this).
 
 Several genes may carry the same symbol. Paralogs, recent duplicates and retrocopies are real, and each copy is named for the gene it is homologous to; GOAnnotate does not reserve a symbol for one gene or rename copies with a "-like" suffix. Nucleotide (blastx) input skips this pass, since the reverse search needs protein queries; `--no-reciprocal` disables it.
+
+**Pseudogenes, readthroughs and weakly evidenced paralogs.** A readthrough locus of the reference species (an official symbol made of two official symbols: IQCJ-SCHIP1, KLRC4-KLRK1) never names a gene. A reference pseudogene symbol (NCBI type `pseudo`) does not win the vote when only reference-species hits carry it (FAM90A27P); when hits of other species carry it, it names their functional gene and stays (rodent Uox, Gucy1b2, Fer1l4, whose human orthologs are pseudogenes). Neither is ever a reciprocal best hit or a replacement. After the checks, a symbol whose reference proteins have only weak UniProt protein evidence (PE 2 to 5) is replaced by the established reference gene (PE=1) it is named after (its symbol begins with that gene's symbol) when the gene covers it and hits it at least 0.95 as well: a retrocopy or a recent human duplicate scoring almost like its parent gives way to the parent (NANOGP8 to NANOG, CD8B2 to CD8B). The replaced symbol is kept in `voted_symbol` and among the aliases.
+
+**Ortholog symbols.** With the orthology module, the relatives' ortholog symbols enter the vote in Phase 6 (a close relative's symbol decides it, a distant one is one more vote) and are applied after these checks: a close relative's symbol is taken even over a supported core symbol (`ortholog`; such conflicts are listed for review), a distant one fills what is left (`ortholog_fill`). See [orthology](#orthology-symbols-from-relatives-weighted-by-their-closeness).
 
 ### Phase 9: Confidence
 
@@ -405,7 +415,7 @@ score = 0.45 * name_concordance
       + 0.15 * symbol_concordance
 ```
 
-The score is lowered by 0.1 when no hit of the gene passed the hit coverage filter (coverage status `fallback`). Labels: `high` (>= 0.7), `medium` (>= 0.4), `low` (< 0.4), `none` (no hits). The label is written to the evidence table and to the annotated GFF3 (`goannotate_confidence`).
+The score is lowered by 0.1 when no hit of the gene passed the hit coverage filter (coverage status `fallback`). With the orthology module, orthology evidence enters the score: a symbol confirmed by close relatives' one-to-one orthologs adds 0.15 (distant relatives 0.05); a symbol taken from close relatives against the hits is placed between 0.55 and 0.69 (medium, for review); a filled symbol scores at least 0.55 (close relatives) or 0.4 (distant), also for genes without hits; a kept conflict (`conflict_kept`) subtracts 0.15. Labels: `high` (>= 0.7), `medium` (>= 0.4), `low` (< 0.4), `none` (no hits). The label is written to the evidence table and to the annotated GFF3 (`goannotate_confidence`).
 
 ### Phase 10: Comparison with Existing Annotation
 
@@ -417,12 +427,12 @@ Resolution follows from the annotation mode. In the default `fill` mode the exis
 
 ### Concordance Metrics
 
-For each annotated gene, GOAnnotate computes two concordance scores against the full merged hit pool (not just the winning cluster):
+For each annotated gene with hits, GOAnnotate computes two concordance scores against the gene's full merged hit pool (not just the winning cluster), once the symbol and product are final (after the reference checks, the orthology module and InterProScan), so they describe the annotation that is written:
 
-- **Name concordance:** The fraction of all merged hits whose cleaned protein name matches the final assigned name (at or above the similarity threshold).
-- **Symbol concordance:** The fraction of all merged hits whose gene symbol exactly matches the final assigned symbol (case-insensitive).
+- **Name concordance:** the fraction of the gene's hits whose cleaned protein name matches the final product (at or above the similarity threshold).
+- **Symbol concordance:** the fraction of the gene's hits that carry a symbol and name the gene of the final symbol: the symbol itself, a copy form of it or the gene it is a copy form of (one genome suffix: kdm2aa and KDM2A), the replaced voted symbol, or one of the gene's aliases (hit symbols of the same gene, reference-species synonyms). Hits without a symbol (many TrEMBL entries) are not counted.
 
-A name concordance of 1.0 means every hit for that gene agrees with the chosen annotation. Low concordance (e.g., < 0.2) indicates the gene's hits are split across divergent annotations, which can happen with multidomain proteins, gene fusions, or genuinely ambiguous homology. Symbol concordance is typically much lower than name concordance because orthologous genes across species often share protein names but carry different gene symbols.
+A name concordance of 1.0 means every hit agrees with the product. Low concordance (e.g., < 0.2) indicates the gene's hits are split across divergent annotations, which can happen with multidomain proteins, gene fusions, or genuinely ambiguous homology, or that the product came from another source (a close relative's ortholog, an InterPro domain). Genes without hits (symbols filled from close relatives) get 0 and are left out of the summary statistics. The confidence score is computed from these final values.
 
 ## Output Files
 
@@ -442,8 +452,9 @@ The annotation files are written to the top level of the `--output` directory; r
     reports/
         {prefix}_comparison.tsv, _comparison_summary.txt, _review.tsv   comparison with the input annotation
         {prefix}_annotation_evidence.tsv     per-gene evidence for every decision
-        {prefix}_go_evidence.tsv             per gene and GO term: evidence codes, class, supporting hits;
-                                             terms removed by the taxon constraints
+        {prefix}_go_evidence.tsv             per gene and GO term: evidence codes, class, supporting hits,
+                                             source (hits, reference gene, InterPro); terms removed by the
+                                             taxon constraints
         {prefix}_name_audit.txt              what the name and symbol filters removed and kept
         {prefix}_extraction_report.tsv       per-transcript extraction flags (genome mode)
         {prefix}_protein_input_check.tsv     problems found in a --proteins file
@@ -496,8 +507,8 @@ Product names in all outputs are cleaned for submission: database prefixes, brac
 | top_hit_bitscore | Bitscore of that hit |
 | top_hit_source | `sp` (SwissProt) or `tr` (TrEMBL) |
 | mean_cluster_bitscore | Mean bitscore of hits in the winning cluster |
-| name_concordance | Fraction of all hits matching the assigned name |
-| symbol_concordance | Fraction of all hits matching the assigned symbol |
+| name_concordance | Fraction of the gene's hits whose name matches the final product |
+| symbol_concordance | Fraction of the gene's hits with a symbol that name the final symbol's gene |
 | go_source | How GO terms were collected (`cluster_top5`, `cluster_top5+swissprot_supplement`, or empty) |
 | n_go_terms | Number of specific GO terms assigned |
 | confidence | `high`, `medium`, `low` or `none` |
@@ -575,9 +586,9 @@ Outputs:
 
 No GO terms are added: a signal peptide is not a GO assertion by itself.
 
-### orthology: symbols from close relatives
+### orthology: symbols from relatives, weighted by their closeness
 
-Finds the orthologs of every gene in the RefSeq annotations of close relatives with [OrthoFinder](https://github.com/davidemms/OrthoFinder) (Emms & Kelly 2019, Genome Biology 20:238), and names genes that the hit-based annotation left without a symbol from them. Symbols of expanded or lineage-specific gene families are often missing from UniProt hits but present in a close relative's annotation, where NCBI's own orthology pipeline assigned them.
+Finds the orthologs of every gene in the RefSeq annotations of relatives with [OrthoFinder](https://github.com/davidemms/OrthoFinder) (Emms & Kelly 2019, Genome Biology 20:238) and weighs their symbols against the hit-based vote according to how close the relatives are. An ortholog in a close, well-named relative is the most direct evidence of a gene's identity: the gene tree separates paralogs that a best hit confuses, and symbols of expanded or lineage-specific families are often present there and missing from UniProt hits. An ortholog in a distant relative is weaker evidence, because one-to-one pairs between distant genomes are often lineage-specific paralogs, so it counts as one more vote and fills gaps.
 
 **Requirements.** OrthoFinder (for example `conda create -n orthofinder -c bioconda orthofinder`; give its executable with `--orthofinder-bin`, and GOAnnotate puts that environment first on PATH while it runs) and the NCBI `datasets` command-line tool on PATH (or `--datasets-bin`). Relatives' annotations are downloaded from NCBI.
 
@@ -585,7 +596,20 @@ Finds the orthologs of every gene in the RefSeq annotations of close relatives w
 
 **Orthologs.** The longest protein of each coding gene of the query and of each relative goes to OrthoFinder (Diamond searches, default settings: DendroBLAST gene trees, no RAxML). `--orthofinder-threads` limits its threads (default `--threads`); its progress lines in the log include the CPU temperature when `sensors` is available.
 
-**Symbols (`--ortholog-symbol fill`).** A gene without a symbol, or with a symbol outside the reference nomenclature that was kept because no reference ortholog was found (`foreign_kept`), takes the symbol of its one-to-one orthologs when the relatives that name them agree (case-insensitive; symbols that differ only by a genome suffix such as `a`/`b` agree, and the most frequent form is used). Such genes are marked `ortholog_fill` in `symbol_status`; a replaced lineage symbol is kept among the aliases. When the gene has no product either, the relatives' product is used (`product_note` `ortholog`). Genes whose orthologs are one-to-many, or whose relatives disagree, are not named. Genes that already have a symbol supported by the reference proteome are not changed; their symbol is compared with the relatives' one-to-one symbol, and the agreement rate is reported in the summary as a check of both.
+**Closeness (`--ortholog-close-rank`, default `family`).** A relative is close when its lowest common ancestor with the query species, in the NCBI taxonomy of the database, has a rank at or below the given one (an unranked ancestor counts as the first ranked one above it): for the vole, *M. pennsylvanicus* (genus), *Myodes* and *Alexandromys* (subfamily Arvicolinae) are close, mouse and rat (order Rodentia) are distant. The query species' own annotation (`--same-species`) is close. Each relative's common ancestor and closeness are listed in the summary and in `reports/{prefix}_orthology_relatives.tsv`.
+
+**The ortholog symbol.** For every gene the module derives one ortholog symbol: the symbol on which its one-to-one orthologs agree among the relatives that name them (case-insensitive; symbols that differ only by a genome suffix such as `a`/`b` agree, and the most frequent form is used; identifiers such as LOC numbers do not count). Genes whose orthologs are one-to-many, or whose relatives disagree, get none. The symbol is supported by close relatives when at least one close relative names it. Official reference symbols of uncharacterized genes (C19orf81, KIAA1549L), which the bad-name rules reject when they come from hits, are accepted from close relatives: the one-to-one ortholog mapped to the reference gene identifies the gene, and the symbol is the official one (products of such genes still follow the product rules). Such symbols only fill genes without a supported symbol; they never replace one.
+
+**Weighting (`--ortholog-symbol weighted`, default).** OrthoFinder runs before the Diamond vote, and the ortholog symbols enter it:
+
+- A symbol supported by close relatives decides the vote: when the gene's hits carry it, the cluster and symbol group that carry it win (the log counts these genes as decided by a close relative's ortholog; the report marks them `confirmed`). When the hits do not carry it, or the reference check (Phase 8b) chose another symbol, the ortholog symbol is taken anyway after Phase 8b: `symbol_status` `ortholog`, the core's symbol kept in `voted_symbol` (not among the aliases, which list other names of the same gene; the vote's aliases are removed as well, since they name the core's gene), and the gene listed with decision `taken` in `reports/{prefix}_orthology.tsv`. Such conflicts between a close ortholog and a supported core symbol are rare (0.2% of the vole's genes) and are the genes to review; the summary counts them. One exception guards against an annotation error in a relative: when a single close relative alone names the symbol, none of the gene's hits carries it (nor any alias), and the core symbol is a reciprocal best hit, the core symbol stays and the gene is listed with decision `conflict_kept`.
+- When the close relatives' one-to-one orthologs name the same gene as the core, but in their own form (an ohnolog form such as `kdm2aa` for `kdm2a`, or a lineage name that NCBI gene_orthologs links to the same reference gene), their own form is used: it is the name appropriate to the clade, while the reference-style symbol is kept in `voted_symbol` and among the aliases, and the product and the reference-gene GO terms (through the relatives' symbol in the reference nomenclature) are kept. A taken symbol (another gene) receives the GO terms of its own reference gene, never those of the replaced symbol. Decision `refined` in the report. Reference-style symbols carry no special weight beyond being well annotated.
+- A symbol supported only by distant relatives is one more vote: in the Diamond vote its symbol group wins when it scores at least 75% of the best group; afterwards it fills genes left without a symbol, or with a symbol outside the reference nomenclature kept for lack of a reference ortholog (`foreign_kept`), as `ortholog_fill`. It never replaces a supported core symbol; where the two differ the gene is listed with decision `kept`.
+- Every supported core symbol is compared with the ortholog symbol, and the agreement rate is reported as a check of both (former names of the same reference gene count as agreement).
+
+A gene that takes an ortholog symbol and has no product, or whose product was the reference protein's name of the replaced symbol, takes the reference protein's name of the new symbol when it is a reference symbol, else the relatives' most frequent product (`product_note` `ortholog`).
+
+`--ortholog-symbol fill` is the earlier behaviour: no influence on the vote, fills only. `off` records the orthologs and the checks without changing a symbol.
 
 **Reference nomenclature.** Before they are compared, the relatives' symbols are put in the reference nomenclature in the same way as hit symbols: each relative gene's NCBI GeneID (from its GFF3) is mapped through NCBI gene_orthologs to its ortholog in the reference species, whose symbol is used (with a human reference, mouse `Zfp558` and vole `Znf558` both become `ZNF558`). A gene without a reference ortholog keeps its own symbol. The per-gene report shows both forms (`XP_006509297.1:Zfp558>ZNF558`). `--no-resolve-orthologs` turns this off as it does for hits.
 
@@ -595,10 +619,10 @@ Outputs:
 
 | Where | Content |
 |-------|---------|
-| gene table | `orthogroup`, `relative_orthologs` (`Microtus_pennsylvanicus:Avp(1:1);...`), `ortholog_symbol` (the agreed one-to-one symbol, used or not) |
+| gene table | `orthogroup`, `relative_orthologs` (`Microtus_pennsylvanicus:Avp(1:1);...`), `ortholog_symbol` (the agreed one-to-one symbol, used or not), `ortholog_support` (`close` or `distant`) |
 | annotated GFF3 | `goannotate_orthogroup`, `goannotate_ortholog_symbol` on the gene |
-| `reports/{prefix}_orthology.tsv` | per gene: symbol and status, orthogroup, agreed symbol and agreement, the symbol it replaced, and per relative the ortholog type and orthologs with their symbols |
-| `reports/{prefix}_orthology_relatives.tsv` | every candidate relative examined and, for those used, genes used and query genes with one-to-one and any orthologs |
+| `reports/{prefix}_orthology.tsv` | per gene: symbol and status, orthogroup, ortholog symbol with its agreement and support (close or distant), the decision (`confirmed`, `refined`, `taken`, `conflict_kept`, `filled`, `kept`, `recorded`, `none`), the close relatives' own form, the core's previous symbol when one was taken or filled, and per relative the ortholog type and orthologs with their symbols |
+| `reports/{prefix}_orthology_relatives.tsv` | every candidate relative examined with its common ancestor with the query species and closeness, and, for those used, genes used and query genes with one-to-one and any orthologs |
 | `intermediate/{prefix}_orthology/` | OrthoFinder input and results, its log, and the downloaded annotations |
 
 ### interproscan: domains, InterPro GO terms and domain-based names
@@ -631,9 +655,9 @@ cd "$D" && rmdir .download
 
 The member-database versions for an InterPro release are listed in `interpro/<release>/databases.json`. The data must be in place before GOAnnotate runs: InterProScan 6.0.3.0 can download missing data itself, but its download of databases that share a directory (PROSITE patterns and profiles, CATH-Gene3D and CATH-FunFam) can start a search on an empty directory. GOAnnotate therefore checks that every analysis has its data and does not run InterProScan otherwise.
 
-**Running.** `--modules interproscan --interproscan-workflow /path/to/InterProScan --interproscan-datadir /path/to/InterProScan_data`. GOAnnotate writes the cleaned proteins to `intermediate/{prefix}_interproscan/` and runs Nextflow there (its `work/` directory, logs and run cache stay with the GOAnnotate output; `work/` is deleted after a successful run unless `--interproscan-keep-work` is given), with `--goterms`, the pinned InterPro release, `-resume` (an interrupted run reuses its finished tasks), `--max-workers` set to half of `--threads` (some analyses are multi-threaded; `--interproscan-workers` sets it), and the container profile found (`--interproscan-profile`). Results are reused by later runs into the same output directory. By default InterProScan first looks up precalculated matches at EBI for proteins already in UniParc, sending only sequence checksums; proteins not found are analysed locally. `--interproscan-local` runs every analysis locally (on the 103 test proteins of InterProScan: 7 minutes against 2). `--nxf-home` moves Nextflow's own files out of `~/.nextflow`.
+**Running.** `--modules interproscan --interproscan-workflow /path/to/InterProScan --interproscan-datadir /path/to/InterProScan_data`. GOAnnotate writes the cleaned proteins to `intermediate/{prefix}_interproscan/` and runs Nextflow there (its `work/` directory, logs and run cache stay with the GOAnnotate output; `work/` is deleted after a successful run unless `--interproscan-keep-work` is given), with `--goterms`, the pinned InterPro release, `-resume` (an interrupted run reuses its finished tasks), `--max-workers` set to `--threads` (`--interproscan-workers` sets it), and the container profile found (`--interproscan-profile`). `--max-workers` is the CPU budget of Nextflow's local executor. Most InterProScan tasks request one CPU; GOAnnotate passes a small configuration (`goannotate_resources.config` in the same directory) that gives the multi-threaded MobiDB-lite step 4 CPUs and, with Docker or Podman, limits each task's container to the CPUs it requested, so the load stays within `--threads`. Results are reused by later runs into the same output directory. By default InterProScan first looks up precalculated matches at EBI for proteins already in UniParc, sending only sequence checksums; proteins not found are analysed locally. `--interproscan-local` runs every analysis locally (on the 103 test proteins of InterProScan: 7 minutes against 2). `--nxf-home` moves Nextflow's own files out of `~/.nextflow`.
 
-**GO terms (`--interpro-go`).** With `add` (default) the GO terms of a gene's InterPro entries join the terms from its hits, and the most specific terms are recomputed: a term the gene already has, or an ancestor of one of its terms, adds nothing, and a more specific InterPro term replaces its ancestor. Terms outside `--namespace`, root terms and terms excluded by the taxon constraints are not added. With `fill` only genes without GO terms from their hits receive them. InterPro terms carry evidence code IEA; `reports/{prefix}_go_evidence.tsv` gives each term's source (`hits`, `interpro` or `hits+interpro`) and the InterPro entries behind it.
+**GO terms (`--interpro-go`).** With `add` (default) the GO terms of a gene's InterPro entries join the terms from its hits, and the most specific terms are recomputed: a term the gene already has, or an ancestor of one of its terms, adds nothing, and a more specific InterPro term replaces its ancestor. Terms outside `--namespace`, root terms and terms excluded by the taxon constraints are not added. With `fill` only genes without GO terms from their hits receive them. InterPro terms carry evidence code IEA; `reports/{prefix}_go_evidence.tsv` gives each term's source (`hits`, `reference`, `interpro`, or combinations such as `hits+interpro`) and the InterPro entries behind it.
 
 **Products (`--interpro-products`).** A coding gene without a product after the hit-based annotation is named from the InterPro entries of type Domain (then Repeat) of its longest protein, in order of position, at most two: `uncharacterized EGF-like domain-containing protein`, `uncharacterized EGF-like and protein kinase domain-containing protein`, `uncharacterized WD40 repeat-containing protein`. Genes with a product are not changed; family and superfamily entries do not give names. Such genes are marked `interpro_domain` in the evidence table's `product_note`.
 
@@ -731,13 +755,13 @@ python3 tests/validate_extraction.py --gff3 Annotations.gff3 --genome Genome.fas
 | File | Description |
 |------|-------------|
 | `GOAnnotate.py` | Wrapper script; runs the package from a checkout |
-| `goannotate/` | The package: `cli.py`, `pipeline.py`, `gff3.py`, `sequences.py`, `search.py`, `blast.py`, `filters.py`, `annotate.py`, `assign.py`, `reference.py`, `go.py`, `taxon.py`, `mappings.py`, `compare.py`, `output.py`, `models.py` |
+| `goannotate/` | The package: `cli.py`, `pipeline.py`, `gff3.py`, `sequences.py`, `search.py`, `blast.py`, `filters.py`, `annotate.py`, `assign.py`, `refgo.py` (GO terms from the reference gene), `reference.py`, `go.py`, `taxon.py`, `mappings.py`, `compare.py`, `output.py`, `models.py` |
 | `goannotate/modules/` | Optional modules: `base.py` (framework), `signalp.py`, `orthology.py`, `interproscan.py` |
 | `goannotate/data/bad_names.txt` | Default name, symbol and product patterns |
 | `goannotate/data/stop_words.txt` | Default stop words for the name similarity |
 | `build_databases.py` | Database download and build script |
 | `clean_gff3.py` | GFF3 ID cleanup utility |
-| `tests/test_annotation_rules.py` | Checks of the coverage filter, word weighting, GO evidence, taxon constraints, product rules and symbol policy on small inputs |
+| `tests/test_annotation_rules.py` | Checks of the coverage filter, word weighting, GO evidence, taxon constraints, ortholog symbols in the vote, reference-gene GO terms, product rules and symbol policy on small inputs |
 | `tests/test_modules.py` | Checks of the module framework and the SignalP module with a stand-in `signalp6` script |
 | `tests/test_interproscan.py` | Checks of the InterProScan module with a stand-in `nextflow` script and a miniature InterPro data directory |
 | `tests/test_orthology.py` | Checks of the orthology module with stand-in `datasets` and `orthofinder` scripts and a miniature taxonomy |

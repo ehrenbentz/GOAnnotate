@@ -250,21 +250,23 @@ def write_go_evidence(annotations: dict, go_hierarchy, path: Path, forbidden_go:
     n_rows = n_removed = 0
     with open(path, "w") as f:
         f.write("gene_id\tgo_id\tname\tnamespace\tstatus\tevidence_codes\tevidence_class\tn_hits\tsource\t"
-                "interpro_entries\tconstraint\n")
+                "interpro_entries\treference_proteins\tconstraint\n")
         for gene_id, annot in sorted(annotations.items()):
             for t in sorted(annot.specific_go_terms):
                 codes = annot.go_evidence.get(t, "")
                 cls = best_evidence_class(set(codes.split(",")) if codes else set())
                 from_ipr = annot.go_interpro.get(t)
+                from_ref = annot.go_reference.get(t)
                 from_hits = annot.go_support.get(t, 0) > 0
-                source = "+".join(s for s, ok in (("hits", from_hits), ("interpro", bool(from_ipr))) if ok)
+                source = "+".join(s for s, ok in (("hits", from_hits), ("reference", bool(from_ref)),
+                                                  ("interpro", bool(from_ipr))) if ok)
                 f.write(f"{gene_id}\t{t}\t{go_hierarchy.names.get(t, '')}\t{go_hierarchy.namespace.get(t, '')}\t"
                         f"specific\t{codes}\t{cls}\t{annot.go_support.get(t, '') if from_hits else ''}\t{source}\t"
-                        f"{','.join(from_ipr) if from_ipr else ''}\t\n")
+                        f"{','.join(from_ipr) if from_ipr else ''}\t{','.join(from_ref) if from_ref else ''}\t\n")
                 n_rows += 1
             for t in sorted(annot.go_taxon_removed):
                 f.write(f"{gene_id}\t{t}\t{go_hierarchy.names.get(t, '')}\t{go_hierarchy.namespace.get(t, '')}\t"
-                        f"removed_taxon\t\t\t\t\t\t{forbidden_go.get(t, '')}\n")
+                        f"removed_taxon\t\t\t\t\t\t\t{forbidden_go.get(t, '')}\n")
                 n_removed += 1
     logger.info(f"  {n_rows:,} gene-term rows" + (f", {n_removed:,} removed by the taxon constraints" if n_removed else ""))
 
@@ -760,7 +762,7 @@ def write_summary(output_dir: Path, prefix: str, annotations: dict, args, blast_
                   universe: GeneUniverse = None, extraction=None, gff_stats=None, comparison: dict = None,
                   search_results: str = None, assignment: dict = None, protein_check=None,
                   coverage=None, forbidden_go: dict = None, product_audit: dict = None,
-                  word_weights=None, modules: list = None) -> None:
+                  word_weights=None, modules: list = None, reference_go: dict = None) -> None:
     stats_file = output_dir / f"{prefix}_summary.txt"
     logger.info(f"Writing summary to {stats_file}")
 
@@ -924,7 +926,9 @@ def write_summary(output_dir: Path, prefix: str, annotations: dict, args, blast_
             f.write("Symbol checks against the reference proteome:\n")
             f.write("-" * 70 + "\n")
             f.write(f"  Reciprocal best hits:             {assignment.get('rbh_total', 0):,}\n")
-            f.write(f"  Vote confirmed by RBH:            {assignment.get('rbh', 0):,}\n")
+            f.write(f"  Vote confirmed by RBH:            {assignment.get('rbh', 0):,}"
+                    + (f" ({assignment['rbh_same_gene_form']:,} voted in a copy form of the RBH symbol: adgrl1a for ADGRL1)"
+                       if assignment.get('rbh_same_gene_form') else "") + "\n")
             f.write(f"  RBH replaced the vote:            {assignment.get('rbh_override', 0):,}\n")
             f.write(f"  RBH named an unnamed gene:        {assignment.get('rbh_added', 0):,}\n")
             f.write(f"  Vote supported by sequence:       {assignment.get('vote_supported', 0):,}\n")
@@ -946,6 +950,16 @@ def write_summary(output_dir: Path, prefix: str, annotations: dict, args, blast_
             if "secondary_symbols" in assignment:
                 f.write(f"  Secondary symbols ({assignment.get('secondary_reference', '')}): "
                         f"{assignment['secondary_symbols']:,} genes\n")
+            if assignment.get("secondary_names"):
+                f.write(f"  Products from the secondary reference: {assignment['secondary_names']:,} genes "
+                        f"(the primary reference name is used by none of their hits)\n")
+            if "reference_name_used" in assignment or "reference_name_not_supported" in assignment:
+                f.write(f"  Reference names of confirmed symbols: {assignment.get('reference_name_used', 0):,} used, "
+                        f"{assignment.get('reference_name_not_supported', 0):,} left to the hits' name (a reference "
+                        f"species' own gene name that curated entries of other species do not use)\n")
+            if assignment.get("established_preferred"):
+                f.write(f"  Established gene preferred (PE=1 over weaker evidence): "
+                        f"{assignment['established_preferred']:,}\n")
             if "designators_stripped" in assignment:
                 f.write(f"  Paralog designators stripped:     {assignment['designators_stripped']:,} products\n")
             f.write(f"  Distinct symbols:                 {n_distinct:,} on {with_gene_symbol:,} genes\n\n")
@@ -972,6 +986,14 @@ def write_summary(output_dir: Path, prefix: str, annotations: dict, args, blast_
             genes_removed = sum(1 for a in annotations.values() if a.go_taxon_removed)
             f.write(f"  Removed by taxon constraints:     {n_removed:,} assignments on {genes_removed:,} genes "
                     f"(reports/{prefix}_go_evidence.tsv)\n")
+        if reference_go:
+            if reference_go.get("mode") == "off":
+                f.write("  From the reference gene:          off (--reference-go off)\n")
+            else:
+                f.write(f"  From the reference gene ({reference_go.get('mode')}):    "
+                        f"{reference_go.get('terms_added', 0):,} specific terms added to "
+                        f"{reference_go.get('genes_added', 0):,} genes ({reference_go.get('genes_only_reference', 0):,} "
+                        f"had none from hits); {reference_go.get('genes_eligible', 0):,} genes carry a reference symbol\n")
         f.write("\n")
 
         if modules:
@@ -992,17 +1014,19 @@ def write_summary(output_dir: Path, prefix: str, annotations: dict, args, blast_
                 f.write(f"  {n:>8,}  {rule}\n")
             f.write("\n")
 
-        name_concs = [a.name_concordance for a in annotations.values() if a.consensus_name]
-        sym_concs = [a.symbol_concordance for a in annotations.values() if a.consensus_symbol]
+        name_concs = [a.name_concordance for a in annotations.values() if a.consensus_name and a.hits]
+        sym_concs = [a.symbol_concordance for a in annotations.values() if a.consensus_symbol and a.hits]
         if name_concs or sym_concs:
-            f.write("Concordance Statistics:\n")
+            f.write("Concordance of the final annotation with each gene's hits:\n")
             f.write("-" * 70 + "\n")
+            f.write("  (name: hits whose name matches the product; symbol: hits with a symbol that name the same gene;\n"
+                    "   genes without hits are not included)\n")
             if name_concs:
-                f.write(f"  Name concordance:   mean={statistics.mean(name_concs):.2f}, "
+                f.write(f"  Name concordance:   {len(name_concs):,} genes, mean={statistics.mean(name_concs):.2f}, "
                         f"median={statistics.median(name_concs):.2f}, "
                         f"min={min(name_concs):.2f}, max={max(name_concs):.2f}\n")
             if sym_concs:
-                f.write(f"  Symbol concordance: mean={statistics.mean(sym_concs):.2f}, "
+                f.write(f"  Symbol concordance: {len(sym_concs):,} genes, mean={statistics.mean(sym_concs):.2f}, "
                         f"median={statistics.median(sym_concs):.2f}, "
                         f"min={min(sym_concs):.2f}, max={max(sym_concs):.2f}\n")
             f.write("\n")

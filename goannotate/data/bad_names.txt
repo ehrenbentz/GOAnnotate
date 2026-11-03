@@ -134,6 +134,11 @@ identifier_regex:\bDKFZ[pP]\d{3,}[A-Z]\d+\b
 identifier_regex:\bBC\d{6}\b
 identifier_regex:\bIMAGE:\d+\b
 identifier_regex:\bclone[: ]\S+
+# cDNA clone names of the Berkeley Drosophila Genome Project used as protein names in UniProt
+# (LD33793p, RH60221p, GH18717p, MIP05919p, FI18136p1, GEO02646p1, bcDNA.GH11023): the clone
+# library code, the clone number and 'p' (with a version number), or the bcDNA. prefix
+identifier_regex:\b[A-Z]{2,4}\d{4,6}p\d*\b
+identifier_regex:\bbcDNA[.:]\S+
 
 # Chromosome open reading frame names, a position in one genome
 # (C6orf89, CXorf38, "C1orf122 homolog", chicken-style "C2H1orf43")
@@ -217,6 +222,11 @@ placeholder:domain protein
 placeholder:domain-containing protein
 placeholder:domain containing protein
 placeholder:family protein
+# what remains of "Protein LOC100123-like protein", "Protein CG4768-like protein" or "Protein, protein"
+# once the identifier is removed
+placeholder:protein like protein
+placeholder:like protein
+placeholder:protein protein
 placeholder:family member
 placeholder:repeat-containing protein
 placeholder:repeat protein
@@ -270,6 +280,7 @@ regex:^[A-Z]{2,4}\d{4,}[a-z]? protein$
 regex:^[A-Z]{2,4}\d{4,}$
 regex:^[A-Za-z]+_\d+_[A-Za-z]+$
 regex:^orf\d+$
+regex:^protein[ ,-]*like protein(?: \d+[a-z]?)?$
 regex:^\d+$
 
 # =============================================================================

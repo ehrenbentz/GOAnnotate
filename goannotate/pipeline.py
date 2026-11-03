@@ -7,7 +7,8 @@ from pathlib import Path
 
 from goannotate import GOAnnotateError
 from goannotate import annotate as annotate_mod
-from goannotate import assign, blast, compare, gff3, mappings, modules, output, reference, search, sequences, taxon
+from goannotate import (assign, blast, compare, gff3, mappings, modules, output, refgo, reference, search,
+                        sequences, taxon)
 from goannotate.filters import BadNameFilter, NameAudit, write_name_audit
 from goannotate.go import GOHierarchy, resolve_go_obo
 
@@ -200,6 +201,28 @@ def run(args) -> None:
     if universe.coding:
         coding_gene_ids = {g for g, c in universe.coding.items() if c}
 
+    ############################################################
+    # Stage 2b: modules that run before the vote (orthology)
+    ############################################################
+    # The orthology module runs OrthoFinder now, so that the relatives'
+    # ortholog symbols can steer the vote; it is integrated after Stage 3b.
+    selected = modules.select_modules(args)
+    modules_auto = (args.modules or "").strip().lower() == "auto"
+    early_modules = []
+    ortholog_prior = {}
+    ctx = None
+    if selected:
+        ctx = modules.ModuleContext(
+            query_fasta=Path(query_fasta), search_mode=search_mode, work_dir=work_dir,
+            reports_dir=reports_dir, prefix=prefix, threads=args.threads or 0,
+            force=getattr(args, "force_modules", False), universe=universe, genes=genes,
+            annotations={}, go_hierarchy=go_hierarchy, forbidden_go=set(forbidden_go),
+            namespaces=list(args.namespace), bad_name_filter=bad_name_filter,
+            symbol_case_fn=lambda s: annotate_mod.format_symbol(s, args.symbol_case))
+        early_modules = modules.start_modules([m for m in selected if m.runs_before_vote], ctx, auto=modules_auto)
+        for m in early_modules:
+            ortholog_prior.update(m.prior())
+
     annotations = annotate_mod.annotate_queries(
         resolved_transcript_hits=resolved_hits,
         transcript_to_gene=universe.transcript_to_gene,
@@ -219,12 +242,15 @@ def run(args) -> None:
         forbidden_go=set(forbidden_go),
         go_iea_min_hits=getattr(args, "go_iea_min_hits", 1),
         coverage_status=coverage_status if coverage.active else None,
+        ortholog_prior=ortholog_prior,
+        reference_taxid=str(args.reference_taxid),
     )
 
     ############################################################
     # Stage 3b: genome-wide symbol assignment (reciprocal best hits)
     ############################################################
     assignment = None
+    ref_symbols, ref_descriptions = {}, {}
     if args.no_reciprocal:
         logger.info("Reciprocal best-hit assignment disabled (--no-reciprocal)")
     elif search_mode != "blastp":
@@ -266,7 +292,8 @@ def run(args) -> None:
             min_coverage=args.symbol_min_coverage, symbol_policy=getattr(args, "symbol_policy", "ortholog"),
             nomenclature=nomenclature, drop_unmatched=getattr(args, "drop_unmatched_symbols", False),
             min_query_coverage=getattr(args, "symbol_min_query_coverage", 0.8),
-            rbh_margin=getattr(args, "rbh_margin", 0.9))
+            rbh_margin=getattr(args, "rbh_margin", 0.9), existence=assign.read_reference_existence(ref_proteome),
+            name_threshold=args.consensus_threshold)
         if not getattr(args, "keep_paralog_designators", False):
             assignment.update(assign.strip_paralog_designators(
                 annotations, ref_descriptions, bad_name_filter.normalize_for_comparison))
@@ -284,7 +311,9 @@ def run(args) -> None:
                 sec_proteome = assign.build_reference_proteome(
                     args.diamond_swissprot, str(sec), work_dir / f"{prefix}_secondary_{sec}_proteome.faa",
                     args.diamond_bin, trembl_db=args.diamond_trembl)
-            sec_symbols, _ = assign.read_reference_symbols(sec_proteome)
+            sec_symbols, sec_descriptions = assign.read_reference_symbols(sec_proteome)
+            sec_descriptions = {sym: bad_name_filter.clean_name(desc) for sym, desc in sec_descriptions.items()}
+            sec_descriptions = {sym: d for sym, d in sec_descriptions.items() if d and not bad_name_filter.is_bad_name(d)}
             sec_symbols = {acc: s for acc, s in sec_symbols.items() if not bad_name_filter.is_bad_symbol(s)}
             sec_forward, sec_reverse = assign.run_reciprocal_searches(
                 Path(query_fasta), sec_proteome, work_dir, f"{prefix}_secondary_{sec}",
@@ -299,24 +328,29 @@ def run(args) -> None:
                 min_query_coverage=getattr(args, "symbol_min_query_coverage", 0.8),
                 rbh_margin=getattr(args, "rbh_margin", 0.9)))
             assignment["secondary_reference"] = f"{reference.label(sec)} ({sec})"
+            assignment.update(assign.secondary_names(annotations, sec_descriptions, ref_descriptions,
+                                                     name_threshold=args.consensus_threshold))
 
     assign.add_symbol_aliases(annotations, nomenclature, bad_name_filter.is_bad_symbol,
                               symbol_case_fn=lambda s: annotate_mod.format_symbol(s, args.symbol_case))
 
     ############################################################
-    # Stage 3c: optional modules (SignalP, ...)
+    # Stage 3c: ortholog symbols, reference-gene GO terms, other modules
     ############################################################
     modules_run = []
-    selected = modules.select_modules(args)
-    if selected:
-        ctx = modules.ModuleContext(
-            query_fasta=Path(query_fasta), search_mode=search_mode, work_dir=work_dir,
-            reports_dir=reports_dir, prefix=prefix, threads=args.threads or 0,
-            force=getattr(args, "force_modules", False), universe=universe, genes=genes,
-            annotations=annotations, go_hierarchy=go_hierarchy, forbidden_go=set(forbidden_go),
-            namespaces=list(args.namespace), bad_name_filter=bad_name_filter,
-            symbol_case_fn=lambda s: annotate_mod.format_symbol(s, args.symbol_case))
-        modules_run = modules.run_modules(selected, ctx, auto=(args.modules or "").strip().lower() == "auto")
+    if ctx is not None:
+        ctx.annotations = annotations
+        ctx.reference_descriptions = ref_descriptions
+        modules_run = modules.integrate_modules(early_modules, ctx)
+    reference_go = refgo.add_reference_go(
+        annotations, ref_symbols, args.db, go_hierarchy, set(forbidden_go), list(args.namespace),
+        evidence_policy=getattr(args, "go_evidence", "all"), mode=getattr(args, "reference_go", "add"))
+    if ctx is not None:
+        modules_run += modules.run_modules([m for m in selected if not m.runs_before_vote], ctx, auto=modules_auto)
+
+    # Concordance of the final symbols and products with each gene's hits, and
+    # the confidence recomputed from it (with the orthology evidence)
+    annotate_mod.final_concordance(annotations, consensus_threshold=args.consensus_threshold)
 
     ############################################################
     # Stage 4: comparison with existing annotation
@@ -378,7 +412,7 @@ def run(args) -> None:
                          comparison=comparison, search_results=str(results_path),
                          assignment=assignment, protein_check=protein_check,
                          coverage=coverage, forbidden_go=forbidden_go, product_audit=product_audit,
-                         word_weights=word_weights, modules=selected)
+                         word_weights=word_weights, modules=selected, reference_go=reference_go)
 
 
 # Files of the earlier output layout (everything at the top level)

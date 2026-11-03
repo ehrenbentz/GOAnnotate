@@ -160,6 +160,52 @@ def lineage_sqlite(db_path: str, taxid: int) -> list:
     return lineage
 
 
+def lineage_nodes_sqlite(db_path: str, taxid: int) -> list:
+    """[(tax_id, rank, name)] from the query taxon up to the root (taxonomy_nodes); [] when unavailable."""
+    import sqlite3
+    lineage = lineage_sqlite(db_path, taxid)
+    if not lineage:
+        return []
+    conn = sqlite3.connect(db_path)
+    columns = {r[1] for r in conn.execute("PRAGMA table_info(taxonomy_nodes)")}
+    out = []
+    for t in lineage:
+        if "rank" in columns:
+            row = conn.execute("SELECT rank, name FROM taxonomy_nodes WHERE tax_id = ?", (t,)).fetchone()
+        else:
+            row = conn.execute("SELECT 'no rank', name FROM taxonomy_nodes WHERE tax_id = ?", (t,)).fetchone()
+        out.append((t, (row[0] if row else "no rank") or "no rank", (row[1] if row else "") or ""))
+    conn.close()
+    return out
+
+
+# Ranks from the species upward, for the closeness of a relative (orthology module)
+RANK_ORDER = ["subspecies", "species", "species group", "subgenus", "genus", "subtribe", "tribe", "subfamily",
+              "family", "superfamily", "parvorder", "infraorder", "suborder", "order", "superorder", "infraclass",
+              "subclass", "class", "superclass", "subphylum", "phylum", "kingdom", "superkingdom", "domain"]
+
+
+def lca_rank(query_nodes: list, relative_nodes: list) -> tuple:
+    """
+    (rank, name) of the lowest common ancestor of two lineages given as
+    [(tax_id, rank, name)]; an unranked ancestor takes the rank of the first
+    ranked node above it. ('', '') without a common node.
+    """
+    relative_ids = {t for t, _, _ in relative_nodes}
+    for i, (t, rank, name) in enumerate(query_nodes):
+        if t in relative_ids:
+            for _, r, n in query_nodes[i:]:
+                if r in RANK_ORDER:
+                    return r, name
+            return rank, name
+    return "", ""
+
+
+def rank_within(rank: str, limit: str) -> bool:
+    """True when rank is limit or a lower rank (genus is within family); unknown ranks are not."""
+    return rank in RANK_ORDER and limit in RANK_ORDER and RANK_ORDER.index(rank) <= RANK_ORDER.index(limit)
+
+
 def taxon_name_sqlite(db_path: str, taxid: int) -> str:
     import sqlite3
     conn = sqlite3.connect(db_path)

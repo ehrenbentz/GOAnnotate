@@ -2,14 +2,16 @@
 
 Modules are selected with --modules (names below, or auto for every module
 whose tool is found). Each adds columns to the annotation tables,
-attributes to the annotated GFF3 and a report; none changes the core
-symbol, product or GO assignment.
+attributes to the annotated GFF3 and a report. A module with
+runs_before_vote (orthology) runs before the Diamond vote and may steer it
+(prior()) and change symbols afterwards; the others run after the core's
+symbol assignment and add to it.
 """
 
 import logging
 import time
 
-from goannotate.modules.base import Module, ModuleContext, ModuleError, ToolStatus
+from goannotate.modules.base import Module, ModuleContext, ModuleError, ModuleSkipped, ToolStatus
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +71,46 @@ def detect_all(args) -> list:
     return statuses
 
 
+def _start(module: Module, ctx: ModuleContext, auto: bool) -> bool:
+    """Detect and run one module; False when it was skipped or failed (reason in skipped_reason)."""
+    status = module.detect()
+    if module.needs_proteins and ctx.search_mode != "blastp":
+        module.skipped_reason = "needs protein queries (nucleotide input)"
+        logger.info(f"Module {module.name} skipped: {module.skipped_reason}")
+        return False
+    if not status.available:
+        module.skipped_reason = status.reason
+        if auto:
+            logger.info(f"Module {module.name} not run: {status.reason}")
+        else:
+            logger.warning(f"Module {module.name} requested but not available: {status.reason}")
+        return False
+    logger.info(f"Module {module.name}: {status.describe()}")
+    module._t0 = time.time()
+    try:
+        module.run(ctx)
+    except ModuleSkipped as e:
+        module.skipped_reason = str(e)
+        logger.warning(f"Module {module.name} not run: {e}")
+        return False
+    except ModuleError as e:
+        module.skipped_reason = str(e)
+        logger.error(f"Module {module.name} failed: {e}")
+        return False
+    return True
+
+
+def _finish(module: Module, ctx: ModuleContext) -> bool:
+    try:
+        module.integrate(ctx)
+    except ModuleError as e:
+        module.skipped_reason = str(e)
+        logger.error(f"Module {module.name} failed: {e}")
+        return False
+    logger.info(f"Module {module.name} done in {(time.time() - module._t0) / 60:.1f} min")
+    return True
+
+
 def run_modules(modules: list, ctx: ModuleContext, auto: bool = False) -> list:
     """
     Detect, run and integrate each module in turn. A module whose tool is
@@ -76,33 +118,18 @@ def run_modules(modules: list, ctx: ModuleContext, auto: bool = False) -> list:
     module that fails is reported and skipped; the pipeline continues.
     Returns the modules that ran.
     """
-    ran = []
-    for module in modules:
-        status = module.detect()
-        if module.needs_proteins and ctx.search_mode != "blastp":
-            module.skipped_reason = "needs protein queries (nucleotide input)"
-            logger.info(f"Module {module.name} skipped: {module.skipped_reason}")
-            continue
-        if not status.available:
-            module.skipped_reason = status.reason
-            if auto:
-                logger.info(f"Module {module.name} not run: {status.reason}")
-            else:
-                logger.warning(f"Module {module.name} requested but not available: {status.reason}")
-            continue
-        logger.info(f"Module {module.name}: {status.describe()}")
-        t0 = time.time()
-        try:
-            module.run(ctx)
-            module.integrate(ctx)
-        except ModuleError as e:
-            module.skipped_reason = str(e)
-            logger.error(f"Module {module.name} failed: {e}")
-            continue
-        logger.info(f"Module {module.name} done in {(time.time() - t0) / 60:.1f} min")
-        ran.append(module)
-    return ran
+    return [m for m in modules if _start(m, ctx, auto) and _finish(m, ctx)]
 
 
-__all__ = ["Module", "ModuleContext", "ModuleError", "ToolStatus", "registry", "parse_selection",
-           "select_modules", "detect_all", "run_modules"]
+def start_modules(modules: list, ctx: ModuleContext, auto: bool = False) -> list:
+    """Detect and run (not integrate) the modules that run before the vote; returns those that ran."""
+    return [m for m in modules if _start(m, ctx, auto)]
+
+
+def integrate_modules(modules: list, ctx: ModuleContext) -> list:
+    """Integrate modules started with start_modules once the annotations exist; returns those that completed."""
+    return [m for m in modules if _finish(m, ctx)]
+
+
+__all__ = ["Module", "ModuleContext", "ModuleError", "ModuleSkipped", "ToolStatus", "registry", "parse_selection",
+           "select_modules", "detect_all", "run_modules", "start_modules", "integrate_modules"]

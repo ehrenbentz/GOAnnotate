@@ -12,9 +12,8 @@ SignalP reads only the first 70 residues of a protein, so:
     copied to every transcript that shares it (isoforms often do);
   - the input is split into chunks run as parallel signalp6 processes with
     one PyTorch thread each, one process per physical core (limited by
-    --threads and by available memory). On a 32-core machine this was the
-    fastest arrangement measured (15 proteins/s against 9.6 for one process
-    with 32 threads), with identical predictions.
+    --threads and by available memory), which is faster than one process
+    with many threads and gives identical predictions.
 
 Optionally (--signalp-alt-starts), transcripts without a signal peptide at
 their annotated start are checked for one at an internal methionine within
@@ -38,9 +37,9 @@ logger = logging.getLogger(__name__)
 
 SP_WINDOW = 70             # residues SignalP 6 reads (signalp/utils.py: x[:70])
 ALT_START_WINDOW = 60      # internal methionines considered for the alternative-start check
-BATCH_SIZE = 100           # SignalP --bsize; 10 (its default) was 1.8 times slower on CPU
+BATCH_SIZE = 100           # SignalP --bsize; larger than its default (10), which is slower on CPU
 PROGRESS_INTERVAL = 60     # seconds between progress lines in the GOAnnotate log
-# Memory per signalp6 process: fast measured at about 2.4 GB; slow needs more
+# Memory per signalp6 process: fast about 2.4 GB; slow more
 # than 14 GB (SignalP documentation); slow-sequential uses the memory of fast.
 MEMORY_PER_PROCESS_GB = {"fast": 2.5, "slow-sequential": 2.5, "slow": 16.0}
 DOWNLOAD_PAGE = "https://services.healthtech.dtu.dk/services/SignalP-6.0/"
@@ -129,9 +128,8 @@ def parse_prediction_results(path: Path) -> dict:
 
 
 CORE_LENGTH = 8           # hydrophobic-core window
-CORE_MIN_HYDROPHOBIC = 6  # of CORE_LENGTH residues. Calibrated on the prairie vole: 97.8% of the
-                          # signal peptides SignalP calls at annotated starts pass from their own Met
-                          # (7 of 8: 82.3%, missing cores with S, T or N such as MFQLLLLSNLLW)
+CORE_MIN_HYDROPHOBIC = 6  # of CORE_LENGTH residues; nearly all signal peptides SignalP calls at
+                          # annotated starts pass from their own Met (7 of 8 misses cores with S, T or N)
 
 
 def hydrophobic_core(seq: str) -> bool:
@@ -150,7 +148,7 @@ def alternative_starts(seq: str, window: int = ALT_START_WINDOW) -> list:
     0-based positions of every internal methionine within the first window
     residues that is followed by a hydrophobic core. Every one is tested:
     taking only the first lets an earlier Met without a signal peptide hide
-    a later one with it (16 vole proteins).
+    a later one with it.
     """
     return [i for i in range(1, min(window, len(seq))) if seq[i] == "M" and hydrophobic_core(seq[i:])]
 
