@@ -333,6 +333,8 @@ class OrthologyModule(Module):
         self.taxid = getattr(args, "taxid", None)
         self.db = getattr(args, "db", None)
         self.with_same_species = getattr(args, "same_species", False)
+        self.go_evidence = getattr(args, "go_evidence", "all")
+        self.go_support_stats = {}
         self.same = None                    # Relative: the query species' own annotation
         self.candidates = []                # every Relative examined
         self.relatives = []                 # chosen Relatives
@@ -854,6 +856,87 @@ class OrthologyModule(Module):
                 own, own_how = agreed_symbol(owns)
                 if own:
                     self.gene_own[gene] = own
+
+    def ortholog_go_support(self, ctx: ModuleContext) -> None:
+        """
+        GO support from the close relatives' one-to-one orthologs: each close relative (and the
+        same-species annotation) whose ortholog's UniProt entries (NCBI GeneID -> UniProt accessions
+        -> GO annotations, under --go-evidence) carry a term, or a more specific one, counts as one
+        supporting source for that term in annot.go_ortholog_support. Entries that are already among
+        the gene's GO source hits are not counted twice. Called by the pipeline once every source of
+        GO terms has been added, before annotate.filter_weak_go.
+        """
+        if not self.db or ctx.go_hierarchy is None:
+            return
+        import sqlite3
+        from goannotate import mappings
+        from goannotate.annotate import _with_ancestors
+        rel_by_label = {r.label: r for r in self.relatives}
+        if self.same:
+            rel_by_label[self.same.label] = self.same
+        wanted = {}                      # query gene -> [GeneID per close relative]
+        for gene, by_rel in self.orthologs.items():
+            if gene not in ctx.annotations:
+                continue
+            ids = []
+            for label, (kind, named) in by_rel.items():
+                rel = rel_by_label.get(label)
+                if kind != "1:1" or rel is None or not (rel.close or rel is self.same):
+                    continue
+                geneid = rel.proteins.get(named[0][0], _NO_GENE).geneid
+                if geneid:
+                    ids.append(geneid)
+            if ids:
+                wanted[gene] = ids
+        all_ids = sorted({g for ids in wanted.values() for g in ids})
+        if not all_ids:
+            return
+        accs_by_gene = {}
+        conn = sqlite3.connect(f"file:{self.db}?mode=ro", uri=True)
+        try:
+            if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_ncbi_idmapping_gene'").fetchone():
+                logger.info("  Ortholog GO support skipped: the database has no GeneID index on ncbi_idmapping "
+                            "(build it with: sqlite3 DB 'CREATE INDEX idx_ncbi_idmapping_gene ON ncbi_idmapping(gene_id)', "
+                            "or rebuild the idmapping tables with build_databases.py)")
+                return
+            for i in range(0, len(all_ids), 900):
+                chunk = all_ids[i:i + 900]
+                q = f"SELECT gene_id, uniprot_acc FROM ncbi_idmapping WHERE gene_id IN ({','.join('?' * len(chunk))})"
+                for gid, acc in conn.execute(q, chunk):
+                    accs_by_gene.setdefault(gid, set()).add(acc)
+        finally:
+            conn.close()
+        accessions = set().union(*accs_by_gene.values()) if accs_by_gene else set()
+        if not accessions:
+            return
+        go_map = mappings.load_go_mapping_sqlite(self.db, accession_filter=accessions, evidence_policy=self.go_evidence)
+        n_genes = n_terms = 0
+        for gene, ids in wanted.items():
+            annot = ctx.annotations[gene]
+            if not annot.go_terms:
+                continue
+            own = getattr(annot, "go_source_accs", set()) or set()
+            closures = []
+            for gid in ids:
+                terms = set()
+                for acc in accs_by_gene.get(gid, ()):
+                    if acc in own:
+                        continue
+                    terms.update(go_map.get(acc, {}))
+                if terms:
+                    closures.append(_with_ancestors(terms, ctx.go_hierarchy))
+            if not closures:
+                continue
+            candidates = set(annot.go_terms) | {a for anc in (annot.go_fallback or {}).values() for a in anc}
+            support = {t: sum(1 for c in closures if t in c) for t in candidates}
+            support = {t: n for t, n in support.items() if n}
+            if support:
+                annot.go_ortholog_support = support
+                n_genes += 1
+                n_terms += len(support)
+        self.go_support_stats = {"genes": n_genes, "terms": n_terms}
+        logger.info(f"  Ortholog GO support: {n_terms:,} terms of {n_genes:,} genes carried by close relatives' "
+                    f"one-to-one orthologs (one supporting source per relative)")
 
     def _orf_symbol(self, sym: str) -> bool:
         """An official reference symbol of an uncharacterized gene (C19orf81, KIAA1549L)."""

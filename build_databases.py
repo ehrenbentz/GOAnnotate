@@ -677,6 +677,8 @@ def build_idmapping(conn, idmap_gz):
     close_gz_stream(proc, idmap_gz)
     logger.info("  Indexing ncbi_idmapping ...")
     conn.execute("CREATE INDEX idx_ncbi_idmapping_acc ON ncbi_idmapping(uniprot_acc)")
+    # GeneID -> accessions: the GO annotations of relatives' genes (orthology module)
+    conn.execute("CREATE INDEX idx_ncbi_idmapping_gene ON ncbi_idmapping(gene_id)")
     conn.commit()
     logger.info(f"  {lines:,} UniProt accessions read; ncbi_idmapping: {rows:,} rows")
     return lines, rows

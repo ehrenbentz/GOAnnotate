@@ -354,6 +354,9 @@ def run(args) -> None:
 
     # Concordance of the final symbols and products with each gene's hits, and
     # the confidence recomputed from it (with the orthology evidence)
+    for module in modules_run:
+        if hasattr(module, "ortholog_go_support"):
+            module.ortholog_go_support(ctx)
     go_weak = annotate_mod.filter_weak_go(annotations, go_hierarchy, min_hits=getattr(args, "go_min_hits", 5),
                                           iea_min_hits=getattr(args, "go_iea_min_hits", 2))
     annotate_mod.final_concordance(annotations, consensus_threshold=args.consensus_threshold)

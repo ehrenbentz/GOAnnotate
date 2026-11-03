@@ -616,9 +616,12 @@ def _with_ancestors(terms: set, go_hierarchy) -> set:
 
 def filter_weak_go(annotations: dict, go_hierarchy, min_hits: int = 3, iea_min_hits: int = 2) -> dict:
     """
-    Remove GO terms that rest on weak support from the hits alone, in place,
-    once every source of GO terms has been added. A term confirmed by the
-    reference gene (go_reference) or by InterPro (go_interpro) is kept. A term
+    Remove GO terms that rest on weak support, in place,
+    once every source of GO terms has been added. A term confirmed by InterPro
+    (go_interpro) is kept, and so is a term from the reference gene
+    (go_reference), unless the gene's hits do not carry it, its only evidence
+    for the reference gene is electronic (IEA), and no close relative's
+    one-to-one ortholog carries it (go_ortholog_support). A term
     from the hits alone is kept when one of its annotations is experimental
     (EXP, IDA, IPI, IMP, IGI, IEP, HTP codes), or when a SwissProt entry of the
     gene itself (its symbol is the gene's symbol) carries it with non-electronic
@@ -643,16 +646,24 @@ def filter_weak_go(annotations: dict, go_hierarchy, min_hits: int = 3, iea_min_h
             continue
         removed = {}
         for t in list(annot.go_terms):
-            if annot.go_reference.get(t) or annot.go_interpro.get(t) or t in annot.go_curated:
+            if annot.go_interpro.get(t) or t in annot.go_curated:
                 continue
-            support = annot.go_support.get(t, 0)
+            support = annot.go_support.get(t, 0) + annot.go_ortholog_support.get(t, 0)
             codes = {c for c in annot.go_evidence.get(t, "").split(",") if c}
+            if annot.go_reference.get(t):
+                # From the reference gene: kept, except a term the gene's hits do not carry whose only
+                # evidence for the reference gene is electronic, unless a close relative's ortholog carries it
+                if (not annot.go_support.get(t, 0) and codes and codes <= ELECTRONIC_CODES
+                        and not annot.go_ortholog_support.get(t, 0)):
+                    removed[t] = (0, ",".join(sorted(codes)), "reference")
+                    stats["reference_electronic"] += 1
+                continue
             if codes & experimental:
                 continue
             main = annot.go_need if annot.go_need else min_hits
             need = max(main, iea_min_hits) if codes and codes <= ELECTRONIC_CODES else main
             if support < need:
-                removed[t] = (support, ",".join(sorted(codes)))
+                removed[t] = (support, ",".join(sorted(codes)), "hits")
         if not removed:
             continue
         specific_before = set(annot.specific_go_terms)
@@ -662,7 +673,7 @@ def filter_weak_go(annotations: dict, go_hierarchy, min_hits: int = 3, iea_min_h
             for a, support in (annot.go_fallback.get(t) or {}).items():
                 if a not in annot.go_terms:
                     annot.go_terms.add(a)
-                    annot.go_support[a] = support
+                    annot.go_support[a] = support + annot.go_ortholog_support.get(a, 0)
                     annot.go_evidence[a] = removed[t][1]
                     stats["ancestors_kept"] += 1
         annot.specific_go_terms = (go_hierarchy.filter_to_specific(annot.go_terms) if go_hierarchy is not None
@@ -675,11 +686,13 @@ def filter_weak_go(annotations: dict, go_hierarchy, min_hits: int = 3, iea_min_h
             stats["genes_left_without_go"] += 1
     stats = dict(stats)
     stats.update({"min_hits": min_hits, "iea_min_hits": iea_min_hits})
-    logger.info(f"GO terms from the hits alone with weak support (fewer than {min_hits} supporting hits, "
-                f"{iea_min_hits} for electronic-only terms; experimental terms and terms confirmed by the "
-                f"reference gene, InterPro or the gene's SwissProt entries kept): {stats.get('terms', 0):,} removed "
-                f"from {stats.get('genes', 0):,} genes, {stats.get('ancestors_kept', 0):,} supported ancestors kept in "
-                f"their place "
+    n_ref = stats.get("reference_electronic", 0)
+    logger.info(f"GO terms with weak support removed: {stats.get('terms', 0) - n_ref:,} from the hits alone "
+                f"(fewer than {min_hits} supporting hits, {iea_min_hits} for electronic-only terms; experimental "
+                f"terms and terms confirmed by the reference gene, InterPro or the gene's SwissProt entries kept) "
+                f"and {n_ref:,} electronic-only terms of the reference gene that neither the hits nor a close "
+                f"relative's ortholog carry; {stats.get('terms', 0):,} removed from {stats.get('genes', 0):,} genes, "
+                f"{stats.get('ancestors_kept', 0):,} supported ancestors kept in their place "
                 f"({stats.get('genes_left_without_go', 0):,} left without GO terms)")
     return stats
 
@@ -871,6 +884,7 @@ def annotate_single_gene(gene_id: str, hits_with_names: list,
 
         result['go_source'] = go_source
         result['go_n_source'] = n_source
+        result['go_source_accs'] = {acc for h in source_with_go for acc in extract_accession(h.subject_id)}
         # Support of a term: the source hits annotated with it or with a more specific term (an
         # annotation to a term implies its ancestors)
         closures = [_with_ancestors(s, go_hierarchy) for s in hit_term_sets if s]
@@ -1209,6 +1223,7 @@ def annotate_queries(resolved_transcript_hits: dict,
         annot.hit_curated_names = result_dict.get('hit_curated_names', {})
         annot.go_n_source = result_dict.get('go_n_source', 0)
         annot.go_curated = result_dict.get('go_curated', set())
+        annot.go_source_accs = result_dict.get('go_source_accs', set())
         annot.go_fallback = result_dict.get('go_fallback', {})
         annot.go_need = result_dict.get('go_need', 0)
         annot.go_single_strong = result_dict.get('go_single_strong', False)

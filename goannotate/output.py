@@ -240,8 +240,8 @@ def write_go_evidence(annotations: dict, go_hierarchy, path: Path, forbidden_go:
     One row per gene and GO term (the specific terms written to gene2go
     and the tables) with the term's name, namespace, the evidence codes
     behind it among the source hits, the strongest evidence class and the
-    number of source hits supporting it; terms from the hits alone removed
-    for weak support follow with status removed_support, and terms removed
+    number of source hits supporting it; terms removed for weak support
+    follow with status removed_support and their source (hits or reference), and terms removed
     by the taxon constraints with status removed_taxon and the constraint
     that removed them.
     """
@@ -265,10 +265,11 @@ def write_go_evidence(annotations: dict, go_hierarchy, path: Path, forbidden_go:
                         f"specific\t{codes}\t{cls}\t{annot.go_support.get(t, '') if from_hits else ''}\t{source}\t"
                         f"{','.join(from_ipr) if from_ipr else ''}\t{','.join(from_ref) if from_ref else ''}\t\n")
                 n_rows += 1
-            for t, (support, codes) in sorted(annot.go_weak_removed.items()):
+            for t, (support, codes, source) in sorted(annot.go_weak_removed.items()):
                 cls = best_evidence_class(set(codes.split(",")) if codes else set())
+                refs = ",".join(annot.go_reference.get(t) or []) if source == "reference" else ""
                 f.write(f"{gene_id}\t{t}\t{go_hierarchy.names.get(t, '')}\t{go_hierarchy.namespace.get(t, '')}\t"
-                        f"removed_support\t{codes}\t{cls}\t{support}\thits\t\t\t\n")
+                        f"removed_support\t{codes}\t{cls}\t{support}\t{source}\t\t{refs}\t\n")
                 n_removed += 1
             for t in sorted(annot.go_taxon_removed):
                 f.write(f"{gene_id}\t{t}\t{go_hierarchy.names.get(t, '')}\t{go_hierarchy.namespace.get(t, '')}\t"
@@ -1000,8 +1001,11 @@ def write_summary(output_dir: Path, prefix: str, annotations: dict, args, blast_
             f.write(f"  Removed by taxon constraints:     {n_removed:,} assignments on {genes_removed:,} genes "
                     f"(reports/{prefix}_go_evidence.tsv)\n")
         if go_weak:
-            f.write(f"  Removed for weak support:         {go_weak.get('terms', 0):,} terms from the hits alone on "
-                    f"{go_weak.get('genes', 0):,} genes ({go_weak.get('specific_removed', 0):,} specific; "
+            n_ref = go_weak.get("reference_electronic", 0)
+            f.write(f"  Removed for weak support:         {go_weak.get('terms', 0):,} terms on "
+                    f"{go_weak.get('genes', 0):,} genes ({go_weak.get('terms', 0) - n_ref:,} from the hits alone; "
+                    f"{n_ref:,} electronic-only terms of the reference gene that neither the hits nor a close "
+                    f"relative's ortholog carry; {go_weak.get('specific_removed', 0):,} specific; "
                     f"{go_weak.get('ancestors_kept', 0):,} supported ancestors kept in their place; "
                     f"{go_weak.get('genes_left_without_go', 0):,} genes left without GO terms; "
                     f"reports/{prefix}_go_evidence.tsv, status removed_support)\n")

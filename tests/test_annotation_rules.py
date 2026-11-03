@@ -123,6 +123,19 @@ annotate.filter_weak_go({"w4": g4, "w5": g5}, None, min_hits=5, iea_min_hits=2)
 check(g4.go_terms == {"GO:10"} and g5.go_terms == {"GO:12"},
       f"a majority of few source hits suffices; one strong hit keeps its non-electronic terms: "
       f"{sorted(g4.go_terms)} {sorted(g5.go_terms)}")
+g6 = QueryAnnotation(query_id="w6", go_terms={"GO:14", "GO:15"}, go_evidence={"GO:14": "ISS", "GO:15": "ISS"},
+                    go_support={"GO:14": 1, "GO:15": 1}, go_need=2, go_ortholog_support={"GO:14": 1})
+annotate.filter_weak_go({"w6": g6}, None, min_hits=5, iea_min_hits=2)
+check(g6.go_terms == {"GO:14"}, f"a close relative's ortholog counts as one supporting source: {sorted(g6.go_terms)}")
+g7 = QueryAnnotation(query_id="w7", go_terms={"GO:20", "GO:21", "GO:22", "GO:23"},
+                    go_evidence={"GO:20": "IEA", "GO:21": "TAS", "GO:22": "IEA", "GO:23": "IEA"},
+                    go_support={"GO:23": 5},
+                    go_reference={"GO:20": ["P1"], "GO:21": ["P1"], "GO:22": ["P1"], "GO:23": ["P1"]},
+                    go_ortholog_support={"GO:22": 1})
+st7 = annotate.filter_weak_go({"w7": g7}, None, min_hits=5, iea_min_hits=2)
+check(g7.go_terms == {"GO:21", "GO:22", "GO:23"} and g7.go_weak_removed["GO:20"][2] == "reference"
+      and st7["reference_electronic"] == 1,
+      f"electronic-only reference terms need the hits or a close relative's ortholog: {sorted(g7.go_terms)}")
 g2 = QueryAnnotation(query_id="w2", go_terms={"GO:1"}, go_evidence={"GO:1": "IEA"}, go_support={"GO:1": 1})
 annotate.filter_weak_go({"w2": g2}, None, min_hits=1, iea_min_hits=1)
 check(g2.go_terms == {"GO:1"}, "minimum 1 keeps every term")

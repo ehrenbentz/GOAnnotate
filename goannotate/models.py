@@ -168,9 +168,11 @@ class QueryAnnotation:
                                 # the SwissProt supplement)
     go_need: int = 0             # supporting hits a term from the hits alone needs in this gene (0: --go-min-hits)
     go_single_strong: bool = False  # the only source hit is a near full-length, high-identity alignment
+    go_source_accs: set = field(default_factory=set)   # UniProt accessions of the GO source hits
+    go_ortholog_support: dict = field(default_factory=dict)  # GO ID -> close relatives whose ortholog carries it
     go_curated: set = field(default_factory=set)   # terms of SwissProt entries of the gene with curated evidence
     go_fallback: dict = field(default_factory=dict)  # weak term -> {its most specific passing ancestors: support}
-    go_weak_removed: dict = field(default_factory=dict)  # GO ID -> (support, codes) of terms from the hits
+    go_weak_removed: dict = field(default_factory=dict)  # GO ID -> (support, codes, source) of removed terms
                                                          # alone removed for weak support
     product_note: str = ""      # designator_stripped when a paralog designator was removed from the product
     secondary_symbol: str = ""  # symbol in the secondary nomenclature (unambiguous reciprocal best hit)
