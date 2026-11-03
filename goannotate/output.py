@@ -240,9 +240,10 @@ def write_go_evidence(annotations: dict, go_hierarchy, path: Path, forbidden_go:
     One row per gene and GO term (the specific terms written to gene2go
     and the tables) with the term's name, namespace, the evidence codes
     behind it among the source hits, the strongest evidence class and the
-    number of source hits carrying it; terms removed by the taxon
-    constraints follow with status removed_taxon and the constraint that
-    removed them.
+    number of source hits supporting it; terms from the hits alone removed
+    for weak support follow with status removed_support, and terms removed
+    by the taxon constraints with status removed_taxon and the constraint
+    that removed them.
     """
     from goannotate.go import best_evidence_class
     forbidden_go = forbidden_go or {}
@@ -264,11 +265,16 @@ def write_go_evidence(annotations: dict, go_hierarchy, path: Path, forbidden_go:
                         f"specific\t{codes}\t{cls}\t{annot.go_support.get(t, '') if from_hits else ''}\t{source}\t"
                         f"{','.join(from_ipr) if from_ipr else ''}\t{','.join(from_ref) if from_ref else ''}\t\n")
                 n_rows += 1
+            for t, (support, codes) in sorted(annot.go_weak_removed.items()):
+                cls = best_evidence_class(set(codes.split(",")) if codes else set())
+                f.write(f"{gene_id}\t{t}\t{go_hierarchy.names.get(t, '')}\t{go_hierarchy.namespace.get(t, '')}\t"
+                        f"removed_support\t{codes}\t{cls}\t{support}\thits\t\t\t\n")
+                n_removed += 1
             for t in sorted(annot.go_taxon_removed):
                 f.write(f"{gene_id}\t{t}\t{go_hierarchy.names.get(t, '')}\t{go_hierarchy.namespace.get(t, '')}\t"
                         f"removed_taxon\t\t\t\t\t\t\t{forbidden_go.get(t, '')}\n")
                 n_removed += 1
-    logger.info(f"  {n_rows:,} gene-term rows" + (f", {n_removed:,} removed by the taxon constraints" if n_removed else ""))
+    logger.info(f"  {n_rows:,} gene-term rows" + (f", {n_removed:,} removed (weak support, taxon constraints)" if n_removed else ""))
 
 
 ####################
@@ -762,7 +768,8 @@ def write_summary(output_dir: Path, prefix: str, annotations: dict, args, blast_
                   universe: GeneUniverse = None, extraction=None, gff_stats=None, comparison: dict = None,
                   search_results: str = None, assignment: dict = None, protein_check=None,
                   coverage=None, forbidden_go: dict = None, product_audit: dict = None,
-                  word_weights=None, modules: list = None, reference_go: dict = None) -> None:
+                  word_weights=None, modules: list = None, reference_go: dict = None,
+                  go_weak: dict = None) -> None:
     stats_file = output_dir / f"{prefix}_summary.txt"
     logger.info(f"Writing summary to {stats_file}")
 
@@ -827,9 +834,15 @@ def write_summary(output_dir: Path, prefix: str, annotations: dict, args, blast_
         f.write(f"  Consensus threshold:      {args.consensus_threshold}\n")
         f.write(f"  Word weighting:           {word_weights.summary() if word_weights else 'off'}\n")
         f.write(f"  GO namespaces:            {', '.join(args.namespace)}\n")
-        f.write(f"  GO evidence policy:       {getattr(args, 'go_evidence', 'all')}"
-                + (f"; electronic-only terms need {args.go_iea_min_hits} hits"
-                   if getattr(args, 'go_iea_min_hits', 1) > 1 else "") + "\n")
+        f.write(f"  GO evidence policy:       {getattr(args, 'go_evidence', 'all')}\n")
+        f.write(f"  GO terms from hits:       top {getattr(args, 'go_source_hits', 10)} hits of the winning symbol "
+                f"group plus SwissProt hits of the gene; a term from the hits alone needs "
+                f"{getattr(args, 'go_min_hits', 5)} supporting hits, or a majority of fewer source hits (at least 2; "
+                f"{getattr(args, 'go_iea_min_hits', 2)} if electronic only; one hit covering "
+                f"{getattr(args, 'go_single_hit_coverage', 0.7):.0%} of both proteins at "
+                f"{getattr(args, 'go_single_hit_identity', 50.0):.0f}% identity keeps its non-electronic terms) "
+                f"unless experimental, curated in a SwissProt entry of the gene, or confirmed by the "
+                f"reference gene or InterPro; a removed term is replaced by its supported ancestors\n")
         if getattr(args, "taxid", None):
             f.write(f"  Query taxon:              {args.taxid}; GO taxon constraints "
                     f"{'exclude ' + format(len(forbidden_go), ',') + ' terms' if forbidden_go else 'not applied'}\n")
@@ -986,6 +999,12 @@ def write_summary(output_dir: Path, prefix: str, annotations: dict, args, blast_
             genes_removed = sum(1 for a in annotations.values() if a.go_taxon_removed)
             f.write(f"  Removed by taxon constraints:     {n_removed:,} assignments on {genes_removed:,} genes "
                     f"(reports/{prefix}_go_evidence.tsv)\n")
+        if go_weak:
+            f.write(f"  Removed for weak support:         {go_weak.get('terms', 0):,} terms from the hits alone on "
+                    f"{go_weak.get('genes', 0):,} genes ({go_weak.get('specific_removed', 0):,} specific; "
+                    f"{go_weak.get('ancestors_kept', 0):,} supported ancestors kept in their place; "
+                    f"{go_weak.get('genes_left_without_go', 0):,} genes left without GO terms; "
+                    f"reports/{prefix}_go_evidence.tsv, status removed_support)\n")
         if reference_go:
             if reference_go.get("mode") == "off":
                 f.write("  From the reference gene:          off (--reference-go off)\n")

@@ -164,6 +164,14 @@ class QueryAnnotation:
     go_evidence: dict = field(default_factory=dict)   # GO ID -> evidence codes (comma-separated) behind it
     go_support: dict = field(default_factory=dict)    # GO ID -> number of source hits carrying it
     go_taxon_removed: set = field(default_factory=set)  # terms removed by the taxon constraints
+    go_n_source: int = 0        # hits the GO terms were collected from (top hits of the symbol group plus
+                                # the SwissProt supplement)
+    go_need: int = 0             # supporting hits a term from the hits alone needs in this gene (0: --go-min-hits)
+    go_single_strong: bool = False  # the only source hit is a near full-length, high-identity alignment
+    go_curated: set = field(default_factory=set)   # terms of SwissProt entries of the gene with curated evidence
+    go_fallback: dict = field(default_factory=dict)  # weak term -> {its most specific passing ancestors: support}
+    go_weak_removed: dict = field(default_factory=dict)  # GO ID -> (support, codes) of terms from the hits
+                                                         # alone removed for weak support
     product_note: str = ""      # designator_stripped when a paralog designator was removed from the product
     secondary_symbol: str = ""  # symbol in the secondary nomenclature (unambiguous reciprocal best hit)
     symbol_aliases: list = field(default_factory=list)  # other symbols of the same gene (hits' GN= symbols,

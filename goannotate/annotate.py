@@ -13,7 +13,8 @@ from difflib import SequenceMatcher
 from goannotate.blast import merge_hits_by_gene
 from goannotate.filters import BadNameFilter
 from goannotate.go import GOHierarchy, ELECTRONIC_CODES, GO_ROOT_TERMS
-from goannotate.mappings import SymbolResolver, collect_go_evidence, get_go_terms_for_hits, symbol_bases
+from goannotate.mappings import (SymbolResolver, collect_go_evidence, extract_accession, get_go_terms_for_hits,
+                                 symbol_bases)
 from goannotate.models import QueryAnnotation
 
 logger = logging.getLogger(__name__)
@@ -562,15 +563,27 @@ _worker_bad_name_filter = None
 _worker_resolver = None
 _worker_forbidden_go = frozenset()
 _worker_go_iea_min_hits = 1
+_worker_go_source_hits = 5
+_worker_go_min_hits = 5
+_worker_go_single_cov = 0.7
+_worker_go_single_identity = 50.0
+# Source hits counted at most for the majority rule of the GO support requirement
+GO_MAX_AVAILABLE = 10
 _worker_reference_taxid = ""
 
 
 def _init_worker(go_mapping, go_hierarchy, bad_name_filter, resolver, word_weights=None,
-                 forbidden_go=None, go_iea_min_hits=1, reference_taxid=""):
+                 forbidden_go=None, go_iea_min_hits=1, reference_taxid="", go_source_hits=10, go_min_hits=5,
+                 go_single_cov=0.7, go_single_identity=50.0):
     """Initialize shared read-only data in each worker process."""
     global _worker_go_mapping, _worker_go_hierarchy, _worker_bad_name_filter, _worker_resolver
     global _worker_word_weights, _worker_forbidden_go, _worker_go_iea_min_hits, _worker_reference_taxid
+    global _worker_go_source_hits, _worker_go_min_hits, _worker_go_single_cov, _worker_go_single_identity
     _worker_reference_taxid = str(reference_taxid or "")
+    _worker_go_source_hits = max(1, int(go_source_hits or 10))
+    _worker_go_min_hits = max(1, int(go_min_hits or 1))
+    _worker_go_single_cov = float(go_single_cov)
+    _worker_go_single_identity = float(go_single_identity)
     _worker_go_mapping = go_mapping
     _worker_go_hierarchy = go_hierarchy
     _worker_bad_name_filter = bad_name_filter
@@ -580,21 +593,95 @@ def _init_worker(go_mapping, go_hierarchy, bad_name_filter, resolver, word_weigh
     _worker_go_iea_min_hits = go_iea_min_hits
 
 
-def _apply_go_evidence_rules(term_codes: dict, term_support: dict, iea_min_hits: int) -> set:
-    """
-    Terms kept under the evidence rules: a term whose only evidence is
-    electronic (IEA) must be carried by at least iea_min_hits of the source
-    hits; terms with any other evidence, or with no recorded codes (older
-    databases), need one hit. Root terms are never assigned.
-    """
-    kept = set()
-    for term, codes in term_codes.items():
-        if term in GO_ROOT_TERMS:
+_ANCESTOR_CACHE = {}
+_EXPERIMENTAL_CODES = frozenset({"EXP", "IDA", "IPI", "IMP", "IGI", "IEP",
+                                 "HTP", "HDA", "HMP", "HGI", "HEP"})
+
+
+def _with_ancestors(terms: set, go_hierarchy) -> set:
+    """A set of GO terms with all their ancestors (cached per term within a worker)."""
+    out = set()
+    for t in terms:
+        norm = go_hierarchy.normalize_id(t) if go_hierarchy is not None else t
+        if not norm:
             continue
-        if iea_min_hits > 1 and codes and codes <= ELECTRONIC_CODES and term_support.get(term, 0) < iea_min_hits:
+        anc = _ANCESTOR_CACHE.get(norm)
+        if anc is None:
+            anc = go_hierarchy.get_ancestors(norm) if go_hierarchy is not None else set()
+            _ANCESTOR_CACHE[norm] = anc
+        out.add(norm)
+        out |= anc
+    return out
+
+
+def filter_weak_go(annotations: dict, go_hierarchy, min_hits: int = 3, iea_min_hits: int = 2) -> dict:
+    """
+    Remove GO terms that rest on weak support from the hits alone, in place,
+    once every source of GO terms has been added. A term confirmed by the
+    reference gene (go_reference) or by InterPro (go_interpro) is kept. A term
+    from the hits alone is kept when one of its annotations is experimental
+    (EXP, IDA, IPI, IMP, IGI, IEP, HTP codes), or when a SwissProt entry of the
+    gene itself (its symbol is the gene's symbol) carries it with non-electronic
+    evidence (annot.go_curated); otherwise it needs at least
+    min_hits supporting source hits, or a majority of the gene's source hits
+    with GO annotations when that is smaller (never fewer than 2; annot.go_need,
+    set per gene by the annotation), and a term whose only evidence is
+    electronic (IEA) at least iea_min_hits. A gene whose only source hit covers
+    both proteins well at high identity (annot.go_single_strong) keeps that
+    hit's non-electronic terms. A hit supports a term when it is
+    annotated with the term or a more specific one. Terms without recorded
+    evidence codes (older databases) follow min_hits. A removed term is replaced
+    by its most specific ancestors that pass (annot.go_fallback, computed from the
+    source hits). Removed terms are kept in annot.go_weak_removed for the
+    evidence report. Returns counts.
+    """
+    from goannotate.go import EVIDENCE_CLASSES
+    experimental = EVIDENCE_CLASSES["experimental"]
+    stats = Counter()
+    for annot in annotations.values():
+        if not annot.go_terms:
             continue
-        kept.add(term)
-    return kept
+        removed = {}
+        for t in list(annot.go_terms):
+            if annot.go_reference.get(t) or annot.go_interpro.get(t) or t in annot.go_curated:
+                continue
+            support = annot.go_support.get(t, 0)
+            codes = {c for c in annot.go_evidence.get(t, "").split(",") if c}
+            if codes & experimental:
+                continue
+            main = annot.go_need if annot.go_need else min_hits
+            need = max(main, iea_min_hits) if codes and codes <= ELECTRONIC_CODES else main
+            if support < need:
+                removed[t] = (support, ",".join(sorted(codes)))
+        if not removed:
+            continue
+        specific_before = set(annot.specific_go_terms)
+        annot.go_terms = set(annot.go_terms) - set(removed)
+        # the supported part of a removed term: its most specific ancestors that pass
+        for t in removed:
+            for a, support in (annot.go_fallback.get(t) or {}).items():
+                if a not in annot.go_terms:
+                    annot.go_terms.add(a)
+                    annot.go_support[a] = support
+                    annot.go_evidence[a] = removed[t][1]
+                    stats["ancestors_kept"] += 1
+        annot.specific_go_terms = (go_hierarchy.filter_to_specific(annot.go_terms) if go_hierarchy is not None
+                                   else set(annot.go_terms))
+        annot.go_weak_removed = removed
+        stats["genes"] += 1
+        stats["terms"] += len(removed)
+        stats["specific_removed"] += len(specific_before - annot.specific_go_terms)
+        if not annot.go_terms:
+            stats["genes_left_without_go"] += 1
+    stats = dict(stats)
+    stats.update({"min_hits": min_hits, "iea_min_hits": iea_min_hits})
+    logger.info(f"GO terms from the hits alone with weak support (fewer than {min_hits} supporting hits, "
+                f"{iea_min_hits} for electronic-only terms; experimental terms and terms confirmed by the "
+                f"reference gene, InterPro or the gene's SwissProt entries kept): {stats.get('terms', 0):,} removed "
+                f"from {stats.get('genes', 0):,} genes, {stats.get('ancestors_kept', 0):,} supported ancestors kept in "
+                f"their place "
+                f"({stats.get('genes_left_without_go', 0):,} left without GO terms)")
+    return stats
 
 
 def annotate_single_gene(gene_id: str, hits_with_names: list,
@@ -640,6 +727,7 @@ def annotate_single_gene(gene_id: str, hits_with_names: list,
             'go_evidence': {},
             'go_support': {},
             'go_taxon_removed': set(),
+            'go_n_source': 0,
             'best_query_coverage': 0.0,
             'best_subject_coverage': 0.0,
             'hit_names': {},
@@ -721,14 +809,33 @@ def annotate_single_gene(gene_id: str, hits_with_names: list,
             result['best_query_coverage'] = max(h.query_coverage for h in result['filtered_hits'])
             result['best_subject_coverage'] = max(h.subject_coverage for h in result['filtered_hits'])
 
-        # GO terms from the winning symbol group (top 5 by bitscore), with
+        # GO terms from the winning symbol group (its top hits by bitscore), with
         # the evidence codes behind each term and the number of hits that
         # carry it
         go_source_indices = sorted(winning_symbol_indices,
-                                   key=lambda i: hits_with_names[i][HIT].bitscore, reverse=True)[:5]
+                                   key=lambda i: hits_with_names[i][HIT].bitscore,
+                                   reverse=True)[:_worker_go_source_hits]
         go_hits = [hits_with_names[i][HIT] for i in go_source_indices]
         term_codes, term_support = collect_go_evidence(go_hits, go_mapping)
-        go_source = "cluster_top5" if term_codes else ""
+        hit_term_sets = [set(collect_go_evidence([h], go_mapping)[0]) for h in go_hits]
+        winning_sym_upper = gene_symbol.upper() if gene_symbol else ""
+        # Curated (non-electronic) annotations of SwissProt entries of the gene itself (GN= symbol equal to
+        # the winning symbol): taken without a support requirement
+        go_curated = set()
+
+        def add_curated(hit, symbol, codes_by_term):
+            if not (hit.is_swissprot and winning_sym_upper and symbol and symbol.upper() == winning_sym_upper):
+                return
+            for t, codes in codes_by_term.items():
+                if codes - ELECTRONIC_CODES:
+                    go_curated.add(t)
+
+        for i in go_source_indices:
+            add_curated(hits_with_names[i][HIT], hits_with_names[i][SYMBOL],
+                        collect_go_evidence([hits_with_names[i][HIT]], go_mapping)[0])
+        go_source = f"cluster_top{_worker_go_source_hits}" if term_codes else ""
+        source_with_go = [h for h in go_hits if any(acc in go_mapping for acc in extract_accession(h.subject_id))]
+        n_source = len(source_with_go)
 
         # SwissProt GO supplement
         winning_name_norm = normalize_gene_name(protein_name) if protein_name else ""
@@ -751,15 +858,62 @@ def annotate_single_gene(gene_id: str, hits_with_names: list,
             if sym_match or name_match:
                 sp_codes, sp_support = collect_go_evidence([hit], go_mapping)
                 if sp_codes:
+                    n_source += 1
+                    source_with_go.append(hit)
+                    hit_term_sets.append(set(sp_codes))
+                    if sym_match:
+                        add_curated(hit, symbol, sp_codes)
                     if any(t not in term_codes for t in sp_codes):
-                        go_source = "cluster_top5+swissprot_supplement"
+                        go_source = f"cluster_top{_worker_go_source_hits}+swissprot_supplement"
                     for t, codes in sp_codes.items():
                         term_codes.setdefault(t, set()).update(codes)
                         term_support[t] = term_support.get(t, 0) + sp_support[t]
 
         result['go_source'] = go_source
+        result['go_n_source'] = n_source
+        # Support of a term: the source hits annotated with it or with a more specific term (an
+        # annotation to a term implies its ancestors)
+        closures = [_with_ancestors(s, go_hierarchy) for s in hit_term_sets if s]
+        term_support = {t: sum(1 for c in closures if t in c) for t in term_codes}
+        result['go_curated'] = go_curated
+        # Support required of a term from the hits alone: --go-min-hits, or a majority of the source
+        # hits with GO annotations (at most GO_MAX_AVAILABLE counted) when that is smaller, never fewer
+        # than 2; electronic-only terms --go-iea-min-hits. A gene whose only source hit is a near
+        # full-length alignment at high identity keeps that hit's non-electronic terms.
+        available = min(n_source, GO_MAX_AVAILABLE)
+        need_main = max(2, min(_worker_go_min_hits, available // 2 + 1)) if _worker_go_min_hits > 1 else 1
+        single_strong = (n_source == 1 and source_with_go[0].query_coverage >= _worker_go_single_cov
+                         and source_with_go[0].subject_coverage >= _worker_go_single_cov
+                         and source_with_go[0].pident >= _worker_go_single_identity)
+        if single_strong:
+            need_main = 1
+        result['go_need'] = need_main
+        result['go_single_strong'] = single_strong
 
-        go_terms = _apply_go_evidence_rules(term_codes, term_support, _worker_go_iea_min_hits)
+        def needed(codes):
+            return max(need_main, _worker_go_iea_min_hits) if codes and codes <= ELECTRONIC_CODES else need_main
+
+        # For a term that may fail the support requirement, its most specific ancestors that pass it
+        # (kept in its place when it is removed: the supported part of the claim)
+        fallback = {}
+        if go_hierarchy is not None and (need_main > 1 or _worker_go_iea_min_hits > 1):
+            for t, codes in term_codes.items():
+                if t in go_curated or codes & _EXPERIMENTAL_CODES:
+                    continue
+                need = needed(codes)
+                if term_support.get(t, 0) >= need:
+                    continue
+                norm = go_hierarchy.normalize_id(t)
+                if not norm:
+                    continue
+                passing = {a for a in _with_ancestors({norm}, go_hierarchy) - {norm}
+                           if a not in GO_ROOT_TERMS and sum(1 for c in closures if a in c) >= need}
+                if passing:
+                    fallback[t] = {a: sum(1 for c in closures if a in c)
+                                   for a in go_hierarchy.filter_to_specific(passing)}
+        result['go_fallback'] = fallback
+
+        go_terms = {t for t in term_codes if t not in GO_ROOT_TERMS}
 
         if namespaces and go_terms:
             go_terms = go_hierarchy.filter_by_namespace(go_terms, namespaces)
@@ -921,7 +1075,9 @@ def annotate_queries(resolved_transcript_hits: dict,
                      forbidden_go: set = None,
                      go_iea_min_hits: int = 1,
                      coverage_status: dict = None,
-                     ortholog_prior: dict = None, reference_taxid: str = "") -> dict:
+                     ortholog_prior: dict = None, reference_taxid: str = "",
+                     go_source_hits: int = 10, go_min_hits: int = 5, go_single_cov: float = 0.7,
+                     go_single_identity: float = 50.0) -> dict:
     """
     Main annotation pipeline: merge isoform hits, cluster, select name/symbol,
     collect GO terms. Per-gene annotation runs in parallel via multiprocessing,
@@ -997,7 +1153,7 @@ def annotate_queries(resolved_transcript_hits: dict,
     # The main process uses the same globals (normalize_gene_name reads the
     # bad-name filter for comparison-only normalization during propagation).
     init_args = (go_mapping, go_hierarchy, bad_name_filter, resolver, word_weights, forbidden_go, go_iea_min_hits,
-                 reference_taxid)
+                 reference_taxid, go_source_hits, go_min_hits, go_single_cov, go_single_identity)
     _init_worker(*init_args)
     if n_workers == 1:
         results = [annotate_single_gene(*task) for task in tasks]
@@ -1051,6 +1207,11 @@ def annotate_queries(resolved_transcript_hits: dict,
         annot.hit_names = result_dict.get('hit_names', {})
         annot.hit_symbols = result_dict.get('hit_symbols', {})
         annot.hit_curated_names = result_dict.get('hit_curated_names', {})
+        annot.go_n_source = result_dict.get('go_n_source', 0)
+        annot.go_curated = result_dict.get('go_curated', set())
+        annot.go_fallback = result_dict.get('go_fallback', {})
+        annot.go_need = result_dict.get('go_need', 0)
+        annot.go_single_strong = result_dict.get('go_single_strong', False)
         annot.n_isoforms = result_dict['n_isoforms']
         annot.n_cluster_hits = result_dict['n_cluster_hits']
         annot.winning_cluster_names = result_dict['winning_cluster_names']

@@ -244,6 +244,10 @@ def run(args) -> None:
         coverage_status=coverage_status if coverage.active else None,
         ortholog_prior=ortholog_prior,
         reference_taxid=str(args.reference_taxid),
+        go_source_hits=getattr(args, "go_source_hits", 10),
+        go_min_hits=getattr(args, "go_min_hits", 5),
+        go_single_cov=getattr(args, "go_single_hit_coverage", 0.7),
+        go_single_identity=getattr(args, "go_single_hit_identity", 50.0),
     )
 
     ############################################################
@@ -350,6 +354,8 @@ def run(args) -> None:
 
     # Concordance of the final symbols and products with each gene's hits, and
     # the confidence recomputed from it (with the orthology evidence)
+    go_weak = annotate_mod.filter_weak_go(annotations, go_hierarchy, min_hits=getattr(args, "go_min_hits", 5),
+                                          iea_min_hits=getattr(args, "go_iea_min_hits", 2))
     annotate_mod.final_concordance(annotations, consensus_threshold=args.consensus_threshold)
 
     ############################################################
@@ -412,7 +418,8 @@ def run(args) -> None:
                          comparison=comparison, search_results=str(results_path),
                          assignment=assignment, protein_check=protein_check,
                          coverage=coverage, forbidden_go=forbidden_go, product_audit=product_audit,
-                         word_weights=word_weights, modules=selected, reference_go=reference_go)
+                         word_weights=word_weights, modules=selected, reference_go=reference_go,
+                         go_weak=go_weak)
 
 
 # Files of the earlier output layout (everything at the top level)

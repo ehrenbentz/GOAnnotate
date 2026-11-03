@@ -101,9 +101,31 @@ for policy, expect in (("all", {"GO:0005515", "GO:0005634"}), ("non-electronic",
     check(set(m["P1"]) == expect and st["nd"] == 1, f"policy {policy}")
 codes = {"GO:1": {"IEA"}, "GO:2": {"IEA", "IDA"}, "GO:3": {"IEA"}, "GO:0008150": {"IDA"}}
 support = {"GO:1": 1, "GO:2": 1, "GO:3": 3}
-kept = annotate._apply_go_evidence_rules(codes, support, iea_min_hits=2)
-check(kept == {"GO:2", "GO:3"}, "IEA-only terms need the minimum support; roots never assigned")
-check(annotate._apply_go_evidence_rules(codes, support, 1) == {"GO:1", "GO:2", "GO:3"}, "iea_min_hits 1 keeps all")
+g = QueryAnnotation(query_id="w", go_terms={"GO:1", "GO:2", "GO:3", "GO:4", "GO:5", "GO:6"},
+                    go_evidence={"GO:1": "IEA", "GO:2": "IEA,IDA", "GO:3": "IEA", "GO:4": "ISS", "GO:5": "ISS",
+                                 "GO:6": "TAS"},
+                    go_support={"GO:1": 1, "GO:2": 1, "GO:3": 2, "GO:4": 2, "GO:5": 3, "GO:6": 1},
+                    go_reference={"GO:6": ["P9"]})
+st = annotate.filter_weak_go({"w": g}, None, min_hits=3, iea_min_hits=2)
+check(g.go_terms == {"GO:2", "GO:5", "GO:6"} and set(g.go_weak_removed) == {"GO:1", "GO:3", "GO:4"}
+      and st["terms"] == 3,
+      f"weak terms from the hits alone removed; experimental and reference-confirmed kept: {sorted(g.go_terms)}")
+g3 = QueryAnnotation(query_id="w3", go_terms={"GO:7", "GO:8"}, go_evidence={"GO:7": "ISS", "GO:8": "IBA"},
+                    go_support={"GO:7": 1, "GO:8": 1}, go_curated={"GO:8"}, go_fallback={"GO:7": {"GO:9": 4}})
+annotate.filter_weak_go({"w3": g3}, None, min_hits=3, iea_min_hits=2)
+check(g3.go_terms == {"GO:8", "GO:9"} and g3.go_support["GO:9"] == 4,
+      f"curated SwissProt terms of the gene kept; a weak term replaced by its supported ancestor: {sorted(g3.go_terms)}")
+g4 = QueryAnnotation(query_id="w4", go_terms={"GO:10", "GO:11"}, go_evidence={"GO:10": "ISS", "GO:11": "IEA"},
+                    go_support={"GO:10": 2, "GO:11": 1}, go_need=2)
+g5 = QueryAnnotation(query_id="w5", go_terms={"GO:12", "GO:13"}, go_evidence={"GO:12": "IBA", "GO:13": "IEA"},
+                    go_support={"GO:12": 1, "GO:13": 1}, go_need=1, go_single_strong=True)
+annotate.filter_weak_go({"w4": g4, "w5": g5}, None, min_hits=5, iea_min_hits=2)
+check(g4.go_terms == {"GO:10"} and g5.go_terms == {"GO:12"},
+      f"a majority of few source hits suffices; one strong hit keeps its non-electronic terms: "
+      f"{sorted(g4.go_terms)} {sorted(g5.go_terms)}")
+g2 = QueryAnnotation(query_id="w2", go_terms={"GO:1"}, go_evidence={"GO:1": "IEA"}, go_support={"GO:1": 1})
+annotate.filter_weak_go({"w2": g2}, None, min_hits=1, iea_min_hits=1)
+check(g2.go_terms == {"GO:1"}, "minimum 1 keeps every term")
 tc, ts = mappings.collect_go_evidence([hit()], {"P1": {"GO:1": "IEA,IDA", "GO:2": ""}})
 check(tc == {"GO:1": {"IEA", "IDA"}, "GO:2": set()} and ts == {"GO:1": 1, "GO:2": 1}, "collect_go_evidence")
 

@@ -114,9 +114,21 @@ Examples:
                         "  non-electronic: not IEA (electronic) annotations\n"
                         "  experimental:   EXP, IDA, IPI, IMP, IGI, IEP and the HTP codes only\n"
                         "Needs a database built by the current build_databases.py (evidence codes stored)")
-    g.add_argument("--go-iea-min-hits", type=int, default=1, metavar="N",
-                   help="A term whose only evidence is electronic (IEA) must be carried by at least N of\n"
-                        "the hits GO terms are taken from (default: 1, no requirement)")
+    g.add_argument("--go-source-hits", type=int, default=10, metavar="N",
+                   help="GO terms are taken from the top N hits of the winning symbol group, plus SwissProt\n"
+                        "hits of the same gene in the winning cluster (default: 10)")
+    g.add_argument("--go-min-hits", type=int, default=5, metavar="N",
+                   help="A term from the hits alone (not confirmed by the reference gene or InterPro) without\n"
+                        "an experimental annotation must be supported by N source hits, or by a majority of\n"
+                        "the gene's source hits with GO annotations when that is fewer (at least 2); a hit\n"
+                        "supports a term when annotated with it or a more specific term (default: 5; 1 keeps all)")
+    g.add_argument("--go-single-hit-coverage", type=float, default=0.7, metavar="F",
+                   help="A gene with a single source hit keeps that hit's non-electronic terms when the\n"
+                        "alignment covers at least F of both proteins (default: 0.7)")
+    g.add_argument("--go-single-hit-identity", type=float, default=50.0, metavar="PCT",
+                   help="... and has at least PCT percent identity (default: 50)")
+    g.add_argument("--go-iea-min-hits", type=int, default=2, metavar="N",
+                   help="The same for a term whose only evidence is electronic (IEA) (default: 2)")
     g.add_argument("--taxid", type=int, metavar="TAXID",
                    help="NCBI taxon ID of the organism being annotated; enables the GO taxon constraints")
     g.add_argument("--taxon-constraints", default="on", choices=["on", "off"],
@@ -445,8 +457,8 @@ def validate(args, parser) -> None:
             parser.error(f"--{name.replace('_', '-')} must be between 0 and 1")
     if not 0.0 <= args.min_identity <= 100.0:
         parser.error("--min-identity is a percentage between 0 and 100")
-    if args.go_iea_min_hits < 1:
-        parser.error("--go-iea-min-hits must be at least 1")
+    if args.go_iea_min_hits < 1 or args.go_min_hits < 1 or args.go_source_hits < 1:
+        parser.error("--go-source-hits, --go-min-hits and --go-iea-min-hits must be at least 1")
     if args.bad_names is None:
         args.bad_names = str(default_bad_names_path())
     if args.threads is None:
