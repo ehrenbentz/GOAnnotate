@@ -492,8 +492,11 @@ check(not bnf.clean_name("Protein CG4768-like protein") or bnf.is_bad_name(bnf.c
 check(bnf.is_bad_name("protein -like protein") and bnf.is_bad_name("Protein, protein")
       and not bnf.is_bad_name("Ras-like protein"), "'protein like protein' is a placeholder")
 check(all(bnf.is_bad_name(n) for n in ("Chromosome 9", "Chromosome LG6 open reading frame, human", "CD033",
-                                       "CQ067 protein precursor", "protein (Mus musculus)", "Linkage group 7"))
-      and not bnf.is_bad_name("Chromosome partition protein Smc"), "chromosome-only and species-only names are bad")
+                                       "CQ067 protein precursor", "protein (Mus musculus)", "Linkage group 7",
+                                       "chromosome 2A", "Chromosome X", "Chromosome ZW", "chromosome W",
+                                       "Chromosome 1q", "Chromosome LG 12", "Chromosome B10"))
+      and not any(bnf.is_bad_name(n) for n in ("Chromosome partition protein Smc", "Chromosome segregation protein",
+                                               "chromosome arm", "Chromosome-associated kinesin KIF4A")), "chromosome-only and species-only names are bad")
 check(bnf.clean_name("LD33793p") in (None, "") and bnf.clean_name("FI18136p1") in (None, "")
       and bnf.clean_name("GEO02646p1") in (None, "") and bnf.clean_name("bcDNA.GH11023") in (None, "") and bnf.clean_name("Ubiquitin-like protein RH60221p") == "Ubiquitin-like protein",
       "BDGP cDNA clone names are identifiers")

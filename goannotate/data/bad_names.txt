@@ -271,9 +271,10 @@ exact:tyrosine-protein
 # "CQ067 protein precursor")
 regex:^C[A-Z]\d{3}(?: protein)?(?: precursor)?$
 
-# Names that are only a chromosome or linkage group ("Chromosome 9", "Chromosome LG6 open reading frame, human",
-# "Linkage group 7")
-regex:^(?:chromosome|linkage group) (?:[0-9XYZW]{1,2}|LG\d+)(?: open reading frame)?,?(?: human)?$
+# Names that are only a chromosome or linkage group: a number, a sex chromosome or a combination of digits and
+# letters ("Chromosome 9", "Chromosome 2A", "Chromosome X", "Chromosome ZW", "Chromosome LG6 open reading frame,
+# human", "Linkage group 7")
+regex:^(?:chromosome|linkage group) (?:LG ?)?(?:[0-9][0-9A-Z]{0,3}|[A-Z]{1,2}[0-9][0-9A-Z]{0,2}|[XYZW]{1,2})(?: open reading frame)?,?(?: human)?$
 
 # "protein" with only a species name ("protein (Mus musculus)")
 regex:^protein \([A-Z][a-z]+ [a-z]+\)$
