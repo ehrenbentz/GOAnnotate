@@ -918,7 +918,7 @@ def write_summary(output_dir: Path, prefix: str, annotations: dict, args, blast_
             final = getattr(translation, "final_completeness", None)
             if final:
                 f.write("  Completeness (reading frame and reference alignment; transcript tables, column "
-                        "completeness):\n")
+                        "completeness; confidence lowered by 0.05 per missing end):\n")
                 for status in ("complete", "5_partial", "3_partial", "partial"):
                     f.write(f"    {status + ':':<28}{final.get(status, 0):,}\n")
             f.write(f"  Details:                      {translation.report}\n\n")

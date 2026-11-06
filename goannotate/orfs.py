@@ -41,6 +41,7 @@ class TranslationResult:
     n_short: int = 0         # proteins shorter than SHORT_PROTEIN residues
     n_blastx_fallback: int = 0   # transcripts annotated from their blastx hits (no blastp hit)
     final_completeness: Counter = field(default_factory=Counter)
+    confidence: Counter = field(default_factory=Counter)   # confidence of the translated genes, fragments lowered
 
 
 SHORT_PROTEIN = 50

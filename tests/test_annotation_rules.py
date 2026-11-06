@@ -427,6 +427,19 @@ ann["a"].consensus_symbol = "glul"
 n, ids = annotate.propagate_symbols(ann, {"c": [sib("GLUL")]}, "lower")
 check(ann["c"].consensus_symbol == "glul", "a sibling symbol the hits carry is taken as it is")
 
+# ------------------------------------------------------ confidence of fragments
+print("\n# Confidence of fragments")
+fr = QueryAnnotation(query_id="f", hits=[hit()], consensus_symbol="X", name_concordance=0.8, n_cluster_hits=10,
+                     symbol_concordance=0.8)
+full = annotate.compute_confidence(fr)[1]
+fr.completeness = "5_partial"
+one = annotate.compute_confidence(fr)[1]
+fr.completeness = "partial"
+both = annotate.compute_confidence(fr)[1]
+fr.completeness = "complete"
+check(abs(full - one - 0.05) < 1e-9 and abs(full - both - 0.1) < 1e-9 and annotate.compute_confidence(fr)[1] == full,
+      f"0.05 less per missing end: {full} {one} {both}")
+
 # ------------------------------------------------------ confidence with orthology
 print("\n# Confidence with orthology evidence")
 a = QueryAnnotation(query_id="c", hits=[hit()], consensus_symbol="X", name_concordance=0.6, n_cluster_hits=5,

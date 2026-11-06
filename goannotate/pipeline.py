@@ -450,6 +450,12 @@ def run(args) -> None:
                 if s in states:
                     return s
             return ""
+        # fragments score lower confidence (annotate.FRAGMENT_PENALTY per missing end)
+        for gene_id, annot in annotations.items():
+            annot.completeness = gene_completeness(gene_id)
+            if annot.completeness and annot.completeness != "complete":
+                annot.confidence, annot.confidence_score = annotate_mod.compute_confidence(annot)
+        translation.confidence = Counter(a.confidence for a in annotations.values() if a.completeness)
         table_columns = (
             [("completeness", gene_completeness)],
             [("orf", lambda t: f"{orf_rows[t]['strand']}{orf_rows[t]['orf_start']}-{orf_rows[t]['orf_end']}"

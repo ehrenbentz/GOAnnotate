@@ -503,6 +503,10 @@ ORTHOLOG_CONFIDENCE = {
 }
 
 
+# Confidence subtracted for each end missing from a translated transcript's protein
+FRAGMENT_PENALTY = 0.05
+
+
 def compute_confidence(annot: QueryAnnotation, ortholog: str = None) -> tuple:
     """
     Per-gene confidence in the assigned annotation.
@@ -513,7 +517,10 @@ def compute_confidence(annot: QueryAnnotation, ortholog: str = None) -> tuple:
       0.15 * symbol present
       0.15 * symbol concordance across all merged hits
     minus 0.1 when no hit of the gene passed the hit coverage filter and
-    the annotation rests on partial alignments (coverage status fallback).
+    the annotation rests on partial alignments (coverage status fallback),
+    and, for translated transcripts, FRAGMENT_PENALTY for each end missing
+    from the protein (annot.completeness: 5_partial or 3_partial one end,
+    partial both).
 
     ortholog: the orthology module's evidence for the gene's symbol
     (ORTHOLOG_CONFIDENCE; annot.ortholog_evidence when not given): close-relative confirmation adds 0.15, distant
@@ -535,6 +542,8 @@ def compute_confidence(annot: QueryAnnotation, ortholog: str = None) -> tuple:
              + 0.15 * annot.symbol_concordance)
     if annot.coverage_status == "fallback":
         score = max(0.0, score - 0.1)
+    missing_ends = {"5_partial": 1, "3_partial": 1, "partial": 2}.get(annot.completeness, 0)
+    score = max(0.0, score - FRAGMENT_PENALTY * missing_ends)
     rule = ORTHOLOG_CONFIDENCE.get(ortholog)
     if rule:
         if rule[0] == "add":

@@ -143,6 +143,7 @@ class QueryAnnotation:
     hit_curated_names: dict = field(default_factory=dict)  # normalized names of SwissProt hits of other species
                                                            # than the reference -> their upper-case symbols
     ortholog_reference_symbol: str = ""  # close relatives' symbol in the reference nomenclature (orthology module)
+    completeness: str = ""      # translated transcripts: complete, 5_partial, 3_partial, partial (most complete isoform)
     ortholog_evidence: str = ""  # orthology module's evidence for the symbol (annotate.ORTHOLOG_CONFIDENCE key)
     n_isoforms: int = 0
     n_cluster_hits: int = 0
