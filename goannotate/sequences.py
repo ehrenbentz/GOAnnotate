@@ -438,13 +438,33 @@ def extract_sequences(genes: list, genome: dict, output_dir: Path, prefix: str,
 # FASTA UNIVERSE
 ####################
 
-def universe_from_fasta(fasta_file: str) -> GeneUniverse:
+# Trinity transcript identifiers: the isoform suffix follows the gene
+# (TRINITY_DN1000_c0_g1_i1 and DN1000_c0_g1_i1 since Trinity 2.1,
+# TR1000|c0_g1_i1 in Trinity 2.0, comp1000_c0_seq1 before 2.0)
+_TRINITY_ISOFORM = (
+    re.compile(r"^((?:TRINITY_)?DN\d+_c\d+_g\d+)_i\d+$"),
+    re.compile(r"^(TR\d+\|c\d+_g\d+)_i\d+$"),
+    re.compile(r"^(comp\d+_c\d+)_seq\d+$"),
+)
+
+
+def trinity_gene(transcript_id: str) -> str:
+    """The Trinity gene of a transcript identifier, or '' when the identifier is not Trinity's."""
+    for pattern in _TRINITY_ISOFORM:
+        m = pattern.match(transcript_id)
+        if m:
+            return m.group(1)
+    return ""
+
+
+def universe_from_fasta(fasta_file: str, isoform_grouping: str = "trinity") -> GeneUniverse:
     """
     Build the gene universe from FASTA headers.
 
     The transcript ID is the first field of each header; the gene ID comes
-    from a gene= field. Without a gene= field the transcript ID is used as
-    the gene ID (1:1 mapping).
+    from a gene= field. Without a gene= field, a Trinity identifier gives
+    its gene (isoform_grouping trinity; off keeps every transcript as its
+    own gene); any other transcript ID is used as the gene ID (1:1 mapping).
     """
     logger.info(f"Parsing FASTA headers from {fasta_file}")
 
@@ -453,13 +473,19 @@ def universe_from_fasta(fasta_file: str) -> GeneUniverse:
     gene_ids_ordered = []
     gene_ids_seen = set()
     total_sequences = 0
+    n_trinity = 0
 
     with open(fasta_file) as f:
         for line in f:
             if line.startswith('>'):
                 total_sequences += 1
                 transcript_id, fields = parse_header(line.rstrip("\n"))
-                gene_id = fields.get("gene") or transcript_id
+                gene_id = fields.get("gene")
+                if not gene_id and isoform_grouping == "trinity":
+                    gene_id = trinity_gene(transcript_id)
+                    if gene_id:
+                        n_trinity += 1
+                gene_id = gene_id or transcript_id
 
                 transcript_to_gene[transcript_id] = gene_id
                 gene_to_transcripts[gene_id].append(transcript_id)
@@ -469,6 +495,9 @@ def universe_from_fasta(fasta_file: str) -> GeneUniverse:
 
     logger.info(f"Found {total_sequences:,} sequences, {len(gene_ids_ordered):,} unique genes, "
                 f"{len(transcript_to_gene):,} transcripts")
+    if n_trinity:
+        logger.info(f"  {n_trinity:,} transcripts grouped into genes by their Trinity identifiers "
+                    f"(--isoform-grouping off keeps each transcript as a gene)")
     n_multi = sum(1 for txs in gene_to_transcripts.values() if len(txs) > 1)
     if n_multi > 0:
         logger.info(f"  {n_multi:,} genes have multiple transcripts")

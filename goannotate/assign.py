@@ -183,13 +183,14 @@ def _blastp(diamond_bin, query: Path, db: Path, out: Path, threads: int, evalue:
     if out.exists() and out.stat().st_size > 0 and not force:
         with open(out) as fh:
             n_cols = len(fh.readline().split("\t"))
-        if n_cols >= 8:
+        if n_cols >= 12:
             logger.info(f"  Reusing {out}")
             return out
-        logger.info(f"  {out.name} lacks length columns; rerunning")
+        logger.info(f"  {out.name} lacks the length or alignment coordinate columns; rerunning")
     tmp = out.with_suffix(out.suffix + ".tmp")
     cmd = [diamond_bin, "blastp", "--db", str(db), "--query", str(query), "--out", str(tmp),
            "--outfmt", "6", "qseqid", "sseqid", "pident", "length", "evalue", "bitscore", "qlen", "slen",
+           "qstart", "qend", "sstart", "send",
            "--max-target-seqs", "25", "--evalue", str(evalue), "--threads", str(threads)] + sensitivity_flags
     start = time.time()
     proc = subprocess.run(cmd, capture_output=True, text=True)
@@ -233,6 +234,27 @@ def best_hits(path: Path) -> dict:
     return best
 
 
+def reference_alignments(forward: Path, ref_symbols: dict) -> dict:
+    """
+    transcript -> {upper-case reference symbol: (bits, sstart, send, slen)}
+    of the highest-scoring alignment to each reference symbol's proteins.
+    """
+    out = defaultdict(dict)
+    with open(forward) as fh:
+        for line in fh:
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) < 12:
+                continue
+            symbol = ref_symbols.get(_accession(parts[1]))
+            if not symbol:
+                continue
+            key = symbol.upper()
+            bits = float(parts[5])
+            if bits > out[parts[0]].get(key, (-1.0,))[0]:
+                out[parts[0]][key] = (bits, int(parts[10]), int(parts[11]), int(parts[7]))
+    return out
+
+
 def _accession(subject_id: str) -> str:
     parts = subject_id.split("|")
     if len(parts) >= 2 and parts[0] in ("sp", "tr"):
@@ -250,7 +272,8 @@ def assign_symbols(annotations: dict, universe, forward: Path, reverse: Path, re
                    symbol_policy: str = "ortholog", nomenclature=None,
                    drop_unmatched: bool = False, min_query_coverage: float = 0.8,
                    rbh_margin: float = 0.9, existence: dict = None, established_margin: float = 0.95,
-                   name_threshold: float = 0.5) -> dict:
+                   name_threshold: float = 0.5, partial_genes: set = None,
+                   partial_query_coverage: float = 0.6) -> dict:
     """
     Apply reciprocal-best-hit confirmation and the sequence-support check
     to the annotations in place. Sets annot.symbol_status on every gene with
@@ -265,6 +288,10 @@ def assign_symbols(annotations: dict, universe, forward: Path, reverse: Path, re
     min_coverage: and the alignment covers at least this fraction of the
     reference protein, or min_query_coverage of the gene itself (partial
     gene models keep the symbol of the protein they are part of).
+    partial_genes: genes whose proteins are fragments (translated
+    transcripts without both ends); for them partial_query_coverage of the
+    gene replaces min_query_coverage, since a fragment's protein runs to
+    the transcript ends and its ends rarely align.
     symbol_policy, for voted symbols outside the reference nomenclature:
     "ortholog" replaces one by a reference symbol only with evidence that
     it is the same gene (suffix-free form, NCBI synonym, reciprocal best
@@ -458,16 +485,19 @@ def assign_symbols(annotations: dict, universe, forward: Path, reverse: Path, re
     # hit to the reference proteome (lineage-specific families) keep the
     # vote, since nothing in the reference contradicts it.
 
+    partial_genes = partial_genes or set()
+
     def covers(gene, symbol):
         """
         The gene's alignment to the reference protein covers at least
         min_coverage of the reference protein, or at least
-        min_query_coverage of the gene itself: a partial gene model or a
-        shorter protein is the same gene; a gene that shares one domain
-        covers little of either.
+        min_query_coverage of the gene itself (partial_query_coverage for a
+        fragment): a partial gene model or a shorter protein is the same
+        gene; a gene that shares one domain covers little of either.
         """
+        need = partial_query_coverage if gene in partial_genes else min_query_coverage
         return (gene_ref_coverage.get(gene, {}).get(symbol, 0.0) >= min_coverage
-                or gene_query_coverage.get(gene, {}).get(symbol, 0.0) >= min_query_coverage)
+                or gene_query_coverage.get(gene, {}).get(symbol, 0.0) >= need)
 
     def is_supported(gene, symbol, best_bits):
         bits = gene_forward_all.get(gene, {}).get(symbol, 0.0)

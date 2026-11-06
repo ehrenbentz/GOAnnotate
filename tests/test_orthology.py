@@ -126,6 +126,8 @@ a = sys.argv[1:]
 if a[:1] == ["--version"]:
     print("datasets version: 16.35.0"); sys.exit(0)
 if a[:2] == ["summary", "genome"]:
+    if os.environ.get("FAKE_DS_FAIL"):
+        print("panic: runtime error: invalid memory address or nil pointer dereference"); sys.exit(2)
     accs = fix["summary"].get(a[3], []) if a[2] == "taxon" else [a[3]]
     for acc in accs:
         org, taxid, rel, genes = fix["genomes"][acc]
@@ -562,6 +564,29 @@ def test_module(tmp: Path, db: Path):
     integrate_modules([m11], ctx5)
     check(ann5["g11"].consensus_symbol == "ISOC2" and m11.decision["g11"] == "kept",
           f"C#orf symbol does not replace a supported symbol: {m11.decision.get('g11')}")
+
+    # NCBI unreachable: the relatives chosen in the previous run in this output directory are used
+    os.environ["FAKE_DS_FAIL"] = "1"
+    try:
+        ann6 = {g: QueryAnnotation(query_id=g) for g in names}
+        ctx6 = ModuleContext(query_fasta=Path("q.faa"), search_mode="blastp", work_dir=work, reports_dir=reports,
+                             prefix="p", threads=60, universe=universe, annotations=ann6, bad_name_filter=bf,
+                             symbol_case_fn=str.upper)
+        m13 = OrthologyModule(args)
+        ran6 = run_modules([m13], ctx6)
+        check(len(ran6) == 1 and m13.previous_selection and m13.summary_failures > 0
+              and [r.accession for r in m13.relatives] == ["GCF_B", "GCF_C"]
+              and [r.level for r in m13.relatives] == ["Microtus", "Arvicolinae"]
+              and all(r.close for r in m13.relatives),
+              f"previous selection used when NCBI fails: {[r.accession for r in m13.relatives]}")
+        ctx7 = ModuleContext(query_fasta=Path("q.faa"), search_mode="blastp", work_dir=work, reports_dir=reports,
+                             prefix="none", threads=60, universe=universe, annotations=ann6, bad_name_filter=bf,
+                             symbol_case_fn=str.upper)
+        m14 = OrthologyModule(args)
+        ran7 = run_modules([m14], ctx7)
+        check(not ran7 and not m14.previous_selection, "without an earlier selection the module is skipped")
+    finally:
+        del os.environ["FAKE_DS_FAIL"]
 
 
 if __name__ == "__main__":

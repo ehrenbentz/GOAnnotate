@@ -103,9 +103,16 @@ def run_searches(mode: str, query: Path, output_dir: Path, prefix: str,
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     combined = output_dir / f"{prefix}_diamond_results.tsv"
+    # The search mode of the existing results, so that blastx results of
+    # the transcripts are not reused as blastp results of their proteins
+    mode_file = output_dir / f"{prefix}_diamond_results.mode"
+    previous_mode = mode_file.read_text().strip() if mode_file.exists() else ""
 
     def reusable(path: Path) -> bool:
         if not (path.exists() and path.stat().st_size > 0) or force:
+            return False
+        if previous_mode and previous_mode != mode:
+            logger.info(f"  {path.name} holds {previous_mode} results; the {mode} search is run")
             return False
         if need_lengths and not results_have_lengths(path):
             logger.info(f"  {path.name} was written without the qlen/slen columns that the hit coverage "
@@ -145,5 +152,6 @@ def run_searches(mode: str, query: Path, output_dir: Path, prefix: str,
             with open(out) as fin:
                 shutil.copyfileobj(fin, fout)
     os.replace(tmp, combined)
+    mode_file.write_text(mode + "\n")
     logger.info(f"Combined Diamond results written to {combined}")
     return combined

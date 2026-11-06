@@ -3,11 +3,12 @@
 import logging
 import os
 import shutil
+from collections import Counter
 from pathlib import Path
 
 from goannotate import GOAnnotateError
 from goannotate import annotate as annotate_mod
-from goannotate import (assign, blast, compare, gff3, mappings, modules, output, refgo, reference, search,
+from goannotate import (assign, blast, compare, gff3, mappings, modules, orfs, output, refgo, reference, search,
                         sequences, taxon)
 from goannotate.filters import BadNameFilter, NameAudit, write_name_audit
 from goannotate.go import GOHierarchy, resolve_go_obo
@@ -127,7 +128,8 @@ def run(args) -> None:
         search_mode = "blastp"
         annotated_fasta_source = query_fasta
     elif args.transcripts:
-        universe = sequences.universe_from_fasta(args.transcripts)
+        universe = sequences.universe_from_fasta(
+            args.transcripts, isoform_grouping=getattr(args, "isoform_grouping", "trinity"))
         if args.tx2gene:
             _apply_tx2gene(universe, args.tx2gene)
         query_fasta = Path(args.transcripts)
@@ -144,9 +146,35 @@ def run(args) -> None:
     ############################################################
     # Stage 2: Diamond search (or precomputed results)
     ############################################################
+    # Nucleotide transcripts are searched with blastx, translated in the
+    # frame of their best hit, and the proteins are then searched with
+    # blastp so that the rest of the run (reciprocal best hits, reference
+    # names and GO terms, modules) sees proteins, as for a genome.
     coverage = _coverage_filter(args)
-    if args.blast_results:
-        results_path = Path(args.blast_results)
+    translation = None
+    blast_results = args.blast_results
+    if search_mode == "blastx" and getattr(args, "orf_translation", "on") == "on":
+        if not (args.diamond_swissprot or args.diamond_trembl):
+            raise GOAnnotateError("Translating the transcripts needs a Diamond search of their proteins; pass "
+                                  "--diamond-swissprot and/or --diamond-trembl, or --orf-translation off to "
+                                  "annotate from the blastx results alone")
+        if blast_results:
+            blastx_path = Path(blast_results)
+        else:
+            blastx_path = search.run_searches(
+                mode="blastx", query=query_fasta, output_dir=work_dir, prefix=f"{prefix}_blastx",
+                swissprot_db=args.diamond_swissprot, trembl_db=args.diamond_trembl,
+                threads=args.threads or 0, evalue=args.evalue, max_target_seqs=args.max_target_seqs,
+                sensitivity=args.sensitivity, extra_args=args.diamond_args,
+                diamond_bin=args.diamond_bin, force=args.force_search, need_lengths=True)
+        translation = orfs.translate_from_hits(
+            args.transcripts, str(blastx_path), work_dir / f"{prefix}_AA.faa",
+            reports_dir / f"{prefix}_orf_translation.tsv", table_id=args.codon_table, evalue=args.evalue)
+        query_fasta = translation.protein_fasta
+        search_mode = "blastp"
+        blast_results = None
+    if blast_results:
+        results_path = Path(blast_results)
     else:
         results_path = search.run_searches(
             mode=search_mode, query=query_fasta, output_dir=work_dir, prefix=prefix,
@@ -154,6 +182,9 @@ def run(args) -> None:
             threads=args.threads or 0, evalue=args.evalue, max_target_seqs=args.max_target_seqs,
             sensitivity=args.sensitivity, extra_args=args.diamond_args,
             diamond_bin=args.diamond_bin, force=args.force_search, need_lengths=coverage.active)
+    if translation is not None:
+        results_path, translation.n_blastx_fallback = orfs.blastx_fallback(
+            results_path, str(blastx_path), translation.report, work_dir / f"{prefix}_diamond_results_with_blastx.tsv")
 
     ############################################################
     # Stage 3: annotation
@@ -255,6 +286,14 @@ def run(args) -> None:
     ############################################################
     assignment = None
     ref_symbols, ref_descriptions = {}, {}
+    forward = None
+    # Fragments: genes whose translated transcripts all lack one or both ends
+    partial_genes = set()
+    if translation is not None:
+        orf_rows = orfs.read_report(translation.report)
+        complete_genes = {universe.transcript_to_gene.get(t, t) for t, r in orf_rows.items()
+                          if r["completeness"] == "complete"}
+        partial_genes = {universe.transcript_to_gene.get(t, t) for t in orf_rows} - complete_genes
     if args.no_reciprocal:
         logger.info("Reciprocal best-hit assignment disabled (--no-reciprocal)")
     elif search_mode != "blastp":
@@ -297,7 +336,8 @@ def run(args) -> None:
             nomenclature=nomenclature, drop_unmatched=getattr(args, "drop_unmatched_symbols", False),
             min_query_coverage=getattr(args, "symbol_min_query_coverage", 0.8),
             rbh_margin=getattr(args, "rbh_margin", 0.9), existence=assign.read_reference_existence(ref_proteome),
-            name_threshold=args.consensus_threshold)
+            name_threshold=args.consensus_threshold, partial_genes=partial_genes,
+            partial_query_coverage=getattr(args, "symbol_min_fragment_coverage", 0.6))
         if not getattr(args, "keep_paralog_designators", False):
             assignment.update(assign.strip_paralog_designators(
                 annotations, ref_descriptions, bad_name_filter.normalize_for_comparison))
@@ -393,15 +433,45 @@ def run(args) -> None:
         protein_lengths = {}
         for header, seq in sequences.read_fasta(str(query_fasta)):
             protein_lengths[header.split()[0] if header else ""] = len(seq.rstrip("*"))
+    # Completeness of the translated transcripts' proteins, from their reading
+    # frames and their alignments to the reference proteome
+    completeness = {}
+    table_columns = None
+    if translation is not None:
+        ref_alignments = assign.reference_alignments(forward, ref_symbols) if forward else {}
+        completeness = orfs.completeness(translation.report, ref_alignments, annotations,
+                                         universe.transcript_to_gene)
+        translation.final_completeness = Counter(s for s, _ in completeness.values())
+        orf_rows = orfs.read_report(translation.report)
+
+        def gene_completeness(gene_id):
+            states = [completeness[t][0] for t in universe.gene_to_transcripts.get(gene_id, []) if t in completeness]
+            for s in ("complete", "3_partial", "5_partial", "partial"):
+                if s in states:
+                    return s
+            return ""
+        table_columns = (
+            [("completeness", gene_completeness)],
+            [("orf", lambda t: f"{orf_rows[t]['strand']}{orf_rows[t]['orf_start']}-{orf_rows[t]['orf_end']}"
+              if t in orf_rows else ""),
+             ("completeness", lambda t: completeness[t][0] if t in completeness else ""),
+             ("completeness_evidence", lambda t: completeness[t][1] if t in completeness else "")])
     output.write_annotation_tables(output_dir, prefix, annotations, universe, genes=genes,
                                    fasta_headers=str(annotated_fasta_source), mode=args.annotation_mode,
-                                   protein_lengths=protein_lengths, modules=modules_run)
+                                   protein_lengths=protein_lengths, modules=modules_run,
+                                   extra_columns=table_columns)
     output.write_mapping_files(annotations, output_dir, prefix, universe=universe, evidence_dir=reports_dir)
 
     # Annotated sequence files, named by content: amino acid (AA), coding
     # sequence (CDS) and spliced transcript sequences.
     fasta_outputs = []
-    if search_mode == "blastp":
+    header_fields = None
+    if translation is not None:
+        # translated transcripts: the transcripts with their ORF coordinates, and the proteins
+        header_fields = orfs.orf_header_fields(translation.report, completeness)
+        fasta_outputs.append((annotated_fasta_source, f"{prefix}_annotated_transcripts.fna"))
+        fasta_outputs.append((translation.protein_fasta, f"{prefix}_annotated_AA.faa"))
+    elif search_mode == "blastp":
         fasta_outputs.append((annotated_fasta_source, f"{prefix}_annotated_AA.faa"))
     else:
         fasta_outputs.append((annotated_fasta_source, f"{prefix}_annotated_transcripts.fna"))
@@ -411,13 +481,14 @@ def run(args) -> None:
     for source, name in fasta_outputs:
         output.write_annotated_fasta(str(source), annotations, output_dir / name,
                                      transcript_to_gene=universe.transcript_to_gene,
-                                     mode=args.annotation_mode)
+                                     mode=args.annotation_mode,
+                                     header_fields=header_fields)
     if genes is not None:
         output.write_annotated_gff3(args.gff3, output_dir / f"{prefix}_annotated.gff3",
                                     annotations, genes, mode=args.annotation_mode,
                                     hypothetical=args.hypothetical, modules=modules_run)
     output.write_summary(output_dir, prefix, annotations, args, blast_stats=blast_stats,
-                         universe=universe, extraction=extraction, gff_stats=gff_stats,
+                         universe=universe, extraction=extraction, gff_stats=gff_stats, translation=translation,
                          comparison=comparison, search_results=str(results_path),
                          assignment=assignment, protein_check=protein_check,
                          coverage=coverage, forbidden_go=forbidden_go, product_audit=product_audit,

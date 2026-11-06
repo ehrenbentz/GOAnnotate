@@ -358,12 +358,13 @@ class InterProScanModule(Module):
             except (json.JSONDecodeError, OSError):
                 pass
 
-        # CPUs: --max-workers is the CPU budget of Nextflow's local executor (--threads by default).
-        # Most tasks request one CPU; the multi-threaded steps request their real use (STEP_CPUS)
-        # and, with Docker or Podman, each container is limited to the CPUs it requested, so the
-        # load stays within the budget. The configuration is added with Nextflow's -c option.
+        # CPUs: --max-workers is the CPU budget of Nextflow's local executor (half of --threads by
+        # default: analyses computed locally, such as CATH's, use more CPU than they request). Most
+        # tasks request one CPU; the multi-threaded steps request their real use (STEP_CPUS) and,
+        # with Docker or Podman, each container is limited to the CPUs it requested. The
+        # configuration is added with Nextflow's -c option.
         profile = self._profile()
-        workers = self.workers or max(1, ctx.threads or 2)
+        workers = self.workers or max(1, (ctx.threads or 2) // 2)
         resources = out_dir / RESOURCES_CONFIG
         resources.write_text(resources_config(profile))
         local = self._local_workflow()

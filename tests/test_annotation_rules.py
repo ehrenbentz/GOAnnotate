@@ -398,6 +398,21 @@ with tempfile.TemporaryDirectory() as d:
           and ann["g1"].voted_symbol == "adgrl1a" and st["rbh_same_gene_form"] == 1 and st["rbh_override"] == 1,
           f"a copy form of the RBH symbol is a confirmation, another gene an override: "
           f"{ann['g1'].symbol_status} {st['rbh_same_gene_form']} {st['rbh_override']}")
+# a fragment: the alignment covers 63% of the protein and 9% of the reference protein
+print("\n# Fragments of translated transcripts")
+for partial, expect in ((set(), ""), ({"g1"}, "PPP1CA")):
+    with tempfile.TemporaryDirectory() as d:
+        d = Path(d)
+        (d / "fwd.tsv").write_text("t1\tsp|P_PP1A|X\t89.7\t29\t1e-11\t55.5\t46\t330\t5\t33\t100\t128\n"
+                                   "t1\tsp|P_PP1G|X\t82.8\t29\t1e-10\t52.4\t46\t323\t5\t33\t100\t128\n")
+        (d / "rev.tsv").write_text("sp|P_PP1A|X\tt9\t90\t300\t0\t600\t330\t330\t1\t300\t1\t300\n")
+        ref = {"P_PP1A": "PPP1CA", "P_PP1G": "PPP1CC"}
+        uni = type("U", (), {"transcript_to_gene": {"t1": "g1"}})()
+        ann = {"g1": QueryAnnotation(query_id="g1", consensus_symbol="PPP1CA", hits=[hit()])}
+        assign_ref.assign_symbols(ann, uni, d / "fwd.tsv", d / "rev.tsv", ref, str.upper, partial_genes=partial)
+        check(ann["g1"].consensus_symbol == expect,
+              f"{'fragment' if partial else 'gene model'} at 63% query coverage: symbol {ann['g1'].consensus_symbol!r}")
+
 sib = lambda sym: (hit(), "Glutamine synthetase", sym, "uniprot", ("t1",))
 ann = {"a": QueryAnnotation(query_id="a", consensus_name="Glutamine synthetase", consensus_symbol="glula"),
        "b": QueryAnnotation(query_id="b", consensus_name="Glutamine synthetase", consensus_symbol="glula"),

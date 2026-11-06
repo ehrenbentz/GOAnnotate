@@ -35,8 +35,11 @@ Input modes:
   Genome:        --gff3 FILE --genome FILE       extract CDS, translate, search proteins (blastp)
   Proteins:      --gff3 FILE --proteins FILE     search pre-extracted proteins (blastp); IDs checked
                                                  against the GFF3 transcripts before use
-  Transcriptome: --transcripts FILE              search nucleotide sequences (blastx);
-                                                 gene grouping from gene= header fields or --tx2gene
+  Transcriptome: --transcripts FILE              nucleotide sequences: blastx, translation of each
+                                                 transcript in the frame of its best hit, then blastp
+                                                 of the proteins (--orf-translation off: blastx only);
+                                                 gene grouping from gene= header fields, Trinity
+                                                 identifiers or --tx2gene
   Precomputed:   --transcripts FILE --blast-results FILE   annotate existing search results
 
 Reference data: --db (SQLite from build_databases.py) or --go-mapping [--ncbi-idmapping --ncbi-geneinfo]
@@ -63,12 +66,25 @@ Examples:
                         "they are checked before use. With --genome as well, the proteins are\n"
                         "also compared with GOAnnotate's own extraction")
     g.add_argument("--transcripts", metavar="FILE",
-                   help="Transcript (CDS or mRNA) FASTA; gene= header field groups isoforms")
+                   help="Transcript (CDS or mRNA) FASTA, or a protein FASTA; gene= header fields group\n"
+                        "isoforms")
     g.add_argument("--tx2gene", metavar="FILE",
                    help="Two-column file (transcript_id, gene_id) grouping transcripts into genes\n"
                         "for a FASTA without gene= header fields")
+    g.add_argument("--isoform-grouping", default="trinity", choices=["trinity", "off"],
+                   help="Group transcripts without gene= header fields into genes by their Trinity\n"
+                        "identifiers (DN1000_c0_g1_i1 and DN1000_c0_g1_i2 are isoforms of DN1000_c0_g1;\n"
+                        "default), or off: every transcript is its own gene")
+    g.add_argument("--orf-translation", default="on", choices=["on", "off"],
+                   help="Nucleotide transcripts: translate each transcript with a blastx hit in the frame\n"
+                        "of its best hit (the open reading frame around the alignment) and run the rest of\n"
+                        "the annotation on the proteins, as for a genome (default). off: annotate from the\n"
+                        "blastx hits alone (no reciprocal best hits, reference names, reference GO terms\n"
+                        "or modules). Transcripts without a hit get no protein")
     g.add_argument("--blast-results", "--blast", dest="blast_results", metavar="FILE",
-                   help="Precomputed Diamond/BLAST results, format 6 with stitle (skips the search)")
+                   help="Precomputed Diamond/BLAST results, format 6 with stitle (skips the search). For\n"
+                        "nucleotide transcripts with --orf-translation on, these are the blastx results\n"
+                        "used for the translation; the proteins are then searched")
     g.add_argument("--gene-id-attr", default="ID", metavar="ATTR",
                    help="GFF3 gene attribute used as the gene identifier in outputs (default: ID)")
     g.add_argument("--transcript-id-attr", default="ID", metavar="ATTR",
@@ -183,6 +199,9 @@ Examples:
                    help="A voted symbol is also supported when the gene's alignment covers at least F of the\n"
                         "gene itself, so that partial gene models keep the symbol of the protein they are\n"
                         "part of (default: 0.8)")
+    g.add_argument("--symbol-min-fragment-coverage", type=float, default=0.6, metavar="F",
+                   help="The same for translated transcripts whose protein lacks one or both ends: a\n"
+                        "fragment's protein runs to the transcript ends, which rarely align (default: 0.6)")
     g.add_argument("--symbol-policy", default="ortholog", choices=["ortholog", "reference", "any"],
                    help="Voted symbols outside the reference nomenclature (zebrafish foxo3a, rodent Vmn1r,\n"
                         "outdated AARS); comparisons are case-insensitive\n"
@@ -335,7 +354,7 @@ Examples:
                    help="Run every analysis locally; by default InterProScan looks up precalculated matches at\n"
                         "EBI for proteins already in UniParc (only sequence checksums are sent)")
     g.add_argument("--interproscan-workers", type=int, default=0, metavar="N",
-                   help="CPUs for InterProScan's parallel tasks (default: --threads); its multi-threaded\n"
+                   help="CPUs for InterProScan's parallel tasks (default: half of --threads); its multi-threaded\n"
                         "analyses count their CPUs against it")
     g.add_argument("--interproscan-keep-work", action="store_true",
                    help="Keep Nextflow's work directory after a successful InterProScan run")

@@ -327,7 +327,8 @@ def _span(seqid, start, end, strand) -> str:
 
 def write_annotation_tables(output_dir: Path, prefix: str, annotations: dict, universe: GeneUniverse,
                             genes: list = None, fasta_headers: str = None, mode: str = "fill",
-                            protein_lengths: dict = None, modules: list = None) -> tuple:
+                            protein_lengths: dict = None, modules: list = None,
+                            extra_columns: tuple = None) -> tuple:
     """
     Two tab-delimited tables for everyday lookup, one row per gene and one
     row per transcript, with the identifiers in the first column(s) and the
@@ -357,9 +358,13 @@ def write_annotation_tables(output_dir: Path, prefix: str, annotations: dict, un
 
     modules: optional modules that ran; their gene_columns() and
     transcript_columns() are appended after go_terms.
+    extra_columns: (gene columns, transcript columns), each a list of
+    (name, function of the ID), appended after go_terms before the
+    modules' columns (the completeness of translated transcripts).
     """
-    gene_extra = [col for m in (modules or []) for col in m.gene_columns()]
-    tx_extra = [col for m in (modules or []) for col in m.transcript_columns()]
+    gene_extra, tx_extra = (list(extra_columns[0]), list(extra_columns[1])) if extra_columns else ([], [])
+    gene_extra += [col for m in (modules or []) for col in m.gene_columns()]
+    tx_extra += [col for m in (modules or []) for col in m.transcript_columns()]
 
     def extra(columns, key):
         return [fn(key) for _, fn in columns]
@@ -470,7 +475,8 @@ def write_annotation_tables(output_dir: Path, prefix: str, annotations: dict, un
 ####################
 
 def write_annotated_fasta(input_fasta: str, annotations: dict, output_file: Path,
-                          transcript_to_gene: dict = None, mode: str = "fill") -> None:
+                          transcript_to_gene: dict = None, mode: str = "fill",
+                          header_fields: dict = None) -> None:
     """
     Copy a FASTA, adding GOAnnotate results to the headers of annotated
     genes in the GRAFT header format (gene= symbol= product="..." type=
@@ -479,6 +485,8 @@ def write_annotated_fasta(input_fasta: str, annotations: dict, output_file: Path
       fill     symbol= and product= are set where the header has none
       replace  symbol= and product= are set to the GOAnnotate values
     A legacy Name= field (GOAnnotate 1.x) is read as symbol=.
+    header_fields (sequence ID -> fields) adds further fields, such as the
+    ORF coordinates of translated transcripts, to the headers that have them.
     """
     from goannotate.sequences import format_header, parse_header
     logger.info(f"Writing annotated FASTA to {output_file} (mode: {mode})")
@@ -493,10 +501,16 @@ def write_annotated_fasta(input_fasta: str, annotations: dict, output_file: Path
                 continue
             total_count += 1
             seq_id, fields = parse_header(line.rstrip("\n"))
+            extra = header_fields.get(seq_id) if header_fields else None
+            if extra:
+                fields.update(extra)
             gene_id = transcript_to_gene.get(seq_id, seq_id) if transcript_to_gene else seq_id
             annot = annotations.get(gene_id)
             if not annot or not (annot.consensus_symbol or annot.consensus_name):
-                fout.write(line)
+                if extra:
+                    fout.write(">" + format_header(seq_id, fields) + "\n")
+                else:
+                    fout.write(line)
                 continue
             annotated_count += 1
             if "Name" in fields and "symbol" not in fields:
@@ -766,7 +780,8 @@ def write_annotated_gff3(input_gff: str, output_file: Path, annotations: dict, g
 ####################
 
 def write_summary(output_dir: Path, prefix: str, annotations: dict, args, blast_stats: BlastStats = None,
-                  universe: GeneUniverse = None, extraction=None, gff_stats=None, comparison: dict = None,
+                  universe: GeneUniverse = None, extraction=None, gff_stats=None, translation=None,
+                  comparison: dict = None,
                   search_results: str = None, assignment: dict = None, protein_check=None,
                   coverage=None, forbidden_go: dict = None, product_audit: dict = None,
                   word_weights=None, modules: list = None, reference_go: dict = None,
@@ -790,14 +805,17 @@ def write_summary(output_dir: Path, prefix: str, annotations: dict, args, blast_
     for annot in annotations.values():
         confidence_counts[annot.confidence] = confidence_counts.get(annot.confidence, 0) + 1
 
-    # Coverage is reported against genes that can have hits (coding genes)
+    # Coverage is reported against genes that can have hits (coding genes
+    # of a GFF3; every gene of a transcript set)
     if universe is not None and universe.coding:
         n_coding = sum(1 for v in universe.coding.values() if v)
+        pct_label = "of coding"
     else:
         n_coding = total
+        pct_label = "of genes"
 
     def pct(n):
-        return f"{100 * n / n_coding:.1f}% of coding" if n_coding else "0.0%"
+        return f"{100 * n / n_coding:.1f}% {pct_label}" if n_coding else "0.0%"
 
     with open(stats_file, 'w') as f:
         f.write(f"GOAnnotate {__version__} Summary\n")
@@ -881,6 +899,29 @@ def write_summary(output_dir: Path, prefix: str, annotations: dict, args, blast_
             for flag, n in extraction.flag_counts.most_common():
                 f.write(f"  {flag + ':':<30}{n:,}\n")
             f.write("\n")
+
+        if translation is not None:
+            f.write("ORF Translation (transcripts translated in the frame of their best blastx hit):\n")
+            f.write("-" * 70 + "\n")
+            f.write(f"  Transcripts:                  {translation.n_transcripts:,}\n")
+            f.write(f"  With blastx hits:             {translation.n_with_hits:,}\n")
+            f.write(f"  Proteins written:             {translation.n_translated:,} "
+                    f"({translation.n_short:,} shorter than 50 residues; transcripts without hits get no protein)\n")
+            f.write("  Reading frames:               " + ", ".join(
+                f"{status} {n:,}" for status, n in translation.completeness.most_common()) + "\n")
+            if translation.notes:
+                f.write("  Flagged (see the report):     " + ", ".join(
+                    f"{k} {v:,}" for k, v in translation.notes.most_common()) + "\n")
+            if getattr(translation, "n_blastx_fallback", 0):
+                f.write(f"  Annotated from blastx hits:   {translation.n_blastx_fallback:,} "
+                        f"(the protein found no blastp hit)\n")
+            final = getattr(translation, "final_completeness", None)
+            if final:
+                f.write("  Completeness (reading frame and reference alignment; transcript tables, column "
+                        "completeness):\n")
+                for status in ("complete", "5_partial", "3_partial", "partial"):
+                    f.write(f"    {status + ':':<28}{final.get(status, 0):,}\n")
+            f.write(f"  Details:                      {translation.report}\n\n")
 
         if protein_check is not None:
             f.write("Protein Input Check:\n")

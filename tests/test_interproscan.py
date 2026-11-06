@@ -241,7 +241,7 @@ def test_module(tmp: Path, data, workflow, fake, tsv, obo):
           f"status: {m.status.version}")
     argv = (tmp / "args.txt").read_text().split()
     check("--goterms" in argv and "-resume" in argv and "--max-workers" in argv
-          and argv[argv.index("--max-workers") + 1] == "4"
+          and argv[argv.index("--max-workers") + 1] == "2"
           and "--no-matches-api" not in argv and argv[argv.index("--interpro") + 1] == "110.0"
           and argv[argv.index("-profile") + 1] == "docker", f"command line: {' '.join(argv)}")
     conf = Path(argv[argv.index("-c") + 1])

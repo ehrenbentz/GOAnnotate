@@ -312,6 +312,39 @@ class Relative:
         self.n_genes = 0
 
 
+def previous_selection(path: Path, cache: Path) -> list:
+    """
+    The relatives chosen in an earlier run (status chosen in its
+    orthology_relatives.tsv report), when the annotation and proteins of
+    each are still in the cache. Used when NCBI cannot be reached. Returns
+    [] when the report is missing or a chosen relative's files are not
+    cached.
+    """
+    if not path.exists():
+        return []
+    chosen = []
+    with open(path) as fh:
+        header = fh.readline().rstrip("\n").split("\t")
+        for line in fh:
+            row = dict(zip(header, line.rstrip("\n").split("\t")))
+            if row.get("status") != "chosen":
+                continue
+            d = cache / row["accession"]
+            if not all((d / f).exists() and (d / f).stat().st_size > 0 for f in ("genomic.gff", "protein.faa")):
+                return []
+            rel = Relative(row["accession"], row["organism"], int(row["taxid"] or 0), level=row["level"],
+                           annotation=row["annotation"], release=row["release"],
+                           protein_coding=int(row["protein_coding_genes"] or 0))
+            rel.named = float(row["named_fraction"]) if row.get("named_fraction") else None
+            rel.named_symbol = float(row["symbol_fraction"]) if row.get("symbol_fraction") else None
+            rel.status = "chosen"
+            rel.same_species = row["level"] == "same species"
+            if rel.same_species and any(r.label == rel.label for r in chosen):
+                rel.label += "_same_species"
+            chosen.append(rel)
+    return chosen
+
+
 class OrthologyModule(Module):
     name = "orthology"
     description = "OrthoFinder orthologs in relatives (NCBI RefSeq); symbols weighted by the relatives' closeness"
@@ -338,6 +371,8 @@ class OrthologyModule(Module):
         self.same = None                    # Relative: the query species' own annotation
         self.candidates = []                # every Relative examined
         self.relatives = []                 # chosen Relatives
+        self.summary_failures = 0           # datasets summary calls that failed (NCBI unreachable)
+        self.previous_selection = False     # relatives taken from the previous run's selection
         self.orthogroup = {}                # query gene -> orthogroup
         self.orthologs = {}                 # query gene -> {relative label: (type, [(gene, symbol)])}
         self.gene_symbol = {}               # query gene -> (agreed 1:1 symbol, how)
@@ -408,6 +443,7 @@ class OrthologyModule(Module):
         rc, out = self.run_command([self.datasets, "summary", "genome", "taxon", str(taxon), "--reference",
                                     "--annotated", "--assembly-source", "RefSeq", "--as-json-lines"], timeout=600)
         if rc != 0:
+            self.summary_failures += 1
             logger.warning(f"  datasets summary for taxon {taxon} failed: {out.strip()[:200]}")
             return []
         rows = []
@@ -451,6 +487,20 @@ class OrthologyModule(Module):
         self._choose_other_relatives(ctx, cache, is_bad_symbol)
         if self.with_same_species:
             self._choose_same_species(cache, is_bad_symbol)
+        if self.summary_failures:
+            previous = previous_selection(ctx.reports_dir / f"{ctx.prefix}_orthology_relatives.tsv", cache)
+            if previous:
+                logger.warning(f"  {self.summary_failures} NCBI datasets queries failed; the relatives chosen in the "
+                               f"previous run in this output directory are used: "
+                               + ", ".join(f"{r.organism} ({r.accession})" for r in previous))
+                self.candidates = list(previous)
+                self.relatives = list(previous)
+                self.same = next((r for r in previous if r.same_species), None)
+                self.previous_selection = True
+            else:
+                logger.warning(f"  {self.summary_failures} NCBI datasets queries failed and no earlier selection with "
+                               f"downloaded annotations was found; the relatives may differ from a run with NCBI "
+                               f"reachable")
 
     def _choose_same_species(self, cache: Path, is_bad_symbol) -> None:
         """The newest RefSeq annotation of the query species itself, added beyond --relatives."""
@@ -1281,7 +1331,8 @@ class OrthologyModule(Module):
         lines = [f"  Orthology ({self.status.version}): {len(self.relatives)} relatives, "
                  f"{c.get('close_relatives', 0)} close (common ancestor within the {self.close_rank}); "
                  f"symbols {self.mode}"
-                 + (f"; OrthoFinder {self.runtime / 60:.1f} min" if self.runtime else " (OrthoFinder results reused)")]
+                 + (f"; OrthoFinder {self.runtime / 60:.1f} min" if self.runtime else " (OrthoFinder results reused)")
+                 + ("; NCBI unreachable, relatives of the previous run used" if self.previous_selection else "")]
         for r in self.relatives:
             one, anyo = self.per_relative.get(r.label, (0, 0))
             lines.append(f"    {r.organism} ({r.accession}, {r.level}; {'close' if r.close else 'distant'}, "
