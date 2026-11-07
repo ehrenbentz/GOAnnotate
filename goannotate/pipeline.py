@@ -8,7 +8,7 @@ from pathlib import Path
 
 from goannotate import GOAnnotateError
 from goannotate import annotate as annotate_mod
-from goannotate import (assign, blast, compare, gff3, mappings, modules, orfs, output, refgo, reference, search,
+from goannotate import (assign, blast, compare, evaluate, gff3, mappings, modules, orfs, output, refgo, reference, search,
                         sequences, taxon)
 from goannotate.filters import BadNameFilter, NameAudit, write_name_audit
 from goannotate.go import GOHierarchy, resolve_go_obo
@@ -400,6 +400,11 @@ def run(args) -> None:
     go_weak = annotate_mod.filter_weak_go(annotations, go_hierarchy, min_hits=getattr(args, "go_min_hits", 5),
                                           iea_min_hits=getattr(args, "go_iea_min_hits", 2))
     annotate_mod.final_concordance(annotations, consensus_threshold=args.consensus_threshold)
+    ref_alignments = assign.reference_alignments(forward, ref_symbols) if forward else {}
+    evaluation = evaluate.evaluate(
+        annotations, universe, ref_alignments, {s.upper() for s in ref_symbols.values() if s}, ref_descriptions,
+        modules_run,
+        reports_dir / f"{prefix}_evaluation.tsv", bad_name_filter=bad_name_filter)
 
     ############################################################
     # Stage 4: comparison with existing annotation
@@ -438,7 +443,6 @@ def run(args) -> None:
     completeness = {}
     table_columns = None
     if translation is not None:
-        ref_alignments = assign.reference_alignments(forward, ref_symbols) if forward else {}
         completeness = orfs.completeness(translation.report, ref_alignments, annotations,
                                          universe.transcript_to_gene)
         translation.final_completeness = Counter(s for s, _ in completeness.values())
@@ -499,7 +503,7 @@ def run(args) -> None:
                          assignment=assignment, protein_check=protein_check,
                          coverage=coverage, forbidden_go=forbidden_go, product_audit=product_audit,
                          word_weights=word_weights, modules=selected, reference_go=reference_go,
-                         go_weak=go_weak)
+                         go_weak=go_weak, evaluation=evaluation)
 
 
 # Files of the earlier output layout (everything at the top level)

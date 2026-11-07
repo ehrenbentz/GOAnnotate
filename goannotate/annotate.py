@@ -382,8 +382,11 @@ def select_name_and_symbol(winning_indices: list,
 
     prior: (symbol, close) from the orthology module. A close relatives'
     symbol decides: its group wins whenever the cluster has one (origin
-    "relative"). A distant relatives' symbol is one more vote: its group
-    wins when it scores at least ORTHOLOG_VOTE_MARGIN of the best group.
+    "relative" when that group also scores best, "relative_override" when
+    the hits scored another group higher). A distant relatives' symbol is
+    one more vote: its group wins when it scores at least
+    ORTHOLOG_VOTE_MARGIN of the best group (origin "relative" or
+    "relative_override" in the same way).
 
     Returns (protein_name, gene_symbol, symbol_origin, winning_symbol_indices).
     """
@@ -413,12 +416,14 @@ def select_name_and_symbol(winning_indices: list,
         prior_key = prior[0].lower()
         if prior_key in symbol_groups:
             idxs = symbol_groups[prior_key]
-            if prior[1]:
-                return _symbol_group_result(idxs, hits_with_names, bad_name_filter, "relative")
             scores = {s: symbol_group_score([hits_with_names[i][HIT].bitscore for i in g], score_method)
                       for s, g in symbol_groups.items()}
-            if scores[prior_key] >= ORTHOLOG_VOTE_MARGIN * max(scores.values()):
-                return _symbol_group_result(idxs, hits_with_names, bad_name_filter)
+            best = max(scores.values())
+            origin = "relative" if scores[prior_key] >= best else "relative_override"
+            if prior[1]:
+                return _symbol_group_result(idxs, hits_with_names, bad_name_filter, origin)
+            if scores[prior_key] >= ORTHOLOG_VOTE_MARGIN * best:
+                return _symbol_group_result(idxs, hits_with_names, bad_name_filter, origin)
 
     # With ortholog resolution, a symbol is "in nomenclature" when it was
     # resolved to the reference species, comes from a reference-species
@@ -780,11 +785,16 @@ def annotate_single_gene(gene_id: str, hits_with_names: list,
         # Cluster and select the winning cluster
         clusters = cluster_hits_agglomerative(hits_with_names,
                                               similarity_threshold=consensus_threshold)
+        cluster_override = False
         if prior and prior[0] and prior[1]:
             key = prior[0].lower()
             with_prior = [c for c in clusters
                           if any(hits_with_names[i][SYMBOL] and hits_with_names[i][SYMBOL].lower() == key for i in c)]
-            if with_prior:
+            if with_prior and len(with_prior) < len(clusters):
+                # the prior picks among the clusters carrying its symbol; when the hits alone would
+                # have chosen another cluster, the relatives decided
+                plain, _ = select_winning_cluster(clusters, hits_with_names)
+                cluster_override = plain not in with_prior
                 clusters = with_prior
         winning_indices, cluster_fraction = select_winning_cluster(clusters, hits_with_names)
         result['cluster_fraction'] = cluster_fraction
@@ -801,6 +811,8 @@ def annotate_single_gene(gene_id: str, hits_with_names: list,
             winning_indices, hits_with_names, bad_name_filter, resolver=resolver,
             score_method=symbol_score, prior=prior)
 
+        if cluster_override and symbol_origin == "relative":
+            symbol_origin = "relative_override"
         result['consensus_name'] = protein_name
         result['consensus_symbol'] = format_symbol(gene_symbol, symbol_case)
 
@@ -1213,6 +1225,7 @@ def annotate_queries(resolved_transcript_hits: dict,
         'symbols_from_ortholog': 0,
         'symbols_from_ncbi': 0,
         'symbols_from_relative': 0,
+        'symbols_relative_override': 0,
         'genes_with_taxon_removed': 0,
         'terms_taxon_removed': 0,
     }
@@ -1230,6 +1243,7 @@ def annotate_queries(resolved_transcript_hits: dict,
         annot.hit_names = result_dict.get('hit_names', {})
         annot.hit_symbols = result_dict.get('hit_symbols', {})
         annot.hit_curated_names = result_dict.get('hit_curated_names', {})
+        annot.symbol_source = result_dict.get('symbol_source', '')
         annot.go_n_source = result_dict.get('go_n_source', 0)
         annot.go_curated = result_dict.get('go_curated', set())
         annot.go_source_accs = result_dict.get('go_source_accs', set())
@@ -1271,8 +1285,10 @@ def annotate_queries(resolved_transcript_hits: dict,
                 stats['symbols_from_ortholog'] += 1
             elif result_dict['symbol_source'] == 'ncbi':
                 stats['symbols_from_ncbi'] += 1
-            elif result_dict['symbol_source'] == 'relative':
+            elif result_dict['symbol_source'].startswith('relative'):
                 stats['symbols_from_relative'] += 1
+                if result_dict['symbol_source'] == 'relative_override':
+                    stats['symbols_relative_override'] += 1
         if result_dict['go_terms']:
             stats['genes_with_go_terms'] += 1
         if result_dict['cluster_fraction'] > 0:
@@ -1312,8 +1328,9 @@ def annotate_queries(resolved_transcript_hits: dict,
     if stats['symbols_from_ncbi'] > 0:
         logger.info(f"    - From NCBI cross-reference: {stats['symbols_from_ncbi']:,}")
     if stats['symbols_from_relative'] > 0:
-        logger.info(f"    - Decided by a close relative's ortholog (hits carrying its symbol): "
-                    f"{stats['symbols_from_relative']:,}")
+        logger.info(f"    - Decided by a relative's ortholog (hits carrying its symbol): "
+                    f"{stats['symbols_from_relative']:,}, of which {stats['symbols_relative_override']:,} over a "
+                    f"symbol group the hits scored higher")
     if stats['symbols_from_propagation'] > 0:
         logger.info(f"    - From name-based propagation: {stats['symbols_from_propagation']:,}")
     logger.info(f"  Coding genes with GO terms: {stats['genes_with_go_terms']:,} "

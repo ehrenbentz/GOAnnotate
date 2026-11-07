@@ -446,14 +446,16 @@ The comparison is stratified by any gene- or transcript-level attributes named w
 
 Resolution follows from the annotation mode. In the default `fill` mode the existing annotation is kept wherever it exists, genes without an existing symbol or product (LOC-style genes, novel genes) receive the GOAnnotate values, and every gene where the two symbols both exist and disagree is listed in `{prefix}_review.tsv` with both annotations, the stratification attributes and the confidence, while the GFF3 keeps the existing symbol and records the GOAnnotate one as `goannotate_symbol`. `--annotation-mode replace` takes the GOAnnotate values everywhere instead.
 
-### Concordance Metrics
+### Hit Support (Concordance) and the Evaluation Report
 
-For each annotated gene with hits, GOAnnotate computes two concordance scores against the gene's full merged hit pool (not just the winning cluster), once the symbol and product are final (after the reference checks, the orthology module and InterProScan), so they describe the annotation that is written:
+For each annotated gene with hits, GOAnnotate computes two hit-support (concordance) scores against the gene's full merged hit pool (not just the winning cluster), once the symbol and product are final (after the reference checks, the orthology module and InterProScan), so they describe the annotation that is written:
 
 - **Name concordance:** the fraction of the gene's hits whose cleaned protein name matches the final product (at or above the similarity threshold).
 - **Symbol concordance:** the fraction of the gene's hits that carry a symbol and name the gene of the final symbol: the symbol itself, a copy form of it or the gene it is a copy form of (one genome suffix: kdm2aa and KDM2A), the replaced voted symbol, or one of the gene's aliases (hit symbols of the same gene, reference-species synonyms). Hits without a symbol (many TrEMBL entries) are not counted.
 
 A name concordance of 1.0 means every hit agrees with the product. Low concordance (e.g., < 0.2) indicates the gene's hits are split across divergent annotations, which can happen with multidomain proteins, gene fusions, or genuinely ambiguous homology, or that the product came from another source (a close relative's ortholog, an InterPro domain). Genes without hits (symbols filled from close relatives) get 0 and are left out of the summary statistics. The confidence score is computed from these final values.
+
+**Evaluation report.** `reports/{prefix}_evaluation.tsv` scores every gene's final symbol and product against each source of evidence independently, without changing anything: the gene's own hits (`hits_symbol`, `hits_name`: agree at half the hits or more, minority, disagree), the reference proteome (`reference`: the symbol's reference protein is the gene's best reference hit, near_best within 90% of it, below, absent when the gene hits other reference proteins but not this one, not_reference for a lineage symbol, none), the relatives' one-to-one orthologs and the same-species annotation (`relatives`, `same_species`, with the symbols), the InterPro entries (`domains`: the product shares an informative word with an entry description; entry descriptions name domains and families, so a shared word supports the product and `no_shared_word` says nothing against it), and the product against the symbol (`product_symbol`: the product names the gene of the symbol by the reference protein's name or the curated hits carrying the symbol). `decided_by_relatives` marks genes whose symbol the relatives decided: the orthology prior picked a cluster or symbol group that the hits had scored lower, or the orthology module took, refined or filled the symbol; the relatives' agreement is then read separately for the genes they did not decide. `conflict` lists the sources that contradict a gene's symbol; the summary counts each source's agreement and the conflicts by kind. This report is the check that the decisions made along the way are supported by the evidence, and the list of genes to review.
 
 ## Output Files
 
@@ -477,6 +479,7 @@ The annotation files are written to the top level of the `--output` directory; r
                                              source (hits, reference gene, InterPro); terms removed by the
                                              taxon constraints
         {prefix}_name_audit.txt              what the name and symbol filters removed and kept
+        {prefix}_evaluation.tsv              each gene's final symbol and product against every source of evidence
         {prefix}_extraction_report.tsv       per-transcript extraction flags (genome mode)
         {prefix}_orf_translation.tsv         strand, frame, ORF and completeness of each translated transcript
         {prefix}_protein_input_check.tsv     problems found in a --proteins file

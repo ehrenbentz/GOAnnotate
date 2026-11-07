@@ -301,9 +301,12 @@ idx = list(range(len(pool)))
 name, sym, origin, _ = annotate.select_name_and_symbol(idx, pool, bnf)
 check(sym == "KCNQ4" and origin == "uniprot", f"plain vote: {sym}")
 name, sym, origin, _ = annotate.select_name_and_symbol(idx, pool, bnf, prior=("Kcnq5", True))
-check(sym == "KCNQ5" and origin == "relative" and name == "KCNQ5 protein", f"close ortholog decides: {sym} ({origin})")
+check(sym == "KCNQ5" and origin == "relative_override" and name == "KCNQ5 protein",
+      f"close ortholog decides over the higher-scoring group: {sym} ({origin})")
 name, sym, origin, _ = annotate.select_name_and_symbol(idx, pool, bnf, prior=("Kcnq5", False))
-check(sym == "KCNQ5" and origin == "uniprot", f"distant ortholog wins within the margin (250/300): {sym}")
+check(sym == "KCNQ5" and origin == "relative_override", f"distant ortholog wins within the margin (250/300): {sym} ({origin})")
+name, sym, origin, _ = annotate.select_name_and_symbol(idx, pool, bnf, prior=("Kcnq4", True))
+check(sym == "KCNQ4" and origin == "relative", f"a prior agreeing with the hits is not an override: {sym} ({origin})")
 weak = pool + [hwn("KCNQ3", 100)]
 name, sym, origin, _ = annotate.select_name_and_symbol(list(range(len(weak))), weak, bnf, prior=("KCNQ3", False))
 check(sym == "KCNQ4", f"distant ortholog below the margin does not win: {sym}")
@@ -315,7 +318,7 @@ annotate._init_worker({}, None, bnf, mappings.SymbolResolver())
 far = [hwn("ACTB", 500, "Actin, cytoplasmic 1"), hwn("ACTB", 480, "Actin, cytoplasmic 1"),
        hwn("OXT", 200, "Oxytocin-neurophysin 1")]
 gid, res = annotate.annotate_single_gene("g", far, 0.5, [], "upper", "mean", prior=("Oxt", True))
-check(res["consensus_symbol"] == "OXT" and res["symbol_source"] == "relative"
+check(res["consensus_symbol"] == "OXT" and res["symbol_source"] == "relative_override"
       and res["consensus_name"] == "Oxytocin-neurophysin 1", f"close prior selects the cluster: {res['consensus_symbol']}")
 gid, res = annotate.annotate_single_gene("g", far, 0.5, [], "upper", "mean", prior=("Oxt", False))
 check(res["consensus_symbol"] == "ACTB", f"distant prior does not change the cluster: {res['consensus_symbol']}")

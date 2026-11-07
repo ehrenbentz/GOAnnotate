@@ -1228,6 +1228,18 @@ class OrthologyModule(Module):
                 return True
         return False
 
+    def ortholog_evidence_for(self, gene: str) -> dict:
+        """
+        The relatives' symbol for a gene (reference form; close or distant)
+        and the same-species annotation's one-to-one ortholog symbol, for the
+        evaluation report: {'relatives': symbol, 'close': bool, 'same_species': symbol}.
+        """
+        sym, _ = self.gene_symbol.get(gene, ("", ""))
+        same_sym = ""
+        if self.same and self.orthologs.get(gene, {}).get(self.same.label, ("",))[0] == "1:1":
+            same_sym = self.orthologs[gene][self.same.label][1][0][1] or ""
+        return {"relatives": sym or "", "close": self.gene_close.get(gene, False), "same_species": same_sym}
+
     def _equivalent(self, a: str, b: str) -> str:
         """
         How two symbols name the same gene: 'same' (case-insensitive), 'same_base' (they differ by a

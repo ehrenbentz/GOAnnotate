@@ -785,7 +785,7 @@ def write_summary(output_dir: Path, prefix: str, annotations: dict, args, blast_
                   search_results: str = None, assignment: dict = None, protein_check=None,
                   coverage=None, forbidden_go: dict = None, product_audit: dict = None,
                   word_weights=None, modules: list = None, reference_go: dict = None,
-                  go_weak: dict = None) -> None:
+                  go_weak: dict = None, evaluation: dict = None) -> None:
     stats_file = output_dir / f"{prefix}_summary.txt"
     logger.info(f"Writing summary to {stats_file}")
 
@@ -1081,19 +1081,24 @@ def write_summary(output_dir: Path, prefix: str, annotations: dict, args, blast_
         name_concs = [a.name_concordance for a in annotations.values() if a.consensus_name and a.hits]
         sym_concs = [a.symbol_concordance for a in annotations.values() if a.consensus_symbol and a.hits]
         if name_concs or sym_concs:
-            f.write("Concordance of the final annotation with each gene's hits:\n")
+            f.write("Hit support of the final annotation (fraction of each gene's hits):\n")
             f.write("-" * 70 + "\n")
             f.write("  (name: hits whose name matches the product; symbol: hits with a symbol that name the same gene;\n"
-                    "   genes without hits are not included)\n")
+                    "   genes without hits are not included; columns name_concordance and symbol_concordance)\n")
             if name_concs:
-                f.write(f"  Name concordance:   {len(name_concs):,} genes, mean={statistics.mean(name_concs):.2f}, "
+                f.write(f"  Name:   {len(name_concs):,} genes, mean={statistics.mean(name_concs):.2f}, "
                         f"median={statistics.median(name_concs):.2f}, "
                         f"min={min(name_concs):.2f}, max={max(name_concs):.2f}\n")
             if sym_concs:
-                f.write(f"  Symbol concordance: {len(sym_concs):,} genes, mean={statistics.mean(sym_concs):.2f}, "
+                f.write(f"  Symbol: {len(sym_concs):,} genes, mean={statistics.mean(sym_concs):.2f}, "
                         f"median={statistics.median(sym_concs):.2f}, "
                         f"min={min(sym_concs):.2f}, max={max(sym_concs):.2f}\n")
             f.write("\n")
+
+        if evaluation:
+            from goannotate.evaluate import summary_lines
+            for line in summary_lines(evaluation):
+                f.write(line + "\n")
 
         if comparison:
             f.write("Comparison with existing annotation:\n")

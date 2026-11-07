@@ -158,6 +158,7 @@ class QueryAnnotation:
                                 # foreign_ortholog, foreign_kept, foreign_replaced, foreign_removed, none;
                                 # orthology module: ortholog (close relatives' symbol taken), ortholog_fill
     voted_symbol: str = ""      # the voted symbol, when the reference check replaced it
+    symbol_source: str = ""     # origin of the voted symbol: uniprot, ortholog, ncbi, relative (orthology prior)
     coverage_status: str = ""   # "" (filter off or no hits), pass (hits passed the coverage filter),
                                 # fallback (no hit passed; the unfiltered hits were used)
     best_query_coverage: float = 0.0    # best query coverage among the hits of the winning symbol group
