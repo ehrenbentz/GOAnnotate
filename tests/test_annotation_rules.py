@@ -403,7 +403,7 @@ with tempfile.TemporaryDirectory() as d:
           f"{ann['g1'].symbol_status} {st['rbh_same_gene_form']} {st['rbh_override']}")
 # a fragment: the alignment covers 63% of the protein and 9% of the reference protein
 print("\n# Fragments of translated transcripts")
-for partial, expect in ((set(), ""), ({"g1"}, "PPP1CA")):
+for partial, expect in ((set(), "vote_unverified"), ({"g1"}, "vote_supported")):
     with tempfile.TemporaryDirectory() as d:
         d = Path(d)
         (d / "fwd.tsv").write_text("t1\tsp|P_PP1A|X\t89.7\t29\t1e-11\t55.5\t46\t330\t5\t33\t100\t128\n"
@@ -413,8 +413,20 @@ for partial, expect in ((set(), ""), ({"g1"}, "PPP1CA")):
         uni = type("U", (), {"transcript_to_gene": {"t1": "g1"}})()
         ann = {"g1": QueryAnnotation(query_id="g1", consensus_symbol="PPP1CA", hits=[hit()])}
         assign_ref.assign_symbols(ann, uni, d / "fwd.tsv", d / "rev.tsv", ref, str.upper, partial_genes=partial)
-        check(ann["g1"].consensus_symbol == expect,
-              f"{'fragment' if partial else 'gene model'} at 63% query coverage: symbol {ann['g1'].consensus_symbol!r}")
+        check(ann["g1"].consensus_symbol == "PPP1CA" and ann["g1"].symbol_status == expect,
+              f"{'fragment' if partial else 'gene model'} at 63% query coverage: PPP1CA kept, {ann['g1'].symbol_status}")
+# the voted symbol's protein scores below other, uncovered reference proteins: removed
+with tempfile.TemporaryDirectory() as d:
+    d = Path(d)
+    (d / "fwd.tsv").write_text("t1\tsp|P_MARK2|X\t60\t40\t1e-20\t120\t60\t788\t5\t44\t100\t139\n"
+                               "t1\tsp|P_GRP|X\t45\t30\t1e-5\t50\t60\t148\t5\t34\t100\t129\n")
+    (d / "rev.tsv").write_text("")
+    ref = {"P_MARK2": "MARK2", "P_GRP": "GRP"}
+    uni = type("U", (), {"transcript_to_gene": {"t1": "g1"}})()
+    ann = {"g1": QueryAnnotation(query_id="g1", consensus_symbol="GRP", hits=[hit()])}
+    assign_ref.assign_symbols(ann, uni, d / "fwd.tsv", d / "rev.tsv", ref, str.upper)
+    check(ann["g1"].consensus_symbol == "" and ann["g1"].symbol_status == "unsupported_removed",
+          f"vote whose reference protein scores below others, none covered: removed ({ann['g1'].symbol_status})")
 
 sib = lambda sym: (hit(), "Glutamine synthetase", sym, "uniprot", ("t1",))
 ann = {"a": QueryAnnotation(query_id="a", consensus_name="Glutamine synthetase", consensus_symbol="glula"),
@@ -429,6 +441,18 @@ ann["c"].consensus_symbol = ""
 ann["a"].consensus_symbol = "glul"
 n, ids = annotate.propagate_symbols(ann, {"c": [sib("GLUL")]}, "lower")
 check(ann["c"].consensus_symbol == "glul", "a sibling symbol the hits carry is taken as it is")
+
+# ------------------------------------------------------ FlyBase transcript suffixes
+print("\n# FlyBase transcript and protein identifiers as GN= symbols")
+from goannotate.mappings import gene_symbol_of
+from goannotate.models import BlastHit
+check(gene_symbol_of("kay-RA") == "kay" and gene_symbol_of("CG1647-PB") == "CG1647" and gene_symbol_of("DH31-R") == "DH31-R"
+      and gene_symbol_of("HLA-DRA") == "HLA-DRA" and gene_symbol_of("ABC") == "ABC",
+      "the -RA/-PB suffix is dropped; DH31-R and HLA-DRA are symbols")
+h = BlastHit(query_id="q", subject_id="tr|C4JC86|C4JC86_DROME", pident=90.0, length=100, mismatch=0, gapopen=0,
+             qstart=1, qend=100, sstart=1, send=100, evalue=1e-50, bitscore=200.0,
+             stitle="tr|C4JC86|C4JC86_DROME LD16083p OS=Drosophila melanogaster OX=7227 GN=kay-RA PE=2 SV=1")
+check(h.gene_symbol == "kay", f"a hit's GN=kay-RA gives the symbol kay ({h.gene_symbol})")
 
 # ------------------------------------------------------ confidence of fragments
 print("\n# Confidence of fragments")

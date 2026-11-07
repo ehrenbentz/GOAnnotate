@@ -47,7 +47,7 @@ from collections import Counter, defaultdict
 from pathlib import Path
 
 from goannotate import GOAnnotateError
-from goannotate.mappings import symbol_bases
+from goannotate.mappings import gene_symbol_of, symbol_bases
 from goannotate.search import find_diamond
 
 
@@ -134,7 +134,7 @@ def read_reference_symbols(proteome: Path) -> tuple:
             m = re.search(r"GN=(\S+)", header)
             if not m:
                 continue
-            symbols[acc] = m.group(1)
+            symbols[acc] = gene_symbol_of(m.group(1))
             desc = header[len(sid):].strip()
             desc = desc.split(" OS=")[0]
             desc = re.sub(r"\s*(GN|PE|SV)=\S+", "", desc).strip()
@@ -159,7 +159,7 @@ def read_reference_existence(proteome: Path) -> dict:
             g = re.search(r"GN=(\S+)", line)
             pe = re.search(r"PE=(\d)", line)
             if g and pe:
-                key = g.group(1).upper()
+                key = gene_symbol_of(g.group(1)).upper()
                 existence[key] = min(existence.get(key, 9), int(pe.group(1)))
     return existence
 
@@ -253,6 +253,17 @@ def reference_alignments(forward: Path, ref_symbols: dict) -> dict:
             if bits > out[parts[0]].get(key, (-1.0,))[0]:
                 out[parts[0]][key] = (bits, int(parts[10]), int(parts[11]), int(parts[7]))
     return out
+
+
+def reference_scores_by_gene(forward: Path, ref_symbols: dict, tx2gene: dict) -> dict:
+    """gene -> {upper-case reference symbol: best bitscore} over the gene's transcripts."""
+    out = defaultdict(dict)
+    for tx, aligns in reference_alignments(forward, ref_symbols).items():
+        g = tx2gene.get(tx, tx)
+        for sym, rec in aligns.items():
+            if rec[0] > out[g].get(sym, 0.0):
+                out[g][sym] = rec[0]
+    return dict(out)
 
 
 def _accession(subject_id: str) -> str:
@@ -556,6 +567,7 @@ def assign_symbols(annotations: dict, universe, forward: Path, reverse: Path, re
 
     replaced = 0
     supported = 0
+    unverified = 0
     no_reference = 0
     foreign_kept = 0
     foreign_replaced = 0
@@ -635,10 +647,21 @@ def assign_symbols(annotations: dict, universe, forward: Path, reverse: Path, re
             if ref_descriptions.get(best_symbol):
                 annot.consensus_name = ref_descriptions[best_symbol]
             replaced += 1
+        elif gene_forward_all.get(gene, {}).get(voted, 0.0) >= support_fraction * best_bits:
+            # No reference protein covers the gene (a shared domain, a
+            # fragment, a lineage-specific gene) but the voted symbol's
+            # protein is the gene's best or near-best reference hit: the
+            # reference agrees on the identity and cannot confirm the
+            # coverage, so the vote is kept unverified with lower confidence.
+            # The product name from the vote is kept.
+            annot.consensus_symbol = annot.voted_symbol
+            annot.voted_symbol = ""
+            annot.symbol_status = "vote_unverified"
+            unverified += 1
         else:
-            # The gene resembles reference proteins only partially (a shared
-            # domain, a fragment); no reference symbol describes it. The
-            # product name from the vote is kept.
+            # The gene's sequence prefers other reference proteins to the
+            # voted symbol's (or does not hit it at all) and none of them
+            # covers it: the symbol is removed, the product name kept.
             annot.consensus_symbol = ""
             annot.symbol_status = "unsupported_removed"
             removed += 1
@@ -687,6 +710,7 @@ def assign_symbols(annotations: dict, universe, forward: Path, reverse: Path, re
     for how in ("suffix", "renamed", "rbh"):
         stats[f"foreign_ortholog_{how}"] = foreign_ortholog[how]
     stats["reference_best_hit"] = replaced
+    stats["vote_unverified"] = unverified
     stats["unsupported_removed"] = removed
     stats["rbh_total"] = len(rbh)
     stats["symbol_policy"] = symbol_policy

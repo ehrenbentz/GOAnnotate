@@ -67,6 +67,10 @@ class ModuleContext:
     bad_name_filter: object = None   # BadNameFilter, for modules that take symbols or products from elsewhere
     symbol_case_fn: object = None    # formats a symbol in the --symbol-case of the run
     reference_descriptions: dict = None  # upper-case reference symbol -> reference protein name (Stage 3b)
+    reference_scores: dict = None        # gene -> {upper-case reference symbol: best bitscore} (forward search)
+    reference_symbols: set = None        # upper-case symbols of the reference proteome
+    n_terminus_missing: set = None       # transcripts whose protein lacks the N-terminus (fragments, no start codon)
+    transcript_best_bitscore: dict = None   # transcript -> bitscore of its best Diamond hit
 
 
 class ModuleError(Exception):

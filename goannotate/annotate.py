@@ -510,6 +510,8 @@ ORTHOLOG_CONFIDENCE = {
 
 # Confidence subtracted for each end missing from a translated transcript's protein
 FRAGMENT_PENALTY = 0.05
+# Confidence subtracted from a voted symbol that no reference protein covers
+UNVERIFIED_PENALTY = 0.1
 
 
 def compute_confidence(annot: QueryAnnotation, ortholog: str = None) -> tuple:
@@ -523,6 +525,8 @@ def compute_confidence(annot: QueryAnnotation, ortholog: str = None) -> tuple:
       0.15 * symbol concordance across all merged hits
     minus 0.1 when no hit of the gene passed the hit coverage filter and
     the annotation rests on partial alignments (coverage status fallback),
+    minus UNVERIFIED_PENALTY when no reference protein covers the gene and
+    the voted symbol is kept unverified (symbol status vote_unverified),
     and, for translated transcripts, FRAGMENT_PENALTY for each end missing
     from the protein (annot.completeness: 5_partial or 3_partial one end,
     partial both).
@@ -547,6 +551,8 @@ def compute_confidence(annot: QueryAnnotation, ortholog: str = None) -> tuple:
              + 0.15 * annot.symbol_concordance)
     if annot.coverage_status == "fallback":
         score = max(0.0, score - 0.1)
+    if annot.symbol_status == "vote_unverified":
+        score = max(0.0, score - UNVERIFIED_PENALTY)
     missing_ends = {"5_partial": 1, "3_partial": 1, "partial": 2}.get(annot.completeness, 0)
     score = max(0.0, score - FRAGMENT_PENALTY * missing_ends)
     rule = ORTHOLOG_CONFIDENCE.get(ortholog)

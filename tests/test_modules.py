@@ -172,7 +172,8 @@ def test_module_end_to_end(tmp):
     selected = select_modules(args)
     check(len(selected) == 1 and isinstance(selected[0], SignalPModule), "signalp module selected")
     ctx = ModuleContext(query_fasta=proteins, search_mode="blastp", work_dir=work, reports_dir=reports,
-                        prefix="test", threads=2, universe=universe, annotations=annotations)
+                        prefix="test", threads=2, universe=universe, annotations=annotations,
+                        n_terminus_missing={"g3_t1"})     # g3's protein lacks its N-terminus
     ran = run_modules(selected, ctx)
     check(len(ran) == 1, "module ran with the stand-in executable")
     m = ran[0]
@@ -183,12 +184,14 @@ def test_module_end_to_end(tmp):
     check(len(inputs) == 10 and all(len(s) <= 70 for s in inputs),
           f"7 distinct annotated starts + 3 alternative starts sent, each at most 70 residues ({len(inputs)})")
     check(m.counts == {"proteins_scored": 8, "distinct_starts": 7, "transcripts_with_sp": 4, "below_cutoff": 0,
-                       "genes_with_sp": 3, "genes_tested": 6, "alt_candidates": 2, "alt_distinct": 3,
-                       "alt_sp": 2, "alt_supported": 1}, f"counts {m.counts}")
+                       "genes_with_sp": 3, "genes_tested": 5, "not_assessable": 1, "genes_not_assessable": 1,
+                       "alt_candidates": 2, "alt_distinct": 3, "alt_sp": 2, "alt_supported": 1}, f"counts {m.counts}")
     check(m._tx_value("g2_sec_t2") == "yes" and m._tx_cleavage("g2_sec_t2") == "22-23",
           "result copied to the isoform with the same N-terminus")
     check(m._gene_value("g1") == "yes (1/2 isoforms)" and m._gene_value("g2") == "yes"
-          and m._gene_value("g3") == "no" and m._gene_value("g9") == "", "gene column values")
+          and m._gene_value("g3") == "not_assessable" and m._tx_value("g3_t1") == "not_assessable"
+          and m._gene_value("g9") == "", "gene column values; a protein without its N-terminus is not assessable")
+    check(any("Not assessable:             1 proteins" in l for l in m.summary_lines()), "summary line for not assessable")
     check(m._tx_value("g1_sec_t1") == "yes" and m._tx_probability("g1_sec_t1") == "0.988"
           and m._tx_cleavage("g1_sec_t1") == "22-23" and m._tx_probability("g1_t2") == "", "transcript columns")
     check(m._tx_value("g4_t1") == "no" and

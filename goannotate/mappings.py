@@ -566,6 +566,15 @@ class ReferenceNomenclature:
 
 # Genome-duplication and copy suffixes of gene symbols (.2, a, b, l, la, lb, l2)
 _GENOME_SUFFIX = re.compile(r"(?:\.\d+|L?[AB]|L\d*)$", re.I)
+# FlyBase transcript and protein identifiers carried as gene symbols by cDNA-clone entries (kay-RA, CG1647-PB)
+_TRANSCRIPT_SUFFIX = re.compile(r"-[RP][A-Z]$")
+
+
+def gene_symbol_of(gn: str) -> str:
+    """A UniProt GN= value as a gene symbol: a FlyBase transcript or protein suffix (-RA, -PB) is dropped."""
+    if gn and _TRANSCRIPT_SUFFIX.search(gn) and len(gn) > 3:
+        return gn[:-3]
+    return gn
 
 
 def symbol_base(symbol: str) -> str:

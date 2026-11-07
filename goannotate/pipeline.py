@@ -241,6 +241,14 @@ def run(args) -> None:
     modules_auto = (args.modules or "").strip().lower() == "auto"
     early_modules = []
     ortholog_prior = {}
+    # Proteins without their N-terminus: translated transcripts that lack a
+    # start (5' partial), and gene models whose CDS has no start codon
+    n_terminus_missing = set()
+    if translation is not None:
+        n_terminus_missing = {t for t, r in orfs.read_report(translation.report).items()
+                              if r["completeness"] in ("5_partial", "partial")}
+    elif extraction is not None:
+        n_terminus_missing = set(extraction.no_start_codon)
     ctx = None
     if selected:
         ctx = modules.ModuleContext(
@@ -249,7 +257,10 @@ def run(args) -> None:
             force=getattr(args, "force_modules", False), universe=universe, genes=genes,
             annotations={}, go_hierarchy=go_hierarchy, forbidden_go=set(forbidden_go),
             namespaces=list(args.namespace), bad_name_filter=bad_name_filter,
-            symbol_case_fn=lambda s: annotate_mod.format_symbol(s, args.symbol_case))
+            symbol_case_fn=lambda s: annotate_mod.format_symbol(s, args.symbol_case),
+            n_terminus_missing=n_terminus_missing,
+            transcript_best_bitscore={tx: max(h[0].bitscore for h in hits)
+                                      for tx, hits in resolved_hits.items() if hits})
         early_modules = modules.start_modules([m for m in selected if m.runs_before_vote], ctx, auto=modules_auto)
         for m in early_modules:
             ortholog_prior.update(m.prior())
@@ -385,6 +396,9 @@ def run(args) -> None:
     if ctx is not None:
         ctx.annotations = annotations
         ctx.reference_descriptions = ref_descriptions
+        ctx.reference_symbols = {s.upper() for s in ref_symbols.values() if s}
+        ctx.reference_scores = (assign.reference_scores_by_gene(forward, ref_symbols, universe.transcript_to_gene)
+                                if forward else {})
         modules_run = modules.integrate_modules(early_modules, ctx)
     reference_go = refgo.add_reference_go(
         annotations, ref_symbols, args.db, go_hierarchy, set(forbidden_go), list(args.namespace),

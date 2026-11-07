@@ -3,8 +3,9 @@
 Close relatives with NCBI RefSeq annotations are chosen automatically from
 the query organism's lineage (--taxid), or named with --relative. Their
 proteomes and annotations are downloaded with the NCBI datasets
-command-line tool; one protein per gene (the longest) of the query and of
-each relative is given to OrthoFinder (Emms & Kelly 2019, Genome Biology).
+command-line tool; one protein per gene is given to OrthoFinder (Emms &
+Kelly 2019, Genome Biology): the query isoform with the best Diamond hit
+(the longest among equals), and the longest protein of each relative's genes.
 
 For every query gene the module records its orthogroup and its orthologs in
 each relative with their symbols, and derives one ortholog symbol: the
@@ -64,6 +65,7 @@ run and the annotation rests on the hits alone.
 """
 
 import gzip
+import hashlib
 import json
 import logging
 import os
@@ -75,7 +77,7 @@ import zipfile
 from collections import Counter
 from pathlib import Path
 
-from goannotate.mappings import symbol_base  # noqa: F401 (used here and by importers of this module)
+from goannotate.mappings import symbol_base, symbol_bases  # noqa: F401 (used here and by importers of this module)
 from goannotate.modules.base import Module, ModuleContext, ModuleError, ModuleSkipped, ToolStatus, clean_sequence
 from goannotate.sequences import read_fasta
 
@@ -91,6 +93,9 @@ DEFAULT_MIN_NAMED = 0.2         # absolute floor on a candidate relative's infor
 DEFAULT_NAMED_RATIO = 0.75      # and at least this fraction of the best candidate at its level or closer
 DEFAULT_NAMED_MARGIN = 0.10     # a farther candidate is preferred when better by this much (per level step)
 RBH_STATUSES = {"rbh", "rbh_override", "rbh_added"}
+# A close relatives' reference symbol replaces a supported symbol only when the gene's own alignment to
+# that symbol's reference protein scores at least this fraction of its alignment to the voted symbol's
+TAKE_MARGIN = 0.9
 # Official reference symbols of uncharacterized genes (C19orf81, KIAA1549L). The bad-name rules reject them
 # from hits, where they come with uninformative names; a close relative's one-to-one ortholog mapped to the
 # reference gene identifies the gene, so they are accepted from that route.
@@ -365,7 +370,8 @@ class OrthologyModule(Module):
         self.close_rank = getattr(args, "ortholog_close_rank", DEFAULT_CLOSE_RANK) or DEFAULT_CLOSE_RANK
         self.taxid = getattr(args, "taxid", None)
         self.db = getattr(args, "db", None)
-        self.with_same_species = getattr(args, "same_species", False)
+        same = getattr(args, "same_species", "on")
+        self.with_same_species = same if isinstance(same, bool) else same == "on"
         self.go_evidence = getattr(args, "go_evidence", "all")
         self.go_support_stats = {}
         self.same = None                    # Relative: the query species' own annotation
@@ -510,7 +516,7 @@ class OrthologyModule(Module):
                 if r.taxid == int(self.taxid) or (query_name and r.organism.startswith(query_name))]
         rows = [r for r in rows if r.accession not in {c.accession for c in self.relatives}]
         if not rows:
-            logger.warning(f"  --same-species: no RefSeq annotation of taxon {self.taxid} was found")
+            logger.info(f"  No RefSeq annotation of the query species (taxon {self.taxid}) to add as a relative")
             return
         rel = rows[0]
         rel.level = "same species"
@@ -784,18 +790,24 @@ class OrthologyModule(Module):
                                                  f"{'close' if r.close else 'distant'}: {r.lca_rank or '?'} "
                                                  f"{r.lca_name})" for r in self.relatives))
 
-        # OrthoFinder input: one protein per gene
+        # OrthoFinder input: one protein per gene of the query, the isoform with the best Diamond hit
+        # (a mis-extended model aligns worse than a shorter isoform), the longest among equals or
+        # without hits; the longest per gene of each relative
         indir = base / "input"
         if indir.exists():
             shutil.rmtree(indir)
         indir.mkdir()
+        best_bits = ctx.transcript_best_bitscore or {}
         query = {}
+        rank = {}
         for header, seq in read_fasta(str(ctx.query_fasta)):
             tx = header.split()[0]
             gene = ctx.universe.transcript_to_gene.get(tx, tx)
             s = clean_sequence(seq)
-            if s and (gene not in query or len(s) > len(query[gene])):
+            key = (best_bits.get(tx, 0.0), len(s))
+            if s and (gene not in query or key > rank[gene]):
                 query[gene] = s
+                rank[gene] = key
         _write_fasta(indir / "query.faa", query)
         for rel in self.relatives:
             _write_fasta(indir / f"{rel.label}.faa", self._load_relative(rel, cache))
@@ -804,7 +816,10 @@ class OrthologyModule(Module):
         self._normalize_symbols(is_bad)
         self._extend_names({g.ref_symbol for r in self.relatives for g in r.proteins.values() if g.ref_symbol})
 
-        signature = json.dumps({"query": len(query), "relatives": [r.accession for r in self.relatives]})
+        # the results are reused only for the same query proteins (a different isoform per gene changes them)
+        digest = hashlib.sha1("".join(f"{g}:{s}" for g, s in sorted(query.items())).encode()).hexdigest()
+        signature = json.dumps({"query": len(query), "proteins": digest,
+                                "relatives": [r.accession for r in self.relatives]})
         results = base / "orthofinder" / "Results_goannotate"
         marker = base / "orthofinder.done"
         if not (results.exists() and marker.exists() and marker.read_text() == signature and not ctx.force):
@@ -1119,6 +1134,15 @@ class OrthologyModule(Module):
                     self.decision[gene] = "conflict_kept"
                     self.check["conflict_kept"] += 1
                     continue
+                # The gene's own sequence decides between a supported core symbol and a reference symbol
+                # of the relatives: the relatives' symbol is taken only when its reference protein scores
+                # at least TAKE_MARGIN of the voted symbol's. A lineage symbol with no reference protein
+                # cannot be judged by the sequence and is taken; a gene without a reference hit likewise.
+                if core and status not in FILL_STATUSES and not self._sequence_allows(ctx, gene, core, sym):
+                    self.decision[gene] = "conflict_kept"
+                    self.check["conflict_kept"] += 1
+                    self.check["conflict_sequence"] += 1
+                    continue
             elif not core or status in FILL_STATUSES:
                 take = True                                 # a vote left nothing better: fill
             if not take:
@@ -1146,9 +1170,12 @@ class OrthologyModule(Module):
                 self.filled[gene] = old
                 self.decision[gene] = "filled"
                 n_filled += 1
-            if not annot.consensus_name or (core and annot.consensus_name == ref_descriptions.get(core.upper())):
+            # the product follows the symbol: a taken symbol names another gene than the vote's product,
+            # and a gene the vote left unnamed gets the reference protein's name; a lineage form of the
+            # same gene keeps the hits' product
+            if taken or not core or not self._equivalent(core, sym):
                 prod = product_for(gene, sym, annot)
-                if prod:
+                if prod and prod != annot.consensus_name:
                     annot.consensus_name = prod
                     annot.product_note = "ortholog"
                     n_products += 1
@@ -1180,6 +1207,7 @@ class OrthologyModule(Module):
         n_close_syms = sum(1 for g, (sym, _) in self.gene_symbol.items() if sym and self.gene_close.get(g))
         conflicts = sum(1 for g, (old, st) in self.overrides.items() if old and st in SUPPORTED_STATUSES)
         self.check.setdefault("conflict_kept", 0)
+        self.check.setdefault("conflict_sequence", 0)
         self.counts = {"relatives": len(self.relatives), "close_relatives": sum(1 for r in self.relatives if r.close),
                        "candidates_examined": len(self.candidates),
                        "query_genes": coding, "genes_in_orthogroups": with_og,
@@ -1227,6 +1255,24 @@ class OrthologyModule(Module):
             if gn and self._equivalent(sym, gn):
                 return True
         return False
+
+    def _sequence_allows(self, ctx: ModuleContext, gene: str, core: str, sym: str) -> bool:
+        """
+        Whether the gene's alignments to the reference proteome allow the
+        relatives' reference symbol sym to replace the core symbol: sym has
+        no reference protein (a lineage symbol), the gene has no reference
+        hit, or sym's reference protein scores at least TAKE_MARGIN of the
+        core symbol's (zero when the gene does not hit it).
+        """
+        ref_symbols = ctx.reference_symbols or set()
+        if sym.upper() not in ref_symbols:
+            return True
+        scores = (ctx.reference_scores or {}).get(gene)
+        if not scores:
+            return True
+        core_forms = {core.upper()} | symbol_bases(core.upper())
+        core_score = max((scores.get(s, 0.0) for s in core_forms), default=0.0)
+        return scores.get(sym.upper(), 0.0) >= TAKE_MARGIN * core_score
 
     def ortholog_evidence_for(self, gene: str) -> dict:
         """
@@ -1363,8 +1409,10 @@ class OrthologyModule(Module):
         lines.append(f"    Symbols taken (close):       {c.get('symbols_taken', 0):,}, of which "
                      f"{c.get('symbols_taken_conflicts', 0):,} replace a supported core symbol (decision 'taken' in "
                      f"the report; review these)")
-        lines.append(f"    Conflicts kept:              {c.get('check_conflict_kept', 0):,} (one close relative alone "
-                     f"against a reciprocal best hit that no hit supports; decision 'conflict_kept')")
+        lines.append(f"    Conflicts kept:              {c.get('check_conflict_kept', 0):,} (the core symbol stays: "
+                     f"{c.get('check_conflict_sequence', 0):,} where the gene's sequence scores the relatives' "
+                     f"reference protein below 90% of the voted symbol's, the rest one close relative alone against "
+                     f"a reciprocal best hit that no hit supports; decision 'conflict_kept')")
         lines.append(f"    Symbols filled:              {c.get('symbols_filled', 0):,} "
                      f"({c.get('filled_unnamed', 0):,} unnamed genes, {c.get('filled_foreign_kept', 0):,} lineage symbols); "
                      f"products {c.get('products_filled', 0):,}")

@@ -187,6 +187,7 @@ class SignalPModule(Module):
     def __init__(self, args):
         super().__init__(args)
         self.results = {}            # transcript key -> SignalPResult at the annotated start
+        self.missing = set()         # transcripts whose protein lacks the N-terminus: no signal peptide can be seen
         self.alt = {}                # transcript key -> (Met position 1-based, SignalPResult in protein coordinates)
         self.alt_support = {}        # transcript key -> homology note for the alternative start
         self.gene_sp = {}            # gene key -> (n isoforms with SP, n isoforms scored)
@@ -386,10 +387,11 @@ class SignalPModule(Module):
         predicted = self._predict(inputs, base_dir / "annotated_starts", "annotated starts", ctx.force)
         self.results = {tx: predicted[rep] for tx, rep in rep_of.items()}
 
+        self.missing = set(ctx.n_terminus_missing or ())
         if self.check_alt:
             candidates = {}          # transcript -> 0-based positions of the gated Mets
             for tx, s in seqs.items():
-                if self.is_sp(self.results.get(tx)):
+                if self.is_sp(self.results.get(tx)) or tx in self.missing:
                     continue
                 starts = alternative_starts(s)
                 if starts:
@@ -417,19 +419,31 @@ class SignalPModule(Module):
 
     def integrate(self, ctx: ModuleContext) -> dict:
         universe = ctx.universe
+        self.missing = set(ctx.n_terminus_missing or ()) | self.missing
+        # a protein without its N-terminus cannot show a signal peptide: a negative call on it says
+        # nothing, so only positive calls and calls on complete N-termini count
         self.gene_sp = {}
         for tx_id, gene_id in universe.transcript_to_gene.items():
             r = self.results.get(tx_id)
             if r is None:
                 continue
             n_sp, n_scored = self.gene_sp.get(gene_id, (0, 0))
-            self.gene_sp[gene_id] = (n_sp + (1 if self.is_sp(r) else 0), n_scored + 1)
+            if self.is_sp(r):
+                self.gene_sp[gene_id] = (n_sp + 1, n_scored + 1)
+            elif tx_id not in self.missing:
+                self.gene_sp[gene_id] = (n_sp, n_scored + 1)
+            else:
+                self.gene_sp.setdefault(gene_id, (0, 0))
         n_tx_sp = sum(1 for r in self.results.values() if self.is_sp(r))
         n_below = sum(1 for r in self.results.values() if r.has_sp and not self.is_sp(r))
         n_gene_sp = sum(1 for n, _ in self.gene_sp.values() if n)
+        n_not_assessable = sum(1 for tx, r in self.results.items() if tx in self.missing and not self.is_sp(r))
+        n_genes_assessable = sum(1 for _, n in self.gene_sp.values() if n)
         self.counts = {"proteins_scored": len(self.results), "distinct_starts": self.n_distinct,
                        "transcripts_with_sp": n_tx_sp, "below_cutoff": n_below,
-                       "genes_with_sp": n_gene_sp, "genes_tested": len(self.gene_sp)}
+                       "genes_with_sp": n_gene_sp, "genes_tested": n_genes_assessable,
+                       "not_assessable": n_not_assessable,
+                       "genes_not_assessable": len(self.gene_sp) - n_genes_assessable}
         self.report = ctx.reports_dir / f"{ctx.prefix}_secretome.tsv"
         self._write_secretome(ctx)
         logger.info(f"  Signal peptides: {n_tx_sp:,} proteins on {n_gene_sp:,} genes; secretome list {self.report}"
@@ -488,6 +502,8 @@ class SignalPModule(Module):
         if v is None:
             return ""
         n_sp, n_scored = v
+        if n_scored == 0:
+            return "not_assessable"
         if n_sp == 0:
             return "no"
         return "yes" if n_sp == n_scored else f"yes ({n_sp}/{n_scored} isoforms)"
@@ -496,7 +512,9 @@ class SignalPModule(Module):
         r = self.results.get(tx_key)
         if r is None:
             return ""
-        return "yes" if self.is_sp(r) else "no"
+        if self.is_sp(r):
+            return "yes"
+        return "not_assessable" if tx_key in self.missing else "no"
 
     def _tx_probability(self, tx_key: str) -> str:
         r = self.results.get(tx_key)
@@ -579,6 +597,10 @@ class SignalPModule(Module):
                   else "SignalP's own call")
         lines.append(f"    Signal peptides:            {c.get('transcripts_with_sp', 0):,} proteins on "
                      f"{c.get('genes_with_sp', 0):,} of {c.get('genes_tested', 0):,} genes ({cutoff})")
+        if c.get("not_assessable"):
+            lines.append(f"    Not assessable:             {c['not_assessable']:,} proteins without their N-terminus "
+                         f"({c.get('genes_not_assessable', 0):,} genes with no complete N-terminus; a negative call "
+                         f"on them says nothing)")
         if self.min_probability:
             lines.append(f"    Below the cutoff:           {c.get('below_cutoff', 0):,} SignalP calls")
         if self.report:

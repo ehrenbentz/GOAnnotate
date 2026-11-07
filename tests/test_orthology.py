@@ -531,6 +531,42 @@ def test_module(tmp: Path, db: Path):
           f"a hit carrying the relatives' symbol lifts the guard: {m10.decision['g1']}")
     check(any("Conflicts kept:              1" in l for l in m10.summary_lines()), "summary line for conflicts kept")
 
+    # The gene's own sequence decides a taken symbol: the relatives' reference symbol replaces a supported
+    # core symbol only when its reference protein scores at least 90% of the core symbol's
+    for scores, expect, label in (({"g1": {"OXT": 300.0, "AVP": 280.0}}, "taken", "within 90%"),
+                                  ({"g1": {"OXT": 300.0, "AVP": 200.0}}, "conflict_kept", "below 90%"),
+                                  ({"g1": {"OXT": 300.0}}, "conflict_kept", "absent from the reference hits"),
+                                  ({}, "taken", "no reference hit")):
+        ann7 = {g: QueryAnnotation(query_id=g) for g in names}
+        ann7["g1"].consensus_symbol, ann7["g1"].symbol_status = "OXT", "rbh"
+        ann7["g1"].consensus_name = "Oxytocin-neurophysin 1"
+        ann7["g1"].hits = [type("H", (), {"gene_symbol": "Avp"})()]
+        ctx7 = ModuleContext(query_fasta=Path("q.faa"), search_mode="blastp", work_dir=work, reports_dir=reports,
+                             prefix="s", threads=60, universe=universe, annotations={}, bad_name_filter=bf,
+                             symbol_case_fn=str.upper, reference_symbols={"OXT", "AVP"}, reference_scores=scores,
+                             reference_descriptions={"AVP": "vasopressin-neurophysin 2-copeptin"})
+        m15 = OrthologyModule(Namespace(**{**vars(args), "ortholog_symbol": "weighted", "relative": ["GCF_B", "GCF_E"]}))
+        start_modules([m15], ctx7)
+        ctx7.annotations = ann7
+        integrate_modules([m15], ctx7)
+        a = ann7["g1"]
+        product_ok = (a.consensus_name == "vasopressin-neurophysin 2-copeptin") if expect == "taken" \
+            else (a.consensus_name == "Oxytocin-neurophysin 1")
+        check(m15.decision["g1"] == expect and a.consensus_symbol == ("AVP" if expect == "taken" else "OXT") and product_ok,
+              f"relatives' reference symbol {label}: {m15.decision['g1']}, {a.consensus_symbol}, {a.consensus_name}")
+    # a lineage symbol of the relatives has no reference protein and is taken
+    ann8 = {g: QueryAnnotation(query_id=g) for g in names}
+    ann8["g1"].consensus_symbol, ann8["g1"].symbol_status = "OXT", "rbh"
+    ann8["g1"].hits = [type("H", (), {"gene_symbol": "Avp"})()]
+    ctx8 = ModuleContext(query_fasta=Path("q.faa"), search_mode="blastp", work_dir=work, reports_dir=reports,
+                         prefix="s", threads=60, universe=universe, annotations={}, bad_name_filter=bf,
+                         symbol_case_fn=str.upper, reference_symbols={"OXT"}, reference_scores={"g1": {"OXT": 300.0}})
+    m16 = OrthologyModule(Namespace(**{**vars(args), "ortholog_symbol": "weighted", "relative": ["GCF_B", "GCF_E"]}))
+    start_modules([m16], ctx8)
+    ctx8.annotations = ann8
+    integrate_modules([m16], ctx8)
+    check(m16.decision["g1"] == "taken", f"a symbol outside the reference nomenclature is taken: {m16.decision['g1']}")
+
     # The close relatives' own form of the same gene replaces the core's reference-style symbol
     from goannotate.modules.orthology import RelGene
     m12 = OrthologyModule(Namespace(**{**vars(args), "ortholog_symbol": "weighted"}))

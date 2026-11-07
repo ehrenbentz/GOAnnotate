@@ -154,6 +154,9 @@ def evaluate(annotations: dict, universe, ref_alignments: dict, ref_symbol_set: 
             if orthology is not None:
                 ev = orthology.ortholog_evidence_for(gene_id)
                 rel_sym, same_sym = ev.get("relatives", ""), ev.get("same_species", "")
+                if bad_name_filter is not None:      # an identifier (LOC123) names nothing
+                    rel_sym = "" if rel_sym and bad_name_filter.is_bad_symbol(rel_sym) else rel_sym
+                    same_sym = "" if same_sym and bad_name_filter.is_bad_symbol(same_sym) else same_sym
                 from_relatives = (annot.ortholog_reference_symbol or "").upper() == rel_sym.upper() and rel_sym
                 if symbol and rel_sym:
                     agree = from_relatives or orthology._equivalent(symbol, rel_sym)

@@ -199,6 +199,7 @@ class ExtractionResult:
     n_proteins_written: int = 0
     flag_counts: Counter = field(default_factory=Counter)
     missing_sequences: set = field(default_factory=set)
+    no_start_codon: set = field(default_factory=set)   # transcripts whose CDS does not begin with a start codon
 
 
 def _write_fasta_record(fh, header: str, seq: str, width: int = 80) -> None:
@@ -391,6 +392,7 @@ def extract_sequences(genes: list, genome: dict, output_dir: Path, prefix: str,
                         flags.append("no_stop_codon")
                     if coding_seq[:3] != "ATG":
                         flags.append(f"start_codon:{coding_seq[:3]}")
+                        result.no_start_codon.add(tx.key)
                     internal = protein.count("*")
                     if internal:
                         flags.append(f"internal_stop:{internal}")

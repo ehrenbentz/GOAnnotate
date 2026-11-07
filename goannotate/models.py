@@ -96,7 +96,8 @@ class BlastHit:
             return ""
         match = re.search(r'GN=(\S+)', self.stitle)
         if match:
-            return match.group(1)
+            from goannotate.mappings import gene_symbol_of
+            return gene_symbol_of(match.group(1))
         return ""
 
     @property

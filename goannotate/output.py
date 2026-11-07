@@ -988,7 +988,9 @@ def write_summary(output_dir: Path, prefix: str, annotations: dict, args, blast_
             f.write(f"  RBH named an unnamed gene:        {assignment.get('rbh_added', 0):,}\n")
             f.write(f"  Vote supported by sequence:       {assignment.get('vote_supported', 0):,}\n")
             f.write(f"  Vote replaced by closest protein: {assignment.get('reference_best_hit', 0):,}\n")
-            f.write(f"  Vote removed (partial homology):  {assignment.get('unsupported_removed', 0):,}\n")
+            f.write(f"  Vote unverified (best reference hit, not covered): {assignment.get('vote_unverified', 0):,}\n")
+            f.write(f"  Vote removed (other reference proteins score higher, none covered): "
+                    f"{assignment.get('unsupported_removed', 0):,}\n")
             f.write(f"  Vote without reference hit, kept: {assignment.get('vote_no_reference_hit', 0):,}\n")
             if assignment.get("symbol_policy") == "any":
                 f.write(f"  Non-reference symbol, kept:       {assignment.get('vote_foreign_symbol', 0):,}\n")

@@ -383,11 +383,11 @@ Examples:
     g.add_argument("--relative-named-margin", type=float, default=0.10, metavar="F",
                    help="Closer relatives are preferred; a candidate one lineage level farther out is taken\n"
                         "first only when its fraction is higher by F (default: 0.10, per level)")
-    g.add_argument("--same-species", action="store_true",
-                   help="Also use the RefSeq annotation of the query species itself (the newest, needs\n"
-                        "--taxid), beyond --relatives, so that a previous annotation's symbols carry over:\n"
-                        "its one-to-one ortholog's symbol is used unless the other relatives agree on a\n"
-                        "different one; supported symbols are also compared with it")
+    g.add_argument("--same-species", default="on", choices=["on", "off"],
+                   help="Also use the RefSeq annotation of the query species itself when one exists (the\n"
+                        "newest, needs --taxid), beyond --relatives, so that a previous annotation's symbols\n"
+                        "carry over: its one-to-one ortholog's symbol is used unless the other relatives\n"
+                        "agree on a different one; supported symbols are also compared with it (default: on)")
     g.add_argument("--relatives-dir", metavar="DIR",
                    help="Directory where relatives' annotations are downloaded and kept for later runs\n"
                         "(default: intermediate/{prefix}_orthology/relatives)")

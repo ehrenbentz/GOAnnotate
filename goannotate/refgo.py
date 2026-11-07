@@ -27,9 +27,10 @@ from goannotate import mappings
 logger = logging.getLogger(__name__)
 
 # Symbols the reference gene's GO terms are transferred through: supported by the reference
-# proteome, or taken from the relatives' orthologs
-REFERENCE_GO_STATUSES = {"rbh", "rbh_override", "rbh_added", "vote_supported", "reference_best_hit",
-                         "foreign_ortholog", "ortholog", "ortholog_fill"}
+# proteome, voted and left unverified by it (no reference protein covered), or taken from the
+# relatives' orthologs
+REFERENCE_GO_STATUSES = {"rbh", "rbh_override", "rbh_added", "vote_supported", "vote_unverified",
+                         "reference_best_hit", "foreign_ortholog", "ortholog", "ortholog_fill"}
 
 
 def add_reference_go(annotations: dict, ref_symbols: dict, db: str, go_hierarchy, forbidden_go: set,
