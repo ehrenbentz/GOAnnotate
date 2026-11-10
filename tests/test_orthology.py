@@ -128,6 +128,9 @@ if a[:1] == ["--version"]:
 if a[:2] == ["summary", "genome"]:
     if os.environ.get("FAKE_DS_FAIL"):
         print("panic: runtime error: invalid memory address or nil pointer dereference"); sys.exit(2)
+    if a[2] == "taxon" and a[3] in fix.get("no_data", []):
+        print(f"Error: The taxonomy ID '{a[3]}' is valid for 'X', but no genome data is currently available "
+              "for this taxon."); sys.exit(1)
     accs = fix["summary"].get(a[3], []) if a[2] == "taxon" else [a[3]]
     for acc in accs:
         org, taxid, rel, genes = fix["genomes"][acc]
@@ -187,6 +190,7 @@ else:                                                 # OrthoFinder 3: one gzipp
 def setup(tmp: Path):
     fix = {"genomes": {k: [v[0], v[1], v[2], [g[0] for g in v[3]]] for k, v in GENOMES.items()},
            "summary": SUMMARY,
+           "no_data": ["999"],
            "gff": {k: gff(v[3], k) for k, v in GENOMES.items()},
            "faa": {k: faa(v[3]) for k, v in GENOMES.items()}}
     (tmp / "ds_fix.json").write_text(json.dumps(fix))
@@ -436,17 +440,21 @@ def test_module(tmp: Path, db: Path):
     check(not m7.normalized and m.relatives[0].proteins["XP_B5"].ref_symbol == "Zfp558",
           "--no-resolve-orthologs keeps the relatives' symbols")
 
-    # --same-species: the query species' own annotation, beyond --relatives
+    # --same-species: the query species' own annotation is one of the --relatives, chosen first
     ann2 = {g: QueryAnnotation(query_id=g) for g in names}
     ann2["g3"].consensus_symbol, ann2["g3"].symbol_status = "GRM1", "vote_supported"
     ctx2 = ModuleContext(query_fasta=Path("q.faa"), search_mode="blastp", work_dir=work, reports_dir=reports,
                          prefix="s", threads=60, universe=universe, annotations=ann2, bad_name_filter=bf,
                          symbol_case_fn=str.upper)
-    m6 = OrthologyModule(Namespace(**{**vars(args), "same_species": True}))
+    m5 = OrthologyModule(Namespace(**{**vars(args), "same_species": True}))
+    m5._choose_relatives(ctx2, work / "rel_cache_m5", lambda s: s.startswith("LOC"))
+    check([r.accession for r in m5.relatives] == ["GCF_Q", "GCF_B"],
+          f"same species takes one of --relatives 2: {[r.accession for r in m5.relatives]}")
+    m6 = OrthologyModule(Namespace(**{**vars(args), "same_species": True, "relatives": 3}))
     ran = run_modules([m6], ctx2)
     check(len(ran) == 1 and m6.same is not None and m6.same.accession == "GCF_Q"
-          and [r.accession for r in m6.relatives] == ["GCF_B", "GCF_C", "GCF_Q"],
-          f"same-species annotation added beyond --relatives: {[r.accession for r in m6.relatives]}")
+          and [r.accession for r in m6.relatives] == ["GCF_Q", "GCF_B", "GCF_C"],
+          f"same-species annotation first among --relatives 3: {[r.accession for r in m6.relatives]}")
     inputs = dict(l.split("\t") for l in (tmp / "of_input.txt").read_text().splitlines())
     check("Microtus_ochrogaster" in inputs, "same-species proteome given to OrthoFinder")
     check(m6.gene_symbol["g1"] == ("Avp", "agree_same_species"), f"agrees with the relatives: {m6.gene_symbol['g1']}")
@@ -460,10 +468,13 @@ def test_module(tmp: Path, db: Path):
     check(m6.same_check == {"compared": 1, "same": 1} and m6.check["compared"] == 1,
           f"continuity check of supported symbols: {m6.same_check}")
     check(any("Check, previous annotation" in l and "1 of 1" in l for l in m6.summary_lines())
-          and any("same species, beyond --relatives" in l for l in m6.summary_lines()), "same-species summary lines")
+          and any("(same species)" in l for l in m6.summary_lines()), "same-species summary lines")
+    failures_before = m6.summary_failures
+    check(m6._summary("999") == [] and m6.summary_failures == failures_before,
+          "a taxon NCBI reports without genome data is an empty answer, not a failed query")
     rel_rows = (reports / "s_orthology_relatives.tsv").read_text().splitlines()
-    check(rel_rows[-1].split("\t")[3] == "same species" and rel_rows[-1].split("\t")[9:13]
-          == ["chosen", "species", "Microtus ochrogaster", "close"], f"same species in the relatives report: {rel_rows[-1]}")
+    check(rel_rows[1].split("\t")[3] == "same species" and rel_rows[1].split("\t")[9:13]
+          == ["chosen", "species", "Microtus ochrogaster", "close"], f"same species first in the relatives report: {rel_rows[1]}")
 
     # Weighted mode with a close (GCF_B, genus) and a distant (GCF_E, another family) relative
     from goannotate.modules import integrate_modules, start_modules

@@ -38,8 +38,8 @@ is used (mouse Zfp558 -> ZNF558 with a human reference). A gene without a
 reference ortholog keeps its own symbol.
 
 With --same-species, the RefSeq annotation of the query species itself (a
-previous annotation of the same genome or of another assembly) is added to
-the relatives, beyond --relatives, so that its names carry over: its
+previous annotation of the same genome or of another assembly) is one of
+the --relatives, chosen first, so that its names carry over: its
 one-to-one ortholog's symbol is used when the other relatives agree with it
 or name no one-to-one ortholog; when they agree on a different symbol,
 nothing is filled and the gene is counted as a disagreement. Supported core
@@ -344,10 +344,18 @@ def previous_selection(path: Path, cache: Path) -> list:
             rel.named_symbol = float(row["symbol_fraction"]) if row.get("symbol_fraction") else None
             rel.status = "chosen"
             rel.same_species = row["level"] == "same species"
-            if rel.same_species and any(r.label == rel.label for r in chosen):
-                rel.label += "_same_species"
+            _unique_label(rel, chosen)
             chosen.append(rel)
     return chosen
+
+
+def _unique_label(rel, chosen: list) -> None:
+    """Give rel a label no chosen relative has (a subspecies named like another relative)."""
+    base = rel.label
+    n = 2
+    while any(r.label == rel.label for r in chosen):
+        rel.label = f"{base}_{n}"
+        n += 1
 
 
 class OrthologyModule(Module):
@@ -448,6 +456,8 @@ class OrthologyModule(Module):
         """Annotated RefSeq reference genomes of a taxon (datasets summary), newest annotation first."""
         rc, out = self.run_command([self.datasets, "summary", "genome", "taxon", str(taxon), "--reference",
                                     "--annotated", "--assembly-source", "RefSeq", "--as-json-lines"], timeout=600)
+        if rc != 0 and re.search(r"no genome data is currently available|no assemblies? (were )?found", out, re.I):
+            return []                       # NCBI answered: the taxon has no genome data
         if rc != 0:
             self.summary_failures += 1
             logger.warning(f"  datasets summary for taxon {taxon} failed: {out.strip()[:200]}")
@@ -490,9 +500,10 @@ class OrthologyModule(Module):
         return d
 
     def _choose_relatives(self, ctx: ModuleContext, cache: Path, is_bad_symbol) -> None:
-        self._choose_other_relatives(ctx, cache, is_bad_symbol)
+        # the query species' own annotation takes one of the --relatives places when it exists
         if self.with_same_species:
             self._choose_same_species(cache, is_bad_symbol)
+        self._choose_other_relatives(ctx, cache, is_bad_symbol, self.n_relatives - (1 if self.same else 0))
         if self.summary_failures:
             previous = previous_selection(ctx.reports_dir / f"{ctx.prefix}_orthology_relatives.tsv", cache)
             if previous:
@@ -509,12 +520,11 @@ class OrthologyModule(Module):
                                f"reachable")
 
     def _choose_same_species(self, cache: Path, is_bad_symbol) -> None:
-        """The newest RefSeq annotation of the query species itself, added beyond --relatives."""
+        """The newest RefSeq annotation of the query species itself, one of the --relatives."""
         from goannotate import taxon
         query_name = taxon.taxon_name_sqlite(self.db, int(self.taxid)) if self.db else ""
         rows = [r for r in self._summary(self.taxid)
                 if r.taxid == int(self.taxid) or (query_name and r.organism.startswith(query_name))]
-        rows = [r for r in rows if r.accession not in {c.accession for c in self.relatives}]
         if not rows:
             logger.info(f"  No RefSeq annotation of the query species (taxon {self.taxid}) to add as a relative")
             return
@@ -529,12 +539,12 @@ class OrthologyModule(Module):
             logger.warning(f"  {e}")
             return
         rel.status = "chosen"
-        if any(r.label == rel.label for r in self.relatives):      # a subspecies named like a relative
-            rel.label += "_same_species"
+        _unique_label(rel, self.relatives)
         self.same = rel
         self.relatives.append(rel)
 
-    def _choose_other_relatives(self, ctx: ModuleContext, cache: Path, is_bad_symbol) -> None:
+    def _choose_other_relatives(self, ctx: ModuleContext, cache: Path, is_bad_symbol, n_wanted: int) -> None:
+        """Relatives from the lineage (or --relative), up to n_wanted of them."""
         from goannotate import taxon
         if self.manual:
             for value in self.manual:
@@ -550,7 +560,10 @@ class OrthologyModule(Module):
                 self._evaluate(rel, cache, is_bad_symbol)
                 rel.status = "chosen"
                 self.candidates.append(rel)
+                _unique_label(rel, self.relatives)
                 self.relatives.append(rel)
+            return
+        if n_wanted <= 0:
             return
         lineage = taxon.lineage_sqlite(self.db, int(self.taxid)) if self.db else []
         if not lineage:
@@ -560,9 +573,9 @@ class OrthologyModule(Module):
         passing = []                # candidates above both floors, with their level index
         level_index = 0
         best_so_far = 0.0
-        levels_after_enough = 0     # levels examined after --relatives candidates had passed (lookahead)
+        levels_after_enough = 0     # levels examined after enough candidates had passed (lookahead)
         for level in lineage[1:]:
-            if len(passing) >= self.n_relatives:
+            if len(passing) >= n_wanted:
                 if levels_after_enough >= 1:
                     break
                 levels_after_enough += 1
@@ -606,8 +619,9 @@ class OrthologyModule(Module):
         passing.sort(key=lambda r: (r.named - self.named_margin * r.level_index, -r.level_index, r.release),
                      reverse=True)
         for i, rel in enumerate(passing):
-            if i < self.n_relatives:
+            if i < n_wanted:
                 rel.status = "chosen"
+                _unique_label(rel, self.relatives)
                 self.relatives.append(rel)
             else:
                 rel.status = "not_needed"
@@ -1396,7 +1410,7 @@ class OrthologyModule(Module):
             lines.append(f"    {r.organism} ({r.accession}, {r.level}; {'close' if r.close else 'distant'}, "
                          f"{r.lca_rank or '?'} {r.lca_name}): {100 * r.named:.1f}% of {r.protein_coding:,} "
                          f"genes named; orthologs for {anyo:,} query genes, 1:1 for {one:,}"
-                         + (" (same species, beyond --relatives)" if r.same_species else ""))
+                         + (" (same species)" if r.same_species else ""))
         lines.append(f"    Candidates examined:         {c.get('candidates_examined', 0)} "
                      f"(reports/{Path(self.report).name.replace('.tsv', '_relatives.tsv')})")
         lines.append(f"    Genes in orthogroups:        {c.get('genes_in_orthogroups', 0):,}")

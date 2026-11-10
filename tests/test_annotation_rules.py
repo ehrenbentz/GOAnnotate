@@ -295,8 +295,9 @@ def hwn(symbol, bits, name=None, tx="t1"):
     return (h, name or f"{symbol} protein", symbol, "uniprot", (tx,))
 
 
-# Three hits say KCNQ4 (mean 300), two say KCNQ5 (mean 250): KCNQ4 wins the plain vote
-pool = [hwn("KCNQ4", 320), hwn("KCNQ4", 300), hwn("KCNQ4", 280), hwn("KCNQ5", 260), hwn("KCNQ5", 240)]
+# Three hits say KCNQ4 (mean 300), three say KCNQ5 (mean 250): KCNQ4 wins the plain vote
+pool = [hwn("KCNQ4", 320), hwn("KCNQ4", 300), hwn("KCNQ4", 280), hwn("KCNQ5", 260), hwn("KCNQ5", 250),
+        hwn("KCNQ5", 240)]
 idx = list(range(len(pool)))
 name, sym, origin, _ = annotate.select_name_and_symbol(idx, pool, bnf)
 check(sym == "KCNQ4" and origin == "uniprot", f"plain vote: {sym}")
@@ -317,12 +318,12 @@ check(sym == "KCNQ4", f"a prior symbol absent from the hits changes nothing here
 annotate._init_worker({}, None, bnf, mappings.SymbolResolver())
 far = [hwn("ACTB", 500, "Actin, cytoplasmic 1"), hwn("ACTB", 480, "Actin, cytoplasmic 1"),
        hwn("OXT", 200, "Oxytocin-neurophysin 1")]
-gid, res = annotate.annotate_single_gene("g", far, 0.5, [], "upper", "mean", prior=("Oxt", True))
+gid, res = annotate.annotate_single_gene("g", far, 0.5, [], "upper", prior=("Oxt", True))
 check(res["consensus_symbol"] == "OXT" and res["symbol_source"] == "relative_override"
       and res["consensus_name"] == "Oxytocin-neurophysin 1", f"close prior selects the cluster: {res['consensus_symbol']}")
-gid, res = annotate.annotate_single_gene("g", far, 0.5, [], "upper", "mean", prior=("Oxt", False))
+gid, res = annotate.annotate_single_gene("g", far, 0.5, [], "upper", prior=("Oxt", False))
 check(res["consensus_symbol"] == "ACTB", f"distant prior does not change the cluster: {res['consensus_symbol']}")
-gid, res = annotate.annotate_single_gene("g", far, 0.5, [], "upper", "mean")
+gid, res = annotate.annotate_single_gene("g", far, 0.5, [], "upper")
 check(res["consensus_symbol"] == "ACTB", "no prior")
 
 # ------------------------------------------------- excluded and weak reference symbols

@@ -180,9 +180,6 @@ Examples:
     g.add_argument("--symbol-case", default="upper", choices=["upper", "title", "lower", "source"],
                    help="Casing of output symbols: upper (AVP), title (Avp), lower (avp), or\n"
                         "source (as in the winning hit) (default: upper)")
-    g.add_argument("--symbol-score", default="mean_sqrt", choices=["mean", "mean_sqrt"],
-                   help="Score of a symbol group within the winning cluster: mean bitscore, or\n"
-                        "mean bitscore times the square root of the group size (default: mean_sqrt)")
     g.add_argument("--reference-proteome", metavar="FILE",
                    help="Protein FASTA of the reference species with UniProt-style headers (GN= symbols)\n"
                         "for reciprocal best hits (default: extracted from --diamond-swissprot)")
@@ -384,8 +381,8 @@ Examples:
                    help="Closer relatives are preferred; a candidate one lineage level farther out is taken\n"
                         "first only when its fraction is higher by F (default: 0.10, per level)")
     g.add_argument("--same-species", default="on", choices=["on", "off"],
-                   help="Also use the RefSeq annotation of the query species itself when one exists (the\n"
-                        "newest, needs --taxid), beyond --relatives, so that a previous annotation's symbols\n"
+                   help="Use the RefSeq annotation of the query species itself when one exists (the newest,\n"
+                        "needs --taxid) as one of the --relatives, so that a previous annotation's symbols\n"
                         "carry over: its one-to-one ortholog's symbol is used unless the other relatives\n"
                         "agree on a different one; supported symbols are also compared with it (default: on)")
     g.add_argument("--relatives-dir", metavar="DIR",

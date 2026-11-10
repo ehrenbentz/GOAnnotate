@@ -342,16 +342,13 @@ def select_winning_cluster(clusters: list, hits_with_names: list) -> tuple:
     return best_cluster, cluster_fraction
 
 
-def symbol_group_score(bitscores: list, method: str) -> float:
+def symbol_group_score(bitscores: list) -> float:
     """
-    Score of a symbol group: the mean bitscore of its hits ("mean"), or the
-    mean times the square root of the group size ("mean_sqrt"), which lets
-    agreement among many species count once symbols are in one nomenclature.
+    Score of a symbol group: the mean bitscore of its hits times the square
+    root of the group size, which lets agreement among many species count
+    once symbols are in one nomenclature.
     """
-    mean = sum(bitscores) / len(bitscores)
-    if method == "mean_sqrt":
-        return mean * math.sqrt(len(bitscores))
-    return mean
+    return sum(bitscores) / len(bitscores) * math.sqrt(len(bitscores))
 
 
 ORTHOLOG_VOTE_MARGIN = 0.75     # a distant ortholog symbol wins when its group scores this fraction of the best
@@ -369,7 +366,6 @@ def select_name_and_symbol(winning_indices: list,
                            hits_with_names: list,
                            bad_name_filter: BadNameFilter,
                            resolver: SymbolResolver = None,
-                           score_method: str = "mean",
                            prior: tuple = None) -> tuple:
     """
     Select the protein name and gene symbol from the winning cluster.
@@ -416,7 +412,7 @@ def select_name_and_symbol(winning_indices: list,
         prior_key = prior[0].lower()
         if prior_key in symbol_groups:
             idxs = symbol_groups[prior_key]
-            scores = {s: symbol_group_score([hits_with_names[i][HIT].bitscore for i in g], score_method)
+            scores = {s: symbol_group_score([hits_with_names[i][HIT].bitscore for i in g])
                       for s, g in symbol_groups.items()}
             best = max(scores.values())
             origin = "relative" if scores[prior_key] >= best else "relative_override"
@@ -455,7 +451,7 @@ def select_name_and_symbol(winning_indices: list,
         best_symbol_key = None
         best_score = -1.0
         for sym, idxs in candidates.items():
-            score = symbol_group_score([hits_with_names[i][HIT].bitscore for i in idxs], score_method)
+            score = symbol_group_score([hits_with_names[i][HIT].bitscore for i in idxs])
             if score > best_score:
                 best_score = score
                 best_symbol_key = sym
@@ -719,8 +715,7 @@ def filter_weak_go(annotations: dict, go_hierarchy, min_hits: int = 3, iea_min_h
 
 def annotate_single_gene(gene_id: str, hits_with_names: list,
                          consensus_threshold: float, namespaces: list,
-                         symbol_case: str = "upper", symbol_score: str = "mean",
-                         prior: tuple = None) -> tuple:
+                         symbol_case: str = "upper", prior: tuple = None) -> tuple:
     """
     Full annotation of a single gene (runs in a worker process).
 
@@ -814,8 +809,7 @@ def annotate_single_gene(gene_id: str, hits_with_names: list,
 
         # Select name and symbol
         protein_name, gene_symbol, symbol_origin, winning_symbol_indices = select_name_and_symbol(
-            winning_indices, hits_with_names, bad_name_filter, resolver=resolver,
-            score_method=symbol_score, prior=prior)
+            winning_indices, hits_with_names, bad_name_filter, resolver=resolver, prior=prior)
 
         if cluster_override and symbol_origin == "relative":
             symbol_origin = "relative_override"
@@ -1110,7 +1104,6 @@ def annotate_queries(resolved_transcript_hits: dict,
                      threads: int = None,
                      symbol_case: str = "upper",
                      coding_gene_ids: set = None,
-                     symbol_score: str = "mean",
                      max_gene_hits: int = 300,
                      word_weights: WordWeights = None,
                      forbidden_go: set = None,
@@ -1185,7 +1178,7 @@ def annotate_queries(resolved_transcript_hits: dict,
         n_close = sum(1 for _, close in ortholog_prior.values() if close)
         logger.info(f"Ortholog symbols steer the vote for {len(ortholog_prior):,} genes "
                     f"({n_close:,} from close relatives decide, the rest count as one more vote)")
-    tasks = [(gene_id, gene_hits.get(gene_id, []), consensus_threshold, namespaces, symbol_case, symbol_score,
+    tasks = [(gene_id, gene_hits.get(gene_id, []), consensus_threshold, namespaces, symbol_case,
               ortholog_prior.get(gene_id))
              for gene_id in all_gene_ids]
 

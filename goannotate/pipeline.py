@@ -278,7 +278,6 @@ def run(args) -> None:
         threads=args.threads,
         symbol_case=args.symbol_case,
         coding_gene_ids=coding_gene_ids,
-        symbol_score=args.symbol_score,
         max_gene_hits=getattr(args, "max_gene_hits", 300),
         word_weights=word_weights,
         forbidden_go=set(forbidden_go),

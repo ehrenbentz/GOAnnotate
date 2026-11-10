@@ -247,7 +247,6 @@ goannotate \
 | `--secondary-reference-proteome` | from SwissProt DB | Protein FASTA of the secondary reference species |
 | `--no-resolve-orthologs` | off | Keep each hit's own GN= symbol |
 | `--symbol-case` | upper | Output casing of symbols: upper, title, lower, source |
-| `--symbol-score` | mean_sqrt | Symbol group score within the winning cluster: mean bitscore, or mean times the square root of the group size |
 | `--reference-proteome` | from SwissProt DB | Reference-species protein FASTA for reciprocal best hits |
 | `--no-reciprocal` | off | Skip the checks of voted symbols against the reference proteome |
 | `--symbol-support` | 0.9 | Minimum score of the voted symbol's reference hit relative to the gene's best reference hit |
@@ -288,7 +287,7 @@ goannotate \
 | `--relative-min-named` | 0.2 | Lowest informative fraction of a relative's protein-coding genes (symbol, or a link to a named reference gene) |
 | `--relative-named-ratio` | 0.75 | A relative must reach this fraction of the best candidate at its level or closer |
 | `--relative-named-margin` | 0.10 | Per lineage level, how much better named a farther relative must be to rank above a closer one |
-| `--same-species` | on | Also use the RefSeq annotation of the query species itself, when one exists, beyond `--relatives` |
+| `--same-species` | on | Use the RefSeq annotation of the query species itself, when one exists, as one of the `--relatives` |
 | `--relatives-dir` | `intermediate/{prefix}_orthology/relatives` | Where relatives' annotations are downloaded |
 | `--orthofinder-bin`, `--orthofinder-threads`, `--datasets-bin` | on PATH, `--threads`, on PATH | OrthoFinder and NCBI datasets settings |
 | `--ortholog-symbol` | weighted | How the relatives' ortholog symbols are used: `weighted` (close relatives decide, distant ones vote and fill), `fill` (fill only), `off` |
@@ -370,7 +369,7 @@ This rewards clusters with strong evidence (high bitscores), broad support (many
 
 Before voting, the symbol of every hit is resolved to the nomenclature of one reference species (`--reference-taxid`, default human). A hit from another species is mapped to its NCBI GeneID, either through the UniProt ID mapping or through its (species, GN= symbol) pair in NCBI gene_info, then to the reference-species ortholog in NCBI gene_orthologs, and the ortholog's symbol replaces the hit's own. Hits from the reference species keep their symbol, and hits that cannot be resolved keep their GN= symbol. This removes species-specific variants (Zfp428, Olfr577, Ick) in favor of the current reference symbols (ZNF428, OR51G2, CILK1) and makes symbols comparable across genes. The two tables this needs (`ncbi_orthologs`, `ncbi_gene_symbols`) are built by `build_databases.py`; an existing database is extended with `build_databases.py -o DIR --add-orthologs`. `--no-resolve-orthologs` disables the step.
 
-Within the winning cluster, hits are grouped by gene symbol. The symbol group with the highest score is selected, and both the gene symbol and protein name come from that group. The default score is the mean bitscore of the group times the square root of the group size (`--symbol-score mean_sqrt`), so that agreement among many species counts once symbols are in one nomenclature; `--symbol-score mean` uses the mean alone, which favors small groups of the closest species.
+Within the winning cluster, hits are grouped by gene symbol. The symbol group with the highest score is selected, and both the gene symbol and protein name come from that group. The score is the mean bitscore of the group times the square root of the group size, so that agreement among many species counts once symbols are in one nomenclature.
 
 A **single-hit guard** prevents annotation errors in large clusters: if a symbol group has only one hit and there are other groups with two or more hits, the single-hit group cannot win. This stops a lone misannotated hit from overriding the majority. An additional guard rejects a single-hit symbol that represents less than 10% of a cluster with 10+ hits.
 
