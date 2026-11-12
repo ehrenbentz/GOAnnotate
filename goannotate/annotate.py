@@ -13,8 +13,7 @@ from difflib import SequenceMatcher
 from goannotate.blast import merge_hits_by_gene
 from goannotate.filters import BadNameFilter
 from goannotate.go import GOHierarchy, ELECTRONIC_CODES, GO_ROOT_TERMS
-from goannotate.mappings import (SymbolResolver, collect_go_evidence, extract_accession, get_go_terms_for_hits,
-                                 symbol_bases)
+from goannotate.mappings import SymbolResolver, collect_go_evidence, extract_accession, get_go_terms_for_hits
 from goannotate.models import QueryAnnotation
 
 logger = logging.getLogger(__name__)
@@ -988,9 +987,8 @@ def final_concordance(annotations: dict, consensus_threshold: float = 0.5) -> di
     Name concordance: fraction of the gene's hits whose name matches the
     final product (name similarity at least consensus_threshold).
     Symbol concordance: fraction of the gene's hits that carry a symbol and
-    name the gene of the final symbol: the symbol itself, a copy form of it
-    or the gene it is a copy form of (one genome suffix: kdm2aa, KDM2A), the
-    replaced voted symbol, or one of the gene's aliases (hit symbols of the
+    name the gene of the final symbol: the symbol itself, the replaced
+    voted symbol, or one of the gene's aliases (hit symbols of the
     same gene, reference-species synonyms). Hits without a symbol say nothing
     about the symbol and are not counted.
     Genes without hits get 0 and are left out of the statistics.
@@ -1009,7 +1007,7 @@ def final_concordance(annotations: dict, consensus_threshold: float = 0.5) -> di
             names.append(annot.name_concordance)
         if annot.hits and annot.consensus_symbol:
             final = annot.consensus_symbol.upper()
-            same = {final} | symbol_bases(final)
+            same = {final}
             if annot.ortholog_evidence != "close_taken":
                 # a symbol taken from close relatives names another gene than the vote:
                 # the replaced symbol and the vote's aliases are not the same gene
@@ -1017,8 +1015,7 @@ def final_concordance(annotations: dict, consensus_threshold: float = 0.5) -> di
                 if annot.voted_symbol:
                     same.add(annot.voted_symbol.upper())
             total = sum(annot.hit_symbols.values())
-            match = sum(n for sym, n in annot.hit_symbols.items()
-                        if sym in same or final in symbol_bases(sym))
+            match = sum(n for sym, n in annot.hit_symbols.items() if sym in same)
             annot.symbol_concordance = match / total if total else 0.0
             symbols.append(annot.symbol_concordance)
         annot.confidence, annot.confidence_score = compute_confidence(annot)
@@ -1064,10 +1061,7 @@ def propagate_symbols(annotations: dict, gene_hits: dict, symbol_case: str = "up
         for gid in genes_without:
             # Only a symbol the gene's own hits carry: identical product names
             # alone ("disks large 5") are not evidence that two genes are
-            # copies of the same gene. The genes sharing the name may carry a
-            # close relative's form (glula) that the hits give in the
-            # reference form (GLUL); the hit's form is then given, since the
-            # relatives' suffix designates one copy and this gene is another.
+            # copies of the same gene.
             hit_symbols = {}
             for t in gene_hits.get(gid, []):
                 if t[SYMBOL]:
@@ -1077,13 +1071,6 @@ def propagate_symbols(annotations: dict, gene_hits: dict, symbol_case: str = "up
                 if s.lower() in hit_symbols:
                     chosen = s
                     break
-            if not chosen:
-                for s in ranked:
-                    bases = symbol_bases(s)
-                    forms = [h for h in hit_symbols.values() if h.upper() in bases]
-                    if forms:
-                        chosen = format_symbol(forms[0], symbol_case)
-                        break
             if not chosen:
                 continue
             annotations[gid].consensus_symbol = chosen

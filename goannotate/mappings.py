@@ -564,8 +564,6 @@ class ReferenceNomenclature:
         return self.renamed.get(s, "")
 
 
-# Genome-duplication and copy suffixes of gene symbols (.2, a, b, l, la, lb, l2)
-_GENOME_SUFFIX = re.compile(r"(?:\.\d+|L?[AB]|L\d*)$", re.I)
 # FlyBase transcript and protein identifiers carried as gene symbols by cDNA-clone entries (kay-RA, CG1647-PB)
 _TRANSCRIPT_SUFFIX = re.compile(r"-[RP][A-Z]$")
 
@@ -575,32 +573,6 @@ def gene_symbol_of(gn: str) -> str:
     if gn and _TRANSCRIPT_SUFFIX.search(gn) and len(gn) > 3:
         return gn[:-3]
     return gn
-
-
-def symbol_base(symbol: str) -> str:
-    """Upper case without a genome suffix (.2, a, b, l, la, lb, l2): foxo3b -> FOXO3."""
-    s = symbol.upper()
-    stripped = _GENOME_SUFFIX.sub("", s)
-    return stripped or s
-
-
-_SUFFIX_FORMS = (re.compile(r"\.\d+$"), re.compile(r"[AB]$", re.I), re.compile(r"L[AB]$", re.I),
-                 re.compile(r"L\d*$", re.I))
-
-
-def symbol_bases(symbol: str) -> set:
-    """
-    Upper-case forms of a symbol without one genome suffix, each suffix read
-    separately: glula -> {GLUL, GLU}, foxo3b -> {FOXO3}, krt18a.1 -> {KRT18A}.
-    A gene named in one of these forms is the gene the copy belongs to.
-    """
-    s = symbol.upper()
-    out = set()
-    for pattern in _SUFFIX_FORMS:
-        stripped = pattern.sub("", s)
-        if stripped and stripped != s:
-            out.add(stripped)
-    return out
 
 
 def is_readthrough_symbol(symbol: str, official) -> bool:

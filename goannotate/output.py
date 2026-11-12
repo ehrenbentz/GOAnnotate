@@ -981,9 +981,7 @@ def write_summary(output_dir: Path, prefix: str, annotations: dict, args, blast_
             f.write("Symbol checks against the reference proteome:\n")
             f.write("-" * 70 + "\n")
             f.write(f"  Reciprocal best hits:             {assignment.get('rbh_total', 0):,}\n")
-            f.write(f"  Vote confirmed by RBH:            {assignment.get('rbh', 0):,}"
-                    + (f" ({assignment['rbh_same_gene_form']:,} voted in a copy form of the RBH symbol: adgrl1a for ADGRL1)"
-                       if assignment.get('rbh_same_gene_form') else "") + "\n")
+            f.write(f"  Vote confirmed by RBH:            {assignment.get('rbh', 0):,}\n")
             f.write(f"  RBH replaced the vote:            {assignment.get('rbh_override', 0):,}\n")
             f.write(f"  RBH named an unnamed gene:        {assignment.get('rbh_added', 0):,}\n")
             f.write(f"  Vote supported by sequence:       {assignment.get('vote_supported', 0):,}\n")
@@ -996,7 +994,7 @@ def write_summary(output_dir: Path, prefix: str, annotations: dict, args, blast_
                 f.write(f"  Non-reference symbol, kept:       {assignment.get('vote_foreign_symbol', 0):,}\n")
             elif assignment.get("symbol_policy") == "ortholog":
                 f.write(f"  Non-reference symbol, replaced by the reference ortholog: "
-                        f"{assignment.get('foreign_ortholog', 0):,} (suffix {assignment.get('foreign_ortholog_suffix', 0):,}, "
+                        f"{assignment.get('foreign_ortholog', 0):,} ("
                         f"NCBI synonym {assignment.get('foreign_ortholog_renamed', 0):,}, "
                         f"RBH {assignment.get('foreign_ortholog_rbh', 0):,})\n")
                 f.write(f"  Non-reference symbol, kept:       {assignment.get('vote_foreign_symbol', 0):,}\n")

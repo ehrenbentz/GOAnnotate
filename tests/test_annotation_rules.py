@@ -383,8 +383,8 @@ with tempfile.TemporaryDirectory() as d:
                               existence={"NANOGP8": 2, "NANOG": 1}, established_margin=0.99)
     check(ann["g1"].consensus_symbol == "NANOGP8", "not replaced when the established gene scores below the margin")
 
-# ------------------------------------------------- copy forms and propagation
-print("\n# Copy forms of the RBH symbol and symbol propagation")
+# ------------------------------------------------- RBH against another symbol, propagation
+print("\n# RBH symbol against a differently spelled vote, symbol propagation")
 with tempfile.TemporaryDirectory() as d:
     d = Path(d)
     (d / "fwd.tsv").write_text("t1\tsp|P_ADG|X\t90\t400\t0\t500\t400\t400\n"
@@ -398,10 +398,11 @@ with tempfile.TemporaryDirectory() as d:
     ann["g2"].winning_cluster_symbols = ["AGPAT2", "AGPAT1"]
     st = assign_ref.assign_symbols(ann, uni, d / "fwd.tsv", d / "rev.tsv", ref, str.upper,
                                    ref_descriptions={"ADGRL1": "Adhesion G protein-coupled receptor L1"})
-    check(ann["g1"].symbol_status == "rbh" and ann["g1"].consensus_symbol == "ADGRL1"
-          and ann["g1"].voted_symbol == "adgrl1a" and st["rbh_same_gene_form"] == 1 and st["rbh_override"] == 1,
-          f"a copy form of the RBH symbol is a confirmation, another gene an override: "
-          f"{ann['g1'].symbol_status} {st['rbh_same_gene_form']} {st['rbh_override']}")
+    check(ann["g1"].symbol_status == "foreign_ortholog" and ann["g1"].consensus_symbol == "ADGRL1"
+          and ann["g1"].voted_symbol == "adgrl1a" and st["foreign_ortholog_rbh"] == 1 and st.get("rbh", 0) == 0
+          and st["rbh_override"] == 1,
+          f"a vote outside the reference nomenclature is replaced by its reciprocal best hit, not counted as "
+          f"confirmed: {ann['g1'].symbol_status} {ann['g1'].consensus_symbol}")
 # a fragment: the alignment covers 63% of the protein and 9% of the reference protein
 print("\n# Fragments of translated transcripts")
 for partial, expect in ((set(), "vote_unverified"), ({"g1"}, "vote_supported")):
@@ -435,8 +436,8 @@ ann = {"a": QueryAnnotation(query_id="a", consensus_name="Glutamine synthetase",
        "c": QueryAnnotation(query_id="c", consensus_name="Glutamine synthetase"),
        "d": QueryAnnotation(query_id="d", consensus_name="Glutamine synthetase")}
 n, ids = annotate.propagate_symbols(ann, {"c": [sib("GLUL"), sib("gs")], "d": [sib("CA2")]}, "lower")
-check(n == 1 and ann["c"].consensus_symbol == "glul" and not ann["d"].consensus_symbol,
-      f"propagation gives the hits' reference form of a relative's copy form, never a symbol the hits lack: "
+check(n == 0 and not ann["c"].consensus_symbol and not ann["d"].consensus_symbol,
+      f"propagation gives only a symbol the gene's own hits carry in the same spelling: "
       f"{ann['c'].consensus_symbol!r} {ann['d'].consensus_symbol!r}")
 ann["c"].consensus_symbol = ""
 ann["a"].consensus_symbol = "glul"
@@ -570,7 +571,7 @@ t = QueryAnnotation(query_id="t", hits=[fh()], consensus_symbol="agpat2", voted_
 n = QueryAnnotation(query_id="n", consensus_symbol="abc1", ortholog_evidence="close_filled")
 st = annotate.final_concordance({"k": a, "t": t, "n": n}, consensus_threshold=0.5)
 check(abs(a.symbol_concordance - 0.8) < 1e-9 and abs(a.name_concordance - 0.8) < 1e-9,
-      f"a refined copy form counts the hits of its gene: {a.symbol_concordance} {a.name_concordance}")
+      f"the final symbol and the replaced vote count as hits of the gene: {a.symbol_concordance} {a.name_concordance}")
 check(abs(t.symbol_concordance - 0.1) < 1e-9, f"a taken symbol counts only hits of its own gene: {t.symbol_concordance}")
 check(st["symbol"]["n"] == 2 and n.confidence == "medium", f"genes without hits are left out: {st['symbol']}")
 

@@ -13,7 +13,7 @@ import logging
 from collections import Counter, defaultdict
 from pathlib import Path
 
-from goannotate.annotate import load_stop_words, normalize_gene_name, symbol_bases
+from goannotate.annotate import load_stop_words, normalize_gene_name
 
 logger = logging.getLogger(__name__)
 
@@ -61,7 +61,7 @@ def _reference_evidence(gene_ref: dict, symbol: str, reference_symbol: str, ref_
     if not gene_ref:
         return "none", "", ""
     best_sym, best = max(gene_ref.items(), key=lambda kv: kv[1])
-    candidates = {symbol.upper()} | symbol_bases(symbol.upper())
+    candidates = {symbol.upper()}
     if reference_symbol:
         candidates.add(reference_symbol.upper())
     scores = [gene_ref[s] for s in candidates if s in gene_ref]
@@ -117,7 +117,7 @@ def evaluate(annotations: dict, universe, ref_alignments: dict, ref_symbol_set: 
                 continue
             n_rows += 1
             decision = orthology.decision.get(gene_id, "") if orthology is not None else ""
-            decided = (annot.symbol_source == "relative_override") or decision in ("taken", "refined", "filled")
+            decided = (annot.symbol_source == "relative_override") or decision in ("taken", "filled")
             row = {c: "" for c in COLUMNS}
             row.update(gene_id=gene_id, symbol=symbol, symbol_status=annot.symbol_status or "",
                        orthology_decision=decision, decided_by_relatives="yes" if decided else "no",
@@ -186,7 +186,7 @@ def evaluate(annotations: dict, universe, ref_alignments: dict, ref_symbol_set: 
                 # products follow the hits' naming style, the reference's may differ)
                 ref_name = ref_descriptions.get((annot.ortholog_reference_symbol or symbol).upper(), "")
                 product = annot.consensus_name
-                forms = {symbol.upper()} | symbol_bases(symbol.upper())
+                forms = {symbol.upper()}
                 if annot.ortholog_reference_symbol:
                     forms.add(annot.ortholog_reference_symbol.upper())
                 carriers = [name for name, syms in (annot.hit_curated_names or {}).items()

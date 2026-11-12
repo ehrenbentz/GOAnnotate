@@ -47,7 +47,7 @@ from collections import Counter, defaultdict
 from pathlib import Path
 
 from goannotate import GOAnnotateError
-from goannotate.mappings import gene_symbol_of, symbol_bases
+from goannotate.mappings import gene_symbol_of
 from goannotate.search import find_diamond
 
 
@@ -305,8 +305,8 @@ def assign_symbols(annotations: dict, universe, forward: Path, reverse: Path, re
     the transcript ends and its ends rarely align.
     symbol_policy, for voted symbols outside the reference nomenclature:
     "ortholog" replaces one by a reference symbol only with evidence that
-    it is the same gene (suffix-free form, NCBI synonym, reciprocal best
-    hit; see ortholog_evidence) and keeps the rest, or removes them with
+    it is the same gene (NCBI synonym, reciprocal best hit; see
+    ortholog_evidence) and keeps the rest, or removes them with
     drop_unmatched; "reference" replaces it by the closest reference
     protein the gene covers (at least min_coverage of it), or removes it;
     "any" keeps it.
@@ -322,7 +322,7 @@ def assign_symbols(annotations: dict, universe, forward: Path, reverse: Path, re
     Reference pseudogenes and readthrough loci (nomenclature.is_excluded)
     never name a gene.
     Product: when the reference symbol confirms the gene's own symbol (rbh,
-    a copy form of the RBH symbol, rbh_added, vote_supported), the reference
+    rbh_added, vote_supported), the reference
     protein's name replaces the voted name unless SwissProt hits of other
     species carry the voted name and none carries the reference name (names
     matching at name_threshold): a reference species' own gene name
@@ -359,7 +359,7 @@ def assign_symbols(annotations: dict, universe, forward: Path, reverse: Path, re
 
             def other_reference_gene(syms):
                 # an entry of another reference gene (a paralog: UCP2 for UCP3) does not speak for this one
-                return any(s in reference_symbols and s != own and own not in symbol_bases(s) for s in syms)
+                return any(s in reference_symbols and s != own for s in syms)
 
             if (not any(name_similarity(ref_norm, h) >= name_threshold for h in curated)
                     and any(name_similarity(vote_norm, h) >= name_threshold and not other_reference_gene(syms)
@@ -435,12 +435,7 @@ def assign_symbols(annotations: dict, universe, forward: Path, reverse: Path, re
 
     stats = Counter()
     reference_symbols = {s.upper() for s in ref_symbols.values()}
-    # Step 1 and 2: confirmation and RBH override. A voted symbol outside the
-    # reference nomenclature whose suffix-free form is the RBH symbol (a close
-    # relative's or another species' copy form: adgrl1a, kdm2aa) names the
-    # same gene: the RBH confirms it ('rbh'), the reference symbol is used
-    # here and the voted form is kept in voted_symbol (the orthology module
-    # restores the close relatives' form afterwards).
+    # Step 1 and 2: confirmation and RBH override.
     for gene, annot in annotations.items():
         voted = annot.consensus_symbol.upper() if annot.consensus_symbol else ""
         rbh_symbol = rbh.get(gene)
@@ -464,12 +459,6 @@ def assign_symbols(annotations: dict, universe, forward: Path, reverse: Path, re
             # curated name replaces the voted name, which often comes from an
             # automatically named TrEMBL entry ("Serine/threonine-protein"),
             # unless it is the reference species' own gene name (confirm_name).
-            confirm_name(annot, rbh_symbol)
-        elif voted not in reference_symbols and rbh_symbol in symbol_bases(voted):
-            annot.voted_symbol = annot.consensus_symbol
-            annot.consensus_symbol = symbol_case_fn(rbh_symbol)
-            annot.symbol_status = "rbh"
-            stats["rbh_same_gene_form"] += 1
             confirm_name(annot, rbh_symbol)
         else:
             cluster_symbols = {s.upper() for s in annot.winning_cluster_symbols if s}
@@ -521,29 +510,15 @@ def assign_symbols(annotations: dict, universe, forward: Path, reverse: Path, re
         (reference symbol, kind of evidence) when a voted non-reference
         symbol names the same gene as a reference protein the gene's
         sequence covers (at least min_coverage of it):
-          suffix   the symbol without a genome suffix (.2, a, b, l, la, lb,
-                   l2) is that reference symbol (ATP1B1A, DHDH.2, B4GALT1L)
-          renamed  the symbol, or its suffix-free form, is a unique NCBI
-                   synonym of that reference symbol (EIF2C3 -> AGO3)
+          renamed  the symbol is a unique NCBI synonym of that reference
+                   symbol (EIF2C3 -> AGO3)
           rbh      the gene is the reciprocal best hit of that reference symbol
         Comparisons are case-insensitive. ('', '') without evidence.
         """
-        base = re.sub(r"\.\d+$", "", voted)
-        forms = [voted, base]
-        stripped = re.sub(r"(?:L?[AB]|L\d*)$", "", base)
-        if stripped and stripped != base:
-            forms.append(stripped)
-        # A suffix-free form that is itself a reference symbol is tested
-        # before any synonym, so that kmt5ab becomes KMT5A rather than the
-        # gene that happens to list KMT5AB among its synonyms.
-        for form in forms[1:]:
-            if form in reference_symbols and covers(gene, form) and not is_pseudo(form):
-                return form, "suffix"
-        for form in forms:
-            current = nomenclature.current(form).upper() if nomenclature else ""
-            if current and current != form and current in reference_symbols and covers(gene, current) \
-                    and not is_pseudo(current):
-                return current, "renamed"
+        current = nomenclature.current(voted).upper() if nomenclature else ""
+        if current and current != voted and current in reference_symbols and covers(gene, current) \
+                and not is_pseudo(current):
+            return current, "renamed"
         r = rbh.get(gene)
         if r and covers(gene, r) and unambiguous(gene, r):
             return r, "rbh"
@@ -707,7 +682,7 @@ def assign_symbols(annotations: dict, universe, forward: Path, reverse: Path, re
     stats["foreign_replaced"] = foreign_replaced
     stats["foreign_removed"] = foreign_removed
     stats["foreign_ortholog"] = sum(foreign_ortholog.values())
-    for how in ("suffix", "renamed", "rbh"):
+    for how in ("renamed", "rbh"):
         stats[f"foreign_ortholog_{how}"] = foreign_ortholog[how]
     stats["reference_best_hit"] = replaced
     stats["vote_unverified"] = unverified
@@ -719,8 +694,7 @@ def assign_symbols(annotations: dict, universe, forward: Path, reverse: Path, re
     copies = Counter(symbols)
     shared = sum(1 for n in copies.values() if n > 1)
     logger.info(f"Symbol assignment: {len(rbh):,} reciprocal best hits; "
-                f"confirmed={stats['rbh']:,} ({stats['rbh_same_gene_form']:,} of them a copy form of the RBH "
-                f"symbol), rbh override={stats['rbh_override']:,}, "
+                f"confirmed={stats['rbh']:,}, rbh override={stats['rbh_override']:,}, "
                 f"rbh added={stats['rbh_added']:,}")
     logger.info(f"  Voted reference symbols checked against the reference proteome: {supported:,} supported, "
                 f"{replaced:,} replaced by the closest supported reference protein, "
@@ -730,7 +704,7 @@ def assign_symbols(annotations: dict, universe, forward: Path, reverse: Path, re
         logger.info(f"  {foreign_kept:,} symbols outside the reference nomenclature kept (--symbol-policy any)")
     elif symbol_policy == "ortholog":
         logger.info(f"  Symbols outside the reference nomenclature: {sum(foreign_ortholog.values()):,} replaced by "
-                    f"the reference ortholog ({foreign_ortholog['suffix']:,} by suffix, {foreign_ortholog['renamed']:,} "
+                    f"the reference ortholog ({foreign_ortholog['renamed']:,} "
                     f"by NCBI synonym, {foreign_ortholog['rbh']:,} by reciprocal best hit), {foreign_kept:,} kept, "
                     f"{foreign_removed:,} removed (--symbol-policy ortholog)")
     else:

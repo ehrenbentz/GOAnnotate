@@ -58,10 +58,9 @@ def add_reference_go(annotations: dict, ref_symbols: dict, db: str, go_hierarchy
             continue
         accs = by_symbol.get(annot.consensus_symbol.upper())
         if not accs and (annot.symbol_status or "") in ("ortholog", "ortholog_fill"):
-            # a species-specific form (kdm2aa) of a reference gene: the close relatives' symbol in the
-            # reference nomenclature names it; for a refined symbol (the same gene as the core) also the
-            # replaced core symbol and the aliases. A taken symbol names another gene than the replaced
-            # one, whose terms are never used.
+            # a symbol outside the reference nomenclature: the relatives' symbol in the reference
+            # nomenclature names its gene, else the replaced core symbol and the aliases. A taken
+            # symbol names another gene than the replaced one, whose terms are never used.
             alts = [annot.ortholog_reference_symbol]
             if annot.ortholog_evidence != "close_taken":
                 alts += [annot.voted_symbol] + list(annot.symbol_aliases)

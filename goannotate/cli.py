@@ -203,10 +203,9 @@ Examples:
                    help="Voted symbols outside the reference nomenclature (zebrafish foxo3a, rodent Vmn1r,\n"
                         "outdated AARS); comparisons are case-insensitive\n"
                         "  ortholog:  replaced by a reference symbol only with evidence that it is the same\n"
-                        "             gene: the symbol without a genome suffix (.2, a, b, l), a unique NCBI\n"
-                        "             synonym (EIF2C3 -> AGO3), or a reciprocal best hit; the reference\n"
-                        "             protein must be covered to --symbol-min-coverage. Others are kept\n"
-                        "             (default)\n"
+                        "             gene: a unique NCBI synonym (EIF2C3 -> AGO3) or a reciprocal best hit;\n"
+                        "             the reference protein must be covered to --symbol-min-coverage.\n"
+                        "             Others are kept (default)\n"
                         "  reference: replaced by the closest reference protein the gene covers, or removed\n"
                         "  any:       kept as voted")
     g.add_argument("--rbh-margin", type=float, default=0.9, metavar="F",

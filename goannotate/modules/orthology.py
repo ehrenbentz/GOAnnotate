@@ -18,8 +18,9 @@ are (--ortholog-symbol weighted, the default):
   is the primary evidence. OrthoFinder runs before the Diamond vote, and
   the symbol decides the vote among the gene's hits; a gene whose hits do
   not carry it, or whose reference check chose another symbol, takes it
-  anyway (symbol_status ortholog) and the core's symbol is kept as an
-  alias and listed in the report as a conflict for review.
+  when the gene's own reference alignments allow it (symbol_status
+  ortholog); a symbol of the relatives without a reference protein does
+  not replace a symbol those alignments support.
   distant relatives: the ortholog symbol is one more vote. In the Diamond
   vote it carries a symbol group that scores at least 75% of the best group
   (annotate.ORTHOLOG_VOTE_MARGIN); afterwards it fills genes left without a symbol (or
@@ -82,7 +83,6 @@ import zipfile
 from collections import Counter
 from pathlib import Path
 
-from goannotate.mappings import symbol_base, symbol_bases  # noqa: F401 (used here and by importers of this module)
 from goannotate.modules.base import Module, ModuleContext, ModuleError, ModuleSkipped, ToolStatus, clean_sequence
 from goannotate.sequences import read_fasta
 
@@ -114,20 +114,14 @@ def agreed_symbol(symbols: list) -> tuple:
     """
     (symbol, how) from the informative symbols of a gene's one-to-one
     orthologs in the relatives that name them: 'agree' when they are
-    identical (case-insensitive), 'agree_base' when they differ only by a
-    genome suffix (the most frequent form is used, the suffix-free form on a
-    tie), ('', 'disagree') otherwise, ('', 'none') without symbols.
+    identical (case-insensitive), ('', 'disagree') otherwise, ('', 'none')
+    without symbols.
     """
     if not symbols:
         return "", "none"
     upper = Counter(s.upper() for s in symbols)
     if len(upper) == 1:
         return symbols[0], "agree"
-    if len({symbol_base(s) for s in symbols}) == 1:
-        (top, n), *rest = upper.most_common()
-        if rest and rest[0][1] == n:
-            return symbol_base(symbols[0]), "agree_base"
-        return next(s for s in symbols if s.upper() == top), "agree_base"
     return "", "disagree"
 
 
@@ -400,11 +394,10 @@ class OrthologyModule(Module):
         self.shared_calls = set()           # genes whose ortholog symbol rests on a many:1 ortholog
         self.gene_close = {}                # query gene -> True when a close relative supports the symbol
         self.gene_close_count = {}          # query gene -> close relatives (same species included) naming it
-        self.gene_own = {}                  # query gene -> close relatives' own symbol for it (ohnolog, lineage form)
+        self.gene_own = {}                  # query gene -> close relatives' own symbol for it (shown in the report)
         self.gene_products = {}             # query gene -> relatives' products behind the symbol
         self.filled = {}                    # query gene -> (old symbol, old status): distant fills
         self.overrides = {}                 # query gene -> (old symbol, old status): close symbols taken
-        self.refined = {}                   # query gene -> (old symbol, old status): same gene, relatives' own form
         self.decision = {}                  # query gene -> confirmed / taken / filled / kept / none
         self.check = Counter()
         self.same_check = Counter()         # supported symbols against the same-species annotation
@@ -943,7 +936,7 @@ class OrthologyModule(Module):
                 self.gene_close[gene] = n_close > 0
                 self.gene_close_count[gene] = n_close
                 self.gene_products[gene] = products
-                # the close relatives' own symbol for the gene (an ohnolog form such as kdm2aa), when they agree on it
+                # the close relatives' own symbol for the gene, when they agree on it
                 owns = [o for r, o in close_own if self._equivalent(r, sym)]
                 own, own_how = agreed_symbol(owns)
                 if own:
@@ -1146,23 +1139,9 @@ class OrthologyModule(Module):
                 self.decision[gene] = "kept"
                 continue
             own = self.gene_own.get(gene, "") if close else ""
-            final = own or sym             # close relatives' own form (species-appropriate), else the reference form
-            if eq in ("same", "synonym") or (eq == "same_base" and status not in FILL_STATUSES):
+            if eq in ("same", "synonym"):
                 self.check["confirmed_close" if close else "confirmed_distant"] += 1
-                if (own and self.mode == "weighted" and own.upper() != core.upper()
-                        and not (self._orf_symbol(own) and not self._orf_symbol(core))):
-                    # the same gene; the close relatives name it in their own nomenclature (an ohnolog
-                    # form kdm2aa for kdm2a, a lineage name): their symbol is used, the core's kept as alias
-                    if core not in annot.symbol_aliases:
-                        annot.symbol_aliases = list(annot.symbol_aliases) + [core]
-                    annot.voted_symbol = core
-                    annot.consensus_symbol = fmt(own)
-                    annot.ortholog_reference_symbol = sym
-                    annot.symbol_status = "ortholog"
-                    self.refined[gene] = (core, status)
-                    self.decision[gene] = "refined"
-                else:
-                    self.decision[gene] = "confirmed"
+                self.decision[gene] = "confirmed"
                 continue
             take = False
             if close and self.mode == "weighted":
@@ -1175,11 +1154,18 @@ class OrthologyModule(Module):
                     self.decision[gene] = "conflict_kept"
                     self.check["conflict_kept"] += 1
                     continue
-                # The gene's own sequence decides between a supported core symbol and a reference symbol
-                # of the relatives: the relatives' symbol is taken only when its reference protein scores
-                # at least TAKE_MARGIN of the voted symbol's. A lineage symbol with no reference protein
-                # cannot be judged by the sequence and is taken; a gene without a reference hit likewise.
-                if core and status not in FILL_STATUSES and not self._sequence_allows(ctx, gene, core, sym, final):
+                # The gene's own sequence decides between a supported core symbol and the relatives'
+                # symbol. A symbol of the relatives without a reference protein cannot be judged by the
+                # sequence and does not replace a symbol the gene's reference alignments support.
+                scores = (ctx.reference_scores or {}).get(gene)
+                if (core and status not in FILL_STATUSES and scores
+                        and self._reference_score(ctx, scores, sym, own) is None):
+                    self.decision[gene] = "kept"
+                    self.check["kept_unjudged"] += 1
+                    continue
+                # A reference symbol of the relatives is taken only when its reference protein scores at
+                # least TAKE_MARGIN of the voted symbol's; a gene without a reference hit takes it.
+                if core and status not in FILL_STATUSES and not self._sequence_allows(ctx, gene, core, sym, own):
                     self.decision[gene] = "conflict_kept"
                     self.check["conflict_kept"] += 1
                     self.check["conflict_sequence"] += 1
@@ -1192,7 +1178,7 @@ class OrthologyModule(Module):
             if (take and (not core or status in FILL_STATUSES)
                     and not (annot.voted_symbol and self._equivalent(annot.voted_symbol, sym))
                     and not self._among_hits(annot, sym)
-                    and not self._sequence_allows_fill(ctx, gene, sym, final)):
+                    and not self._sequence_allows_fill(ctx, gene, sym, own)):
                 self.decision[gene] = "fill_refused"
                 self.check["fill_refused"] += 1
                 continue
@@ -1208,7 +1194,7 @@ class OrthologyModule(Module):
                 annot.symbol_aliases = []
             elif core and core not in annot.symbol_aliases:
                 annot.symbol_aliases = list(annot.symbol_aliases) + [core]
-            annot.consensus_symbol = fmt(final)
+            annot.consensus_symbol = fmt(sym)
             annot.ortholog_reference_symbol = sym      # the gene in the reference nomenclature (reference GO)
             if taken:
                 annot.symbol_status = "ortholog"
@@ -1239,7 +1225,6 @@ class OrthologyModule(Module):
                 continue
             close = self.gene_close.get(gene, False)
             evidence = {"confirmed": "close_confirmed" if close else "distant_confirmed",
-                        "refined": "close_confirmed",
                         "taken": "close_taken",
                         "filled": "close_filled" if close else "distant_filled",
                         "conflict_kept": "conflict"}.get(decision)
@@ -1260,6 +1245,7 @@ class OrthologyModule(Module):
         self.check.setdefault("conflict_kept", 0)
         self.check.setdefault("conflict_sequence", 0)
         self.check.setdefault("fill_refused", 0)
+        self.check.setdefault("kept_unjudged", 0)
         self.check.setdefault("shared_unsupported", 0)
         self.counts = {"relatives": len(self.relatives), "close_relatives": sum(1 for r in self.relatives if r.close),
                        "candidates_examined": len(self.candidates),
@@ -1268,7 +1254,6 @@ class OrthologyModule(Module):
                        "genes_with_agreed_symbol": sum(1 for s, _ in self.gene_symbol.values() if s),
                        "genes_with_close_symbol": n_close_syms,
                        "symbols_taken": n_taken, "symbols_taken_conflicts": conflicts,
-                       "symbols_refined": len(self.refined),
                        "symbols_filled": n_filled,
                        "shared_calls": len(self.shared_calls),
                        "filled_unnamed": sum(1 for o, _ in self.filled.values() if not o),
@@ -1280,11 +1265,10 @@ class OrthologyModule(Module):
         self._write_report(ctx)
         self._write_relatives(ctx)
         c = self.check
-        agree = (c["same"] + c["same_base"] + c["synonym"]) / c["compared"] if c["compared"] else 0
+        agree = (c["same"] + c["synonym"]) / c["compared"] if c["compared"] else 0
         logger.info(f"  Orthologs: {len(self.orthologs):,} genes with orthologs in the relatives; ortholog symbols for "
                     f"{self.counts['genes_with_agreed_symbol']:,} genes ({n_close_syms:,} from close relatives); "
-                    f"{c['confirmed_close'] + c['confirmed_distant']:,} confirm the core's symbol "
-                    f"({len(self.refined):,} of them in the relatives' own form), {n_taken:,} taken "
+                    f"{c['confirmed_close'] + c['confirmed_distant']:,} confirm the core's symbol, {n_taken:,} taken "
                     f"from close relatives ({conflicts:,} over a supported core symbol; {c['conflict_kept']:,} conflicts "
                     f"kept), {n_filled:,} filled "
                     f"({self.counts['filled_unnamed']:,} unnamed genes, {self.counts['filled_foreign_kept']:,} lineage "
@@ -1292,7 +1276,7 @@ class OrthologyModule(Module):
                     f"{c['compared']:,} agree")
         if self.same:
             sc = self.same_check
-            sagree = (sc["same"] + sc["same_base"] + sc["synonym"]) / sc["compared"] if sc["compared"] else 0
+            sagree = (sc["same"] + sc["synonym"]) / sc["compared"] if sc["compared"] else 0
             logger.info(f"  Same species ({self.same.organism}, {self.same.accession}): supported symbols agree "
                         f"with it for {100 * sagree:.1f}% of {sc['compared']:,}; "
                         f"{sum(1 for _, h in self.gene_symbol.values() if h == 'same_species'):,} symbols from it "
@@ -1337,8 +1321,7 @@ class OrthologyModule(Module):
         sym_score = self._reference_score(ctx, scores, sym, own)
         if sym_score is None:
             return True
-        core_forms = {core.upper()} | symbol_bases(core.upper())
-        core_score = max((scores.get(s, 0.0) for s in core_forms), default=0.0)
+        core_score = scores.get(core.upper(), 0.0)
         return sym_score >= TAKE_MARGIN * core_score
 
     def _own_evidence(self, ctx: ModuleContext, annot, gene: str, sym: str) -> bool:
@@ -1387,14 +1370,11 @@ class OrthologyModule(Module):
 
     def _equivalent(self, a: str, b: str) -> str:
         """
-        How two symbols name the same gene: 'same' (case-insensitive), 'same_base' (they differ by a
-        genome suffix), 'synonym' (one is the reference species' official symbol of a gene that the
+        How two symbols name the same gene: 'same' (case-insensitive), 'synonym' (one is the reference species' official symbol of a gene that the
         other names as symbol or synonym: TIPE3 and its former name TNFAIP8L3), or '' when they differ.
         """
         if a.upper() == b.upper():
             return "same"
-        if symbol_base(a) == symbol_base(b) or symbol_base(a) == b.upper() or a.upper() == symbol_base(b):
-            return "same_base"          # foxo3a / foxo3b, and kdm2aa / kdm2a (one ohnolog suffix)
         na = getattr(self, "_names", {}).get(a.lower(), {})
         nb = getattr(self, "_names", {}).get(b.lower(), {})
         if (na.get("symbol", set()) & nb.get("any", set())) or (nb.get("symbol", set()) & na.get("any", set())):
@@ -1404,7 +1384,7 @@ class OrthologyModule(Module):
     def _with_same_species(self, same_sym: str, same_prod: str, sym: str, how: str, products: list) -> tuple:
         """
         Combine the same-species ortholog's symbol with the other relatives'
-        result: it is used when they agree with it (same suffix-free form), name
+        result: it is used when they agree with it, name
         no one-to-one ortholog, or disagree among themselves; when they agree on
         a different symbol, nothing is used ('same_species_disagree').
         """
@@ -1432,7 +1412,7 @@ class OrthologyModule(Module):
             for gene in sorted(set(self.orthogroup) | set(self.orthologs)):
                 annot = ctx.annotations.get(gene)
                 sym, how = self.gene_symbol.get(gene, ("", "none"))
-                old = self.filled.get(gene) or self.overrides.get(gene) or self.refined.get(gene)
+                old = self.filled.get(gene) or self.overrides.get(gene)
                 row = [gene, annot.consensus_symbol if annot else "", annot.symbol_status if annot else "",
                        self.orthogroup.get(gene, ""), sym, how,
                        ("close" if self.gene_close.get(gene) else "distant") if sym else "",
@@ -1503,8 +1483,6 @@ class OrthologyModule(Module):
                      f"({c.get('genes_with_close_symbol', 0):,} supported by a close relative)")
         lines.append(f"    Core symbol confirmed:       {c.get('check_confirmed_close', 0) + c.get('check_confirmed_distant', 0):,} "
                      f"({c.get('check_confirmed_close', 0):,} by close relatives)")
-        lines.append(f"    Relatives' own form used:    {c.get('symbols_refined', 0):,} genes whose core symbol names the "
-                     f"same gene (ohnolog or lineage form; decision 'refined', core symbol kept as alias)")
         lines.append(f"    Symbols taken (close):       {c.get('symbols_taken', 0):,}, of which "
                      f"{c.get('symbols_taken_conflicts', 0):,} replace a supported core symbol (decision 'taken' in "
                      f"the report; review these)")
@@ -1512,6 +1490,9 @@ class OrthologyModule(Module):
                      f"{c.get('check_conflict_sequence', 0):,} where the gene's sequence scores the relatives' "
                      f"reference protein below 90% of the voted symbol's, the rest one close relative alone against "
                      f"a reciprocal best hit that no hit supports; decision 'conflict_kept')")
+        lines.append(f"    Relatives' symbol not used:  {c.get('check_kept_unjudged', 0):,} (a symbol of the relatives without "
+                     f"a reference protein does not replace a symbol the gene's reference alignments support; "
+                     f"decision 'kept', the relatives' symbol is in the report)")
         lines.append(f"    Symbols filled:              {c.get('symbols_filled', 0):,} "
                      f"({c.get('filled_unnamed', 0):,} unnamed genes, {c.get('filled_foreign_kept', 0):,} lineage symbols); "
                      f"products {c.get('products_filled', 0):,}")
@@ -1525,14 +1506,14 @@ class OrthologyModule(Module):
                          f"reference alignments do not carry the symbol (decision 'shared_unsupported')")
         compared = c.get("check_compared", 0)
         if compared:
-            agree = c.get("check_same", 0) + c.get("check_same_base", 0) + c.get("check_synonym", 0)
+            agree = c.get("check_same", 0) + c.get("check_synonym", 0)
             lines.append(f"    Check, supported symbols:    {agree:,} of {compared:,} agree with the relatives' "
-                         f"1:1 symbol ({100 * agree / compared:.1f}%; {c.get('check_same_base', 0):,} by "
-                         f"suffix-free form, {c.get('check_synonym', 0):,} as former names of the same gene); "
+                         f"1:1 symbol ({100 * agree / compared:.1f}%; "
+                         f"{c.get('check_synonym', 0):,} as former names of the same gene); "
                          f"{c.get('check_different', 0):,} differ")
         sc = self.same_check
         if self.same and sc["compared"]:
-            agree = sc["same"] + sc["same_base"] + sc["synonym"]
+            agree = sc["same"] + sc["synonym"]
             lines.append(f"    Check, previous annotation:  {agree:,} of {sc['compared']:,} supported symbols agree with "
                          f"the {self.same.organism} annotation ({self.same.accession}) "
                          f"({100 * agree / sc['compared']:.1f}%); {sc['different']:,} differ")

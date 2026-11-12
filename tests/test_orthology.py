@@ -24,8 +24,7 @@ from goannotate.filters import BadNameFilter, default_bad_names_path  # noqa: E4
 from goannotate.models import GeneUniverse, QueryAnnotation  # noqa: E402
 from goannotate.modules import ModuleContext, run_modules, select_modules  # noqa: E402
 from goannotate.modules.orthology import (OrthologyModule, _last_line, agreed_symbol,  # noqa: E402
-                                          parse_orthologs_by_species, parse_refseq_gff, species_label,
-                                          symbol_base)
+                                          parse_orthologs_by_species, parse_refseq_gff, species_label)
 
 failures = 0
 
@@ -248,11 +247,9 @@ def setup(tmp: Path):
 
 def test_helpers():
     check(species_label("Peromyscus maniculatus bairdii") == "Peromyscus_maniculatus_bairdii", "species label")
-    check(symbol_base("foxo3b") == "FOXO3" and symbol_base("dhdh.2") == "DHDH" and symbol_base("AVP") == "AVP",
-          "suffix-free symbol")
     check(agreed_symbol(["Avp", "AVP"]) == ("Avp", "agree"), "agreement is case-insensitive")
-    check(agreed_symbol(["foxo3b", "foxo3b", "foxo3"]) == ("foxo3b", "agree_base"), "most frequent form")
-    check(agreed_symbol(["foxo3a", "foxo3b"]) == ("FOXO3", "agree_base"), "tie gives the suffix-free form")
+    check(agreed_symbol(["SEC24A", "SEC24B"]) == ("", "disagree") and agreed_symbol(["foxo3", "foxo3b"]) == ("", "disagree"),
+          "symbols that differ in their last letter are different symbols")
     check(agreed_symbol(["Avp", "Kcnq5"]) == ("", "disagree") and agreed_symbol([]) == ("", "none"),
           "disagreement and no symbol")
 
@@ -356,8 +353,8 @@ def test_module(tmp: Path, db: Path):
           and ann["g1"].consensus_name == "vasopressin-neurophysin 2-copeptin" and ann["g1"].product_note == "ortholog",
           f"unnamed gene filled: {ann['g1'].consensus_symbol} / {ann['g1'].consensus_name}")
     check(ann["g2"].consensus_symbol == "KCNQ5" and "kcnq5b" in ann["g2"].symbol_aliases
-          and ann["g2"].consensus_name == "potassium voltage-gated channel subfamily KQT member 5",
-          "lineage symbol replaced, kept as alias; product kept")
+          and ann["g2"].consensus_name == "potassium channel KCNQ5" and ann["g2"].product_note == "ortholog",
+          "another symbol replaced, kept as alias; the product follows the filled symbol")
     check(ann["g3"].consensus_symbol == "GRM1" and m.check["compared"] == 2 and m.check["same"] == 1,
           "supported symbol checked, not changed")
     check(ann["g5"].consensus_symbol == "" and m.check["relatives_disagree"] == 1, "disagreeing relatives fill nothing")
@@ -380,7 +377,7 @@ def test_module(tmp: Path, db: Path):
     check(ann["g11"].consensus_symbol == "C19ORF81" and m.gene_symbol["g11"] == ("C19orf81", "agree"),
           f"an official C#orf symbol is accepted from a close relative's ortholog: {m.gene_symbol.get('g11')}")
     check(m.counts["symbols_filled"] == 5 and m.counts["filled_unnamed"] == 4 and m.counts["filled_foreign_kept"] == 1
-          and m.counts["products_filled"] == 3 and m.counts["symbols_taken"] == 0, f"counts {m.counts}")
+          and m.counts["products_filled"] == 4 and m.counts["symbols_taken"] == 0, f"counts {m.counts}")
     rel_rows = (reports / "p_orthology_relatives.tsv").read_text().splitlines()
     check(len(rel_rows) == 5 and rel_rows[2].split("\t")[7:13] == ["0.833", "0.833", "chosen", "genus", "Microtus", "close"]
           and rel_rows[3].split("\t")[7:10] == ["0.778", "0.667", "chosen"] and rel_rows[4].split("\t")[9] == "rejected_ratio",
@@ -626,7 +623,7 @@ def test_module(tmp: Path, db: Path):
             else (a.consensus_name == "Oxytocin-neurophysin 1")
         check(m15.decision["g1"] == expect and a.consensus_symbol == ("AVP" if expect == "taken" else "OXT") and product_ok,
               f"relatives' reference symbol {label}: {m15.decision['g1']}, {a.consensus_symbol}, {a.consensus_name}")
-    # a lineage symbol of the relatives has no reference protein and is taken
+    # a symbol of the relatives without a reference protein does not replace a sequence-supported symbol
     ann8 = {g: QueryAnnotation(query_id=g) for g in names}
     ann8["g1"].consensus_symbol, ann8["g1"].symbol_status = "OXT", "rbh"
     ann8["g1"].hits = [type("H", (), {"gene_symbol": "Avp"})()]
@@ -637,16 +634,17 @@ def test_module(tmp: Path, db: Path):
     start_modules([m16], ctx8)
     ctx8.annotations = ann8
     integrate_modules([m16], ctx8)
-    check(m16.decision["g1"] == "taken", f"a symbol outside the reference nomenclature is taken: {m16.decision['g1']}")
+    check(m16.decision["g1"] == "kept" and ann8["g1"].consensus_symbol == "OXT",
+          f"a symbol outside the reference nomenclature does not replace a supported symbol: {m16.decision['g1']}")
 
     # The close relatives' own form of the same gene replaces the core's reference-style symbol
     from goannotate.modules.orthology import RelGene
     m12 = OrthologyModule(Namespace(**{**vars(args), "ortholog_symbol": "weighted"}))
     rel = type("R", (), {})()
     rel.label, rel.close, rel.same_species = "Poecilia_r", True, False
-    rel.proteins = {"XP_P1": RelGene("g-kdm2aa", "kdm2aa", "lysine-specific demethylase 2Aa", "", "kdm2aa")}
+    rel.proteins = {"XP_P1": RelGene("g-kdm2aa", "kdm2aa", "lysine-specific demethylase 2Aa", "", "KDM2A")}
     m12.relatives = [rel]
-    m12.orthologs = {"q1": {"Poecilia_r": ("1:1", [("XP_P1", "kdm2aa")])}}
+    m12.orthologs = {"q1": {"Poecilia_r": ("1:1", [("XP_P1", "KDM2A")])}}
     m12._compute_calls(bf.is_bad_symbol)
     annq = {"q1": QueryAnnotation(query_id="q1", consensus_symbol="kdm2a", symbol_status="rbh",
                                   consensus_name="Lysine-specific demethylase 2A", hits=[])}
@@ -655,10 +653,26 @@ def test_module(tmp: Path, db: Path):
                                                                       gene_to_transcripts={}, coding={"q1": True}),
                          annotations=annq, bad_name_filter=bf, symbol_case_fn=str.lower)
     m12.integrate(ctxq)
-    check(annq["q1"].consensus_symbol == "kdm2aa" and m12.decision["q1"] == "refined"
-          and annq["q1"].voted_symbol == "kdm2a" and "kdm2a" in annq["q1"].symbol_aliases
-          and annq["q1"].consensus_name == "Lysine-specific demethylase 2A" and m12.check["same_base"] == 1,
-          f"ohnolog form from close relatives used, product kept: {annq['q1'].consensus_symbol} {m12.decision['q1']}")
+    check(annq["q1"].consensus_symbol == "kdm2a" and m12.decision["q1"] == "confirmed"
+          and annq["q1"].consensus_name == "Lysine-specific demethylase 2A" and m12.check["same"] == 1
+          and m12.gene_own["q1"] == "kdm2aa",
+          f"relatives naming the same reference gene in their own form confirm the symbol, which stays: "
+          f"{annq['q1'].consensus_symbol} {m12.decision['q1']}")
+    # relatives' symbol without a reference protein against a symbol the reference alignments support
+    rel.proteins = {"XP_P1": RelGene("g-stx3b", "stx3b", "syntaxin 3b", "", "stx3b")}
+    m13 = OrthologyModule(Namespace(**{**vars(args), "ortholog_symbol": "weighted"}))
+    m13.relatives = [rel]
+    m13.orthologs = {"q1": {"Poecilia_r": ("1:1", [("XP_P1", "stx3b")])}}
+    m13._compute_calls(bf.is_bad_symbol)
+    for scores, expect_sym, expect_dec in (({"q1": {"STX3": 400.0}}, "stx3", "kept"), ({}, "stx3b", "taken")):
+        ann13 = {"q1": QueryAnnotation(query_id="q1", consensus_symbol="stx3", symbol_status="vote_supported",
+                                       consensus_name="Syntaxin-3", hits=[])}
+        ctxq.annotations, ctxq.reference_symbols, ctxq.reference_scores = ann13, {"STX3"}, scores
+        m13.decision, m13.check = {}, type(m13.check)()
+        m13.integrate(ctxq)
+        check(ann13["q1"].consensus_symbol == expect_sym and m13.decision["q1"] == expect_dec,
+              f"relatives' symbol without a reference protein, gene {'with' if scores else 'without'} reference "
+              f"alignments: {ann13['q1'].consensus_symbol} {m13.decision['q1']}")
 
     # A C#orf ortholog symbol fills only; it never replaces a supported symbol
     ann5 = {g: QueryAnnotation(query_id=g) for g in names}
