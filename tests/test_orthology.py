@@ -393,6 +393,67 @@ def test_module(tmp: Path, db: Path):
     check(any("Relatives' symbols" in l and "2 put in the reference nomenclature" in l for l in m.summary_lines()),
           "summary normalization line")
     check(m._orthologs_text("g6") == "Myodes_c:Avp,Grm1(1:many)", f"orthologs column: {m._orthologs_text('g6')}")
+
+    # A relative's gene shared by several query genes (many:1): used with transcript input only
+    saved = dict(m.orthologs["g9"])
+    m.orthologs["g9"] = {label: ("many:1", named) for label, (_, named) in saved.items()}
+    m.gene_symbol.pop("g9")
+    m._compute_calls(lambda s: s.startswith("LOC"))
+    check(m.gene_symbol["g9"] == ("", "none") and not m._usable("many:1"),
+          f"gene models: a many:1 ortholog gives no symbol: {m.gene_symbol['g9']}")
+    m.fragment_orthologs = True
+    m._compute_calls(lambda s: s.startswith("LOC"))
+    check(m.gene_symbol["g9"] == ("Oxt", "agree") and m.shared_calls == {"g9"} and not m._usable("1:many"),
+          f"transcript input: a many:1 ortholog is used like 1:1: {m.gene_symbol['g9']}")
+    bare = QueryAnnotation(query_id="g9")
+    voted = QueryAnnotation(query_id="g9")
+    voted.voted_symbol = "OXT"
+    ctx_s = ModuleContext(query_fasta=Path("q.faa"), search_mode="blastp", work_dir=work, reports_dir=reports,
+                          prefix="p", threads=60, reference_symbols={"AVP", "OXT"},
+                          reference_scores={"g9": {"AVP": 300.0, "OXT": 280.0}})
+    check(not m._own_evidence(ctx, bare, "g9", "Oxt") and m._own_evidence(ctx, voted, "g9", "Oxt")
+          and m._own_evidence(ctx_s, bare, "g9", "Oxt") and not m._own_evidence(ctx_s, bare, "g1", "Oxt"),
+          "a shared ortholog needs the transcript's own vote, hits or reference alignment")
+    m.fragment_orthologs = False
+    m.shared_calls.clear()
+    m.orthologs["g9"] = saved
+    check(OrthologyModule(Namespace(**{**vars(args), "transcripts": "t.fasta"})).fragment_orthologs
+          and not OrthologyModule(args).fragment_orthologs, "many:1 orthologs follow the input type")
+
+    # A fill is refused when the gene's sequence scores the symbol's reference protein below the margin
+    ctx_f = ModuleContext(query_fasta=Path("q.faa"), search_mode="blastp", work_dir=work, reports_dir=reports,
+                          prefix="p", threads=60, reference_symbols={"AVP", "OXT"},
+                          reference_scores={"g1": {"AVP": 300.0, "OXT": 200.0}, "g9": {"AVP": 300.0, "OXT": 280.0}})
+    check(m._sequence_allows_fill(ctx_f, "g1", "AVP") and not m._sequence_allows_fill(ctx_f, "g1", "Oxt")
+          and m._sequence_allows_fill(ctx_f, "g9", "Oxt"), "fill allowed at 90% of the best reference hit or more")
+    check(m._sequence_allows_fill(ctx_f, "g1", "GAS8") and m._sequence_allows_fill(ctx_f, "g2", "AVP")
+          and m._sequence_allows_fill(ctx_f, "g1", "Kcnq5"),
+          "a lineage symbol and a gene without reference hits cannot be judged and are filled")
+    ctx_f.reference_symbols.add("GAS8")
+    check(not m._sequence_allows_fill(ctx_f, "g1", "Gas8"), "a reference symbol the gene does not hit is refused")
+    check(not m._sequence_allows_fill(ctx_f, "g1", "DRC4", "Gas8") and m._sequence_allows_fill(ctx_f, "g1", "DRC4"),
+          "the relatives' own form is judged when the reference proteome names the gene by it")
+    ann_f = {g: QueryAnnotation(query_id=g) for g in names}
+    ann_f["g2"].consensus_symbol, ann_f["g2"].symbol_status = "kcnq5b", "foreign_kept"
+    ctx_r = ModuleContext(query_fasta=Path("q.faa"), search_mode="blastp", work_dir=work, reports_dir=reports,
+                          prefix="r", threads=60, universe=universe, annotations=ann_f, bad_name_filter=bf,
+                          symbol_case_fn=str.upper, reference_symbols={"AVP", "OXT", "KCNQ5"},
+                          reference_scores={"g1": {"OXT": 300.0}, "g2": {"AVP": 300.0, "KCNQ5": 100.0},
+                                            "g9": {"OXT": 250.0}})
+    m_r = OrthologyModule(args)
+    run_modules([m_r], ctx_r)
+    check(ann_f["g1"].consensus_symbol == "" and m_r.decision["g1"] == "fill_refused"
+          and ann_f["g2"].consensus_symbol == "kcnq5b" and m_r.decision["g2"] == "fill_refused"
+          and ann_f["g9"].consensus_symbol == "OXT" and m_r.counts["check_fill_refused"] == 2,
+          f"fills refused by the sequence: g1 {m_r.decision['g1']}, g2 {m_r.decision['g2']}, g9 {m_r.decision['g9']}")
+    check(any("Fills refused:               2" in l for l in m_r.summary_lines()), "summary line of refused fills")
+    ann_v = {g: QueryAnnotation(query_id=g) for g in names}
+    ann_v["g1"].voted_symbol, ann_v["g1"].symbol_status = "AVP", "unsupported_removed"
+    ctx_r.annotations, ctx_r.prefix = ann_v, "v"
+    m_v = OrthologyModule(args)
+    run_modules([m_v], ctx_r)
+    check(ann_v["g1"].consensus_symbol == "AVP" and m_v.decision["g1"] != "fill_refused",
+          f"a symbol the gene's own vote carried is not refused: {m_v.decision['g1']}")
     check(any("Check, supported symbols" in l and "2 of 2 agree" in l for l in m.summary_lines()), "summary check line")
     check(any("2 close (common ancestor within the family)" in l for l in m.summary_lines()), "summary closeness")
 

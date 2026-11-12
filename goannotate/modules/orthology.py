@@ -29,7 +29,12 @@ are (--ortholog-symbol weighted, the default):
 --ortholog-symbol fill is the earlier behaviour (no influence on the vote,
 fills only); off records the orthologs and the checks. A gene that takes
 an ortholog symbol and has no product takes the reference protein's name
-when the symbol is a reference symbol, else the relatives' product.
+when the symbol is a reference symbol, else the relatives' product. A taken
+or filled reference symbol must be allowed by the gene's own alignments to
+the reference proteome (TAKE_MARGIN); otherwise the gene keeps what it had
+(conflict_kept, fill_refused). With transcript input, a relative's gene
+that several transcripts share (many:1) is used like a one-to-one ortholog
+when the transcript's own hits or reference alignments carry the symbol.
 
 Relatives' symbols are put in the reference nomenclature first, as the core
 does for hit symbols: a relative's gene (its NCBI GeneID) is mapped through
@@ -390,6 +395,9 @@ class OrthologyModule(Module):
         self.orthogroup = {}                # query gene -> orthogroup
         self.orthologs = {}                 # query gene -> {relative label: (type, [(gene, symbol)])}
         self.gene_symbol = {}               # query gene -> (agreed 1:1 symbol, how)
+        # transcript input: several fragments of one gene share one ortholog (many:1), which is used like 1:1
+        self.fragment_orthologs = bool(getattr(args, "transcripts", None))
+        self.shared_calls = set()           # genes whose ortholog symbol rests on a many:1 ortholog
         self.gene_close = {}                # query gene -> True when a close relative supports the symbol
         self.gene_close_count = {}          # query gene -> close relatives (same species included) naming it
         self.gene_own = {}                  # query gene -> close relatives' own symbol for it (ohnolog, lineage form)
@@ -903,9 +911,11 @@ class OrthologyModule(Module):
             symbols, products, close_syms = [], [], []
             close_own = []                  # (reference form, own form) from close relatives
             same_sym, same_prod = "", ""
+            shared = False
             for label, (kind, named) in by_rel.items():
-                if kind != "1:1":
+                if not self._usable(kind):
                     continue
+                shared = shared or kind != "1:1"
                 pid, sym = named[0]
                 rel = rel_by_label[label]
                 if sym and (not is_bad(sym) or ((rel.close or label == same_label) and self._orf_symbol(sym))):
@@ -925,6 +935,9 @@ class OrthologyModule(Module):
             if same_sym:
                 sym, how, products = self._with_same_species(same_sym, same_prod, sym, how, products)
             self.gene_symbol[gene] = (sym, how)
+            self.shared_calls.discard(gene)
+            if sym and shared:
+                self.shared_calls.add(gene)
             if sym:
                 n_close = sum(1 for c in close_syms if self._equivalent(c, sym)) + (1 if same_sym else 0)
                 self.gene_close[gene] = n_close > 0
@@ -955,12 +968,12 @@ class OrthologyModule(Module):
             rel_by_label[self.same.label] = self.same
         wanted = {}                      # query gene -> [GeneID per close relative]
         for gene, by_rel in self.orthologs.items():
-            if gene not in ctx.annotations:
+            if gene not in ctx.annotations or self.decision.get(gene) == "shared_unsupported":
                 continue
             ids = []
             for label, (kind, named) in by_rel.items():
                 rel = rel_by_label.get(label)
-                if kind != "1:1" or rel is None or not (rel.close or rel is self.same):
+                if not self._usable(kind) or rel is None or not (rel.close or rel is self.same):
                     continue
                 geneid = rel.proteins.get(named[0][0], _NO_GENE).geneid
                 if geneid:
@@ -1016,6 +1029,14 @@ class OrthologyModule(Module):
         self.go_support_stats = {"genes": n_genes, "terms": n_terms}
         logger.info(f"  Ortholog GO support: {n_terms:,} terms of {n_genes:,} genes carried by close relatives' "
                     f"one-to-one orthologs (one supporting source per relative)")
+
+    def _usable(self, kind: str) -> bool:
+        """
+        Whether an ortholog relation names the query gene: one-to-one, and
+        with transcript input also many-to-one, where the query genes
+        sharing one gene of the relative are mostly fragments of one gene.
+        """
+        return kind == "1:1" or (self.fragment_orthologs and kind == "many:1")
 
     def _orf_symbol(self, sym: str) -> bool:
         """An official reference symbol of an uncharacterized gene (C19orf81, KIAA1549L)."""
@@ -1094,7 +1115,7 @@ class OrthologyModule(Module):
             core = annot.consensus_symbol
             # the same-species ortholog alone, for the continuity check
             same_sym = ""
-            if same_label and self.orthologs.get(gene, {}).get(same_label, ("",))[0] == "1:1":
+            if same_label and self._usable(self.orthologs.get(gene, {}).get(same_label, ("",))[0]):
                 pid, s0 = self.orthologs[gene][same_label][1][0]
                 same_sym = s0 if s0 and (not is_bad(s0) or self._orf_symbol(s0)) else ""
             if same_sym and core and status in SUPPORTED_STATUSES:
@@ -1104,6 +1125,12 @@ class OrthologyModule(Module):
                 if how in ("disagree", "same_species_disagree"):
                     self.check["relatives_disagree"] += 1
                 self.decision[gene] = "none"
+                continue
+            # A gene of a relative that many transcripts share names a transcript only with the transcript's
+            # own evidence: fragments of the gene carry it, transcripts of repeats inserted in it do not.
+            if gene in self.shared_calls and not self._own_evidence(ctx, annot, gene, sym):
+                self.decision[gene] = "shared_unsupported"
+                self.check["shared_unsupported"] += 1
                 continue
             # check of supported core symbols against the relatives (before any change)
             if core and status in SUPPORTED_STATUSES:
@@ -1152,13 +1179,23 @@ class OrthologyModule(Module):
                 # of the relatives: the relatives' symbol is taken only when its reference protein scores
                 # at least TAKE_MARGIN of the voted symbol's. A lineage symbol with no reference protein
                 # cannot be judged by the sequence and is taken; a gene without a reference hit likewise.
-                if core and status not in FILL_STATUSES and not self._sequence_allows(ctx, gene, core, sym):
+                if core and status not in FILL_STATUSES and not self._sequence_allows(ctx, gene, core, sym, final):
                     self.decision[gene] = "conflict_kept"
                     self.check["conflict_kept"] += 1
                     self.check["conflict_sequence"] += 1
                     continue
             elif not core or status in FILL_STATUSES:
                 take = True                                 # a vote left nothing better: fill
+            # A symbol given to a gene without a supported one is checked against the gene's own evidence:
+            # when none of its hits carries the symbol (nor the vote), a reference symbol whose protein
+            # scores below TAKE_MARGIN of the gene's best reference hit names another gene.
+            if (take and (not core or status in FILL_STATUSES)
+                    and not (annot.voted_symbol and self._equivalent(annot.voted_symbol, sym))
+                    and not self._among_hits(annot, sym)
+                    and not self._sequence_allows_fill(ctx, gene, sym, final)):
+                self.decision[gene] = "fill_refused"
+                self.check["fill_refused"] += 1
+                continue
             if not take:
                 self.decision[gene] = "kept"                # distant symbol disagrees with a supported core symbol
                 continue
@@ -1222,6 +1259,8 @@ class OrthologyModule(Module):
         conflicts = sum(1 for g, (old, st) in self.overrides.items() if old and st in SUPPORTED_STATUSES)
         self.check.setdefault("conflict_kept", 0)
         self.check.setdefault("conflict_sequence", 0)
+        self.check.setdefault("fill_refused", 0)
+        self.check.setdefault("shared_unsupported", 0)
         self.counts = {"relatives": len(self.relatives), "close_relatives": sum(1 for r in self.relatives if r.close),
                        "candidates_examined": len(self.candidates),
                        "query_genes": coding, "genes_in_orthogroups": with_og,
@@ -1231,6 +1270,7 @@ class OrthologyModule(Module):
                        "symbols_taken": n_taken, "symbols_taken_conflicts": conflicts,
                        "symbols_refined": len(self.refined),
                        "symbols_filled": n_filled,
+                       "shared_calls": len(self.shared_calls),
                        "filled_unnamed": sum(1 for o, _ in self.filled.values() if not o),
                        "filled_foreign_kept": sum(1 for o, _ in self.filled.values() if o),
                        "products_filled": n_products, **{f"check_{k}": v for k, v in self.check.items()},
@@ -1270,7 +1310,20 @@ class OrthologyModule(Module):
                 return True
         return False
 
-    def _sequence_allows(self, ctx: ModuleContext, gene: str, core: str, sym: str) -> bool:
+    @staticmethod
+    def _reference_score(ctx: ModuleContext, scores: dict, *symbols):
+        """
+        Best score of the gene's alignments to the reference proteins of the
+        given forms of one symbol (the reference form and the relatives' own
+        form), or None when none of the forms is a reference symbol.
+        """
+        ref_symbols = ctx.reference_symbols or set()
+        forms = {s.upper() for s in symbols if s} & ref_symbols
+        if not forms:
+            return None
+        return max(scores.get(f, 0.0) for f in forms)
+
+    def _sequence_allows(self, ctx: ModuleContext, gene: str, core: str, sym: str, own: str = "") -> bool:
         """
         Whether the gene's alignments to the reference proteome allow the
         relatives' reference symbol sym to replace the core symbol: sym has
@@ -1278,15 +1331,47 @@ class OrthologyModule(Module):
         hit, or sym's reference protein scores at least TAKE_MARGIN of the
         core symbol's (zero when the gene does not hit it).
         """
-        ref_symbols = ctx.reference_symbols or set()
-        if sym.upper() not in ref_symbols:
-            return True
         scores = (ctx.reference_scores or {}).get(gene)
         if not scores:
             return True
+        sym_score = self._reference_score(ctx, scores, sym, own)
+        if sym_score is None:
+            return True
         core_forms = {core.upper()} | symbol_bases(core.upper())
         core_score = max((scores.get(s, 0.0) for s in core_forms), default=0.0)
-        return scores.get(sym.upper(), 0.0) >= TAKE_MARGIN * core_score
+        return sym_score >= TAKE_MARGIN * core_score
+
+    def _own_evidence(self, ctx: ModuleContext, annot, gene: str, sym: str) -> bool:
+        """
+        Whether the gene's own evidence carries the symbol: its vote or
+        final symbol, one of its hits, or its alignments to the reference
+        proteome (sym's reference protein scores at least TAKE_MARGIN of
+        the gene's best reference hit).
+        """
+        for own in (annot.consensus_symbol, annot.voted_symbol):
+            if own and self._equivalent(own, sym):
+                return True
+        if self._among_hits(annot, sym):
+            return True
+        scores = (ctx.reference_scores or {}).get(gene)
+        if not scores:
+            return False
+        sym_score = self._reference_score(ctx, scores, sym, self.gene_own.get(gene, ""))
+        return sym_score is not None and sym_score >= TAKE_MARGIN * max(scores.values())
+
+    def _sequence_allows_fill(self, ctx: ModuleContext, gene: str, sym: str, own: str = "") -> bool:
+        """
+        Whether the gene's alignments to the reference proteome allow the
+        relatives' reference symbol sym to fill the gene: sym has no
+        reference protein (a lineage symbol), the gene has no reference hit,
+        or sym's reference protein scores at least TAKE_MARGIN of the gene's
+        best reference hit (zero when the gene does not hit it).
+        """
+        scores = (ctx.reference_scores or {}).get(gene)
+        if not scores:
+            return True
+        sym_score = self._reference_score(ctx, scores, sym, own)
+        return sym_score is None or sym_score >= TAKE_MARGIN * max(scores.values())
 
     def ortholog_evidence_for(self, gene: str) -> dict:
         """
@@ -1296,7 +1381,7 @@ class OrthologyModule(Module):
         """
         sym, _ = self.gene_symbol.get(gene, ("", ""))
         same_sym = ""
-        if self.same and self.orthologs.get(gene, {}).get(self.same.label, ("",))[0] == "1:1":
+        if self.same and self._usable(self.orthologs.get(gene, {}).get(self.same.label, ("",))[0]):
             same_sym = self.orthologs[gene][self.same.label][1][0][1] or ""
         return {"relatives": sym or "", "close": self.gene_close.get(gene, False), "same_species": same_sym}
 
@@ -1334,7 +1419,7 @@ class OrthologyModule(Module):
         """
         Per gene: the final symbol and status, the orthogroup, the ortholog
         symbol with how the relatives agree and whether a close relative
-        supports it, the decision (confirmed, taken, filled, kept, recorded,
+        supports it, the decision (confirmed, taken, filled, fill_refused, shared_unsupported, kept, recorded,
         none) and the core's previous symbol when the ortholog symbol was
         taken or filled ("(none)" when there was none), then each relative's
         ortholog type and orthologs.
@@ -1430,6 +1515,14 @@ class OrthologyModule(Module):
         lines.append(f"    Symbols filled:              {c.get('symbols_filled', 0):,} "
                      f"({c.get('filled_unnamed', 0):,} unnamed genes, {c.get('filled_foreign_kept', 0):,} lineage symbols); "
                      f"products {c.get('products_filled', 0):,}")
+        lines.append(f"    Fills refused:               {c.get('check_fill_refused', 0):,} (none of the gene's hits "
+                     f"carries the relatives' symbol and its sequence scores that reference protein below 90% of "
+                     f"its best reference hit; decision 'fill_refused')")
+        if self.fragment_orthologs:
+            lines.append(f"    Shared orthologs:            {c.get('shared_calls', 0):,} ortholog symbols rest on a "
+                         f"gene of a relative that several transcripts share (many:1; transcript input); "
+                         f"{c.get('check_shared_unsupported', 0):,} of them not used, the transcript's own hits and "
+                         f"reference alignments do not carry the symbol (decision 'shared_unsupported')")
         compared = c.get("check_compared", 0)
         if compared:
             agree = c.get("check_same", 0) + c.get("check_same_base", 0) + c.get("check_synonym", 0)
