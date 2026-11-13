@@ -33,7 +33,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from goannotate.annotate import name_similarity, normalize_gene_name  # noqa: E402
-from goannotate.filters import BadNameFilter, default_bad_names_path  # noqa: E402
+from goannotate.filters import BadNameFilter, default_bad_patterns_path  # noqa: E402
 from goannotate.gff3 import parse_attributes  # noqa: E402
 
 csv.field_size_limit(sys.maxsize)
@@ -95,7 +95,7 @@ def main():
 
     out = Path(args.output_dir)
     prefix = args.prefix or out.resolve().name
-    bnf = BadNameFilter(str(default_bad_names_path()))
+    bnf = BadNameFilter(str(default_bad_patterns_path()))
 
     old_sym = {}
     with open(args.previous_gff3) as fh:

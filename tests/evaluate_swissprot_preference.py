@@ -24,7 +24,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from goannotate.annotate import name_similarity, normalize_gene_name  # noqa: E402
-from goannotate.filters import BadNameFilter, default_bad_names_path  # noqa: E402
+from goannotate.filters import BadNameFilter, default_bad_patterns_path  # noqa: E402
 from goannotate.models import BlastHit  # noqa: E402
 
 
@@ -44,13 +44,13 @@ def main():
     ap.add_argument("--taxids", nargs="+", default=["9606", "10090", "10116"],
                     help="Preferred species in priority order (default: human mouse rat)")
     ap.add_argument("--similarity", type=float, default=0.5)
-    ap.add_argument("--bad-names", default=str(default_bad_names_path()))
+    ap.add_argument("--bad-patterns", default=str(default_bad_patterns_path()))
     args = ap.parse_args()
 
     out = Path(args.output)
     prefix = args.prefix or out.resolve().name
     priority = {t: i for i, t in enumerate(args.taxids)}
-    bad = BadNameFilter(args.bad_names)
+    bad = BadNameFilter(args.bad_patterns)
 
     # Gene universe and comparison
     tx2gene = {}

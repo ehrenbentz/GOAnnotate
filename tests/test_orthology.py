@@ -20,7 +20,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from goannotate.filters import BadNameFilter, default_bad_names_path  # noqa: E402
+from goannotate.filters import BadNameFilter, default_bad_patterns_path  # noqa: E402
 from goannotate.models import GeneUniverse, QueryAnnotation  # noqa: E402
 from goannotate.modules import ModuleContext, run_modules, select_modules  # noqa: E402
 from goannotate.modules.orthology import (OrthologyModule, _last_line, agreed_symbol,  # noqa: E402
@@ -308,7 +308,7 @@ def test_module(tmp: Path, db: Path):
     ann["g2"].consensus_name = "potassium voltage-gated channel subfamily KQT member 5"
     ann["g3"].consensus_symbol, ann["g3"].symbol_status = "GRM1", "vote_supported"
     ann["g8"].consensus_symbol, ann["g8"].symbol_status = "TNFAIP8L3", "rbh"
-    bf = BadNameFilter(str(default_bad_names_path()))
+    bf = BadNameFilter(str(default_bad_patterns_path()))
     os.chdir(tmp)
     work, reports = Path("intermediate"), Path("reports")
     work.mkdir()

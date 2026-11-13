@@ -44,7 +44,7 @@ def format_symbol(symbol: str, case: str) -> str:
 def normalize_gene_name(name: str) -> str:
     """
     Normalize a gene name for comparison: lowercase, collapse whitespace,
-    and drop the words the bad-names file marks as comparison noise
+    and drop the words the pattern file marks as comparison noise
     (normalize_regex, e.g. "homolog"). Output names are not affected.
     """
     if not name:
@@ -314,8 +314,8 @@ def _isoforms(t) -> tuple:
 
 def select_winning_cluster(clusters: list, hits_with_names: list) -> tuple:
     """
-    Score clusters and select the winner. Always returns a cluster; there is
-    no fallback to all hits.
+    Score clusters and select the winner. Always returns the best-scoring
+    cluster; there is no fallback to all hits.
 
     Score = sum(bitscores) * sqrt(cluster_size) * (1 + 0.1 * (n_isoforms - 1))
 
@@ -327,14 +327,12 @@ def select_winning_cluster(clusters: list, hits_with_names: list) -> tuple:
     total_hits = len(hits_with_names)
     best_score = -1.0
     best_cluster = None
-    scores = []
 
     for cluster in clusters:
         bitscores_sum = sum(hits_with_names[i][HIT].bitscore for i in cluster)
         size = len(cluster)
         n_isoforms = len(set(tx for i in cluster for tx in _isoforms(hits_with_names[i])))
         score = bitscores_sum * math.sqrt(size) * (1 + 0.1 * (n_isoforms - 1))
-        scores.append(score)
         if score > best_score:
             best_score = score
             best_cluster = cluster

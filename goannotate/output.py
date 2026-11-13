@@ -104,7 +104,8 @@ def sanitize_product(name: str, ncbi_case: bool = True) -> str:
 
 
 _missing_symbol_check = None    # existing symbols that count as missing in fill mode (LOC numbers, locus tags)
-_missing_product_check = None   # existing products that count as missing ("uncharacterized protein LOC...")
+_missing_product_check = None   # existing products that carry no information ("uncharacterized protein LOC...")
+_family_level_check = None      # products that name only a family or a domain ("... domain-containing protein")
 
 
 def configure_existing(bad_name_filter, keep_identifiers: bool = False) -> None:
@@ -115,10 +116,16 @@ def configure_existing(bad_name_filter, keep_identifiers: bool = False) -> None:
     the symbol patterns) and existing products that carry no information
     ("uncharacterized protein LOC122519524", "hypothetical protein") count
     as missing and are filled, unless keep_identifiers is set.
+
+    A GOAnnotate product that is family-level (the generic_regex patterns)
+    does not replace an existing product (choose_pair).
     """
-    global _missing_symbol_check, _missing_product_check
-    if keep_identifiers or bad_name_filter is None:
-        _missing_symbol_check = _missing_product_check = None
+    global _missing_symbol_check, _missing_product_check, _family_level_check
+    _missing_symbol_check = _missing_product_check = _family_level_check = None
+    if bad_name_filter is None:
+        return
+    _family_level_check = lambda p: any(pat.search(p) for pat in bad_name_filter.generic_patterns)  # noqa: E731
+    if keep_identifiers:
         return
     _missing_symbol_check = bad_name_filter.is_bad_symbol
     _missing_product_check = lambda p: bad_name_filter.process_name(p) is None  # noqa: E731
@@ -309,8 +316,8 @@ def choose_pair(in_symbol: str, in_product: str, goa_symbol: str, goa_product: s
     configure_existing) and GOAnnotate has one.
 
     The product follows the symbol. With GOAnnotate's symbol, GOAnnotate's
-    product is used; an input product that agrees with it is kept (fill,
-    add). With the input's symbol, the input's product is kept; when it is
+    product is used; an input product is kept when it agrees with it or
+    when GOAnnotate's product is family-level (fill, add). With the input's symbol, the input's product is kept; when it is
     missing, GOAnnotate's product is used only when GOAnnotate names the
     same symbol or none. Without any symbol the input's product is kept
     unless it is missing.
@@ -325,7 +332,10 @@ def choose_pair(in_symbol: str, in_product: str, goa_symbol: str, goa_product: s
         symbol, sym_src = "", ""
 
     if sym_src == "goannotate":
-        if goa_product and not (mode != "replace" and in_prod_ok and products_agree(in_product, goa_product)):
+        keep_input = mode != "replace" and in_prod_ok and (
+            products_agree(in_product, goa_product)
+            or bool(_family_level_check and _family_level_check(goa_product)))
+        if goa_product and not keep_input:
             return symbol, sym_src, goa_product, "goannotate"
     elif in_sym_ok:
         same = not goa_symbol or goa_symbol.upper() == in_symbol.upper()
@@ -1113,7 +1123,7 @@ def write_summary(output_dir: Path, prefix: str, annotations: dict, args, blast_
         if getattr(args, "go_mapping", None):
             f.write(f"  GO mapping:     {args.go_mapping}\n")
         f.write(f"  GO OBO:         {args.go_obo}\n")
-        f.write(f"  Bad names:      {args.bad_names}\n\n")
+        f.write(f"  Pattern file:   {args.bad_patterns}\n\n")
 
         f.write("Parameters:\n")
         f.write("-" * 70 + "\n")

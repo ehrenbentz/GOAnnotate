@@ -11,6 +11,10 @@ are kept, terms new to the gene are added, and ancestors of terms already
 present add nothing. With fill they go only to genes without GO terms from
 hits; off leaves GO to the hits and InterProScan.
 
+A reference gene whose only name is an identifier (BcDNA:SD01241) gives no
+symbol, and its terms are still transferred to a gene without a symbol that
+is its reciprocal best hit (assign.unnamed_reference_genes).
+
 The reference gene's entries are the proteins of the reference proteome
 (SwissProt and TrEMBL of the reference species, as built for the reciprocal
 searches) that carry the symbol in GN=; their GO terms come from the
@@ -34,12 +38,16 @@ REFERENCE_GO_STATUSES = {"rbh", "rbh_override", "rbh_added", "vote_supported", "
 
 
 def add_reference_go(annotations: dict, ref_symbols: dict, db: str, go_hierarchy, forbidden_go: set,
-                     namespaces: list, evidence_policy: str = "all", mode: str = "add") -> dict:
+                     namespaces: list, evidence_policy: str = "all", mode: str = "add",
+                     unnamed: dict = None) -> dict:
     """
     Add the reference gene's GO terms to each eligible gene in place and
     record them in annot.go_reference (GO ID -> accessions carrying it).
 
     ref_symbols: reference proteome accession -> GN= symbol (assign.read_reference_symbols).
+    unnamed: accession -> symbol of the reference proteins whose symbol is an
+    identifier; a gene without a symbol whose reciprocal best hit is such a
+    gene (annot.reference_unnamed) receives that gene's terms.
     Returns the counts.
     """
     stats = {"mode": mode, "genes_eligible": 0, "genes_with_reference_go": 0, "genes_added": 0,
@@ -52,8 +60,16 @@ def add_reference_go(annotations: dict, ref_symbols: dict, db: str, go_hierarchy
     by_symbol = defaultdict(set)
     for acc, sym in ref_symbols.items():
         by_symbol[sym.upper()].add(acc)
+    by_unnamed = defaultdict(set)
+    for acc, sym in (unnamed or {}).items():
+        by_unnamed[sym.upper()].add(acc)
     eligible = {}
     for gene, annot in annotations.items():
+        if not annot.consensus_symbol and getattr(annot, "reference_unnamed", ""):
+            if by_unnamed.get(annot.reference_unnamed.upper()):
+                eligible[gene] = by_unnamed[annot.reference_unnamed.upper()]
+                stats["genes_unnamed_reference"] = stats.get("genes_unnamed_reference", 0) + 1
+            continue
         if not annot.consensus_symbol or (annot.symbol_status or "") not in REFERENCE_GO_STATUSES:
             continue
         accs = by_symbol.get(annot.consensus_symbol.upper())

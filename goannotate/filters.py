@@ -44,9 +44,9 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 
-def default_bad_names_path() -> Path:
-    """Path of the bad_names.txt file shipped inside the package."""
-    return Path(__file__).resolve().parent / "data" / "bad_names.txt"
+def default_bad_patterns_path() -> Path:
+    """Path of the bad_patterns.txt file shipped inside the package."""
+    return Path(__file__).resolve().parent / "data" / "bad_patterns.txt"
 
 
 # Connector words left dangling at either end of a name after a token was removed

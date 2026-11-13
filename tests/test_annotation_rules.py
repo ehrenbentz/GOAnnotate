@@ -13,7 +13,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from goannotate import annotate, blast, mappings, output, taxon  # noqa: E402
-from goannotate.filters import BadNameFilter, default_bad_names_path  # noqa: E402
+from goannotate.filters import BadNameFilter, default_bad_patterns_path  # noqa: E402
 from goannotate.go import GOHierarchy  # noqa: E402
 from goannotate.models import BlastHit, QueryAnnotation  # noqa: E402
 
@@ -47,7 +47,7 @@ check(perm.passes(full) and perm.passes(domain) and perm.passes(frag), "permissi
 check(not strict.passes(lowid) and not perm.passes(lowid) and off.passes(lowid), "identity floor")
 check(strict.passes(nolen), "hits without lengths pass on identity alone")
 
-bnf = BadNameFilter(str(default_bad_names_path()))
+bnf = BadNameFilter(str(default_bad_patterns_path()))
 hits = {"t1": [domain, full], "t2": [domain]}
 filtered, status = blast.filter_and_select_hits(hits, bnf, top_n=30, coverage=strict)
 check(len(filtered["t1"]) == 1 and filtered["t1"][0][0] is full and status["t1"] == "pass",
@@ -286,6 +286,32 @@ check(bnf.clean_name("Ras-related protein Rab-11b, tandem duplicate 1") == "Ras-
 check(bnf.process_name("Not available") is None and bnf.process_name("NA") is None, "'not available' placeholder")
 
 
+print("\n# Reference genes named only by an identifier")
+with tempfile.TemporaryDirectory() as _d:
+    _fwd, _rev = Path(_d) / "fwd.tsv", Path(_d) / "rev.tsv"
+    _fwd.write_text("t1\ttr|A1|X_DROME\t90\t100\t1e-50\t300\n" "t2\ttr|A1|X_DROME\t90\t100\t1e-50\t200\n"
+                    "t3\ttr|A1|X_DROME\t90\t100\t1e-50\t150\n")
+    _rev.write_text("tr|A1|X_DROME\tt1\t90\t100\t1e-50\t300\n")
+    _ann = {g: QueryAnnotation(query_id=g) for g in ("g1", "g2", "g3")}
+    _ann["g1"].consensus_symbol = ""
+    _uni = type("U", (), {"transcript_to_gene": {"t1": "g1", "t2": "g2", "t3": "g3"}})()
+    from goannotate import assign as _assign
+    n_unnamed = _assign.unnamed_reference_genes(_ann, _uni, _fwd, _rev, {"A1": "BcDNA:SD01241"})
+    check(n_unnamed == 1 and _ann["g1"].reference_unnamed == "BCDNA:SD01241" and not _ann["g2"].reference_unnamed,
+          "the reciprocal best hit of an identifier-named reference gene is recorded, other genes are not")
+    _ann["g1"].reference_unnamed = ""
+    _ann["g1"].consensus_symbol = "ABC1"
+    check(_assign.unnamed_reference_genes(_ann, _uni, _fwd, _rev, {"A1": "BcDNA:SD01241"}) == 0,
+          "a gene with a symbol is left alone")
+
+print("\n# Identifiers among gene symbols")
+flagged = ["BEST:CK00246", "lincRNA.S6902", "BS13C01.Y1", "MB8.CHRX.PASA.104-MIP02663", "AUGUSTUS-3.0.2_10649", "ANON-WO0170980.151", "BcDNA:GH28351", "BCDNA.GH02384", "EG:171D11.5", "38B.13",
+           "lincRNA.945", "sb:cb1058", "XB5729910.S", "MGC147631.L", "ACEY_s0041.g366", "141233_at", "TY3B-G_151"]
+valid = ["adgrl2b.1", "apoda.1", "nkx2.2b", "His3.3A", "ND-B14.5A", "c12.1", "MYOS.S", "TRPC2.L", "UQCR-6.4",
+         "Su(var)3-9", "mt:CoI", "HLA-DRB1", "NKX2-1"]
+check(all(bnf.is_bad_symbol(x) for x in flagged), "clone, patent, predictor and probe identifiers are not symbols")
+check(not any(bnf.is_bad_symbol(x) for x in valid), "symbols with periods, colons, hyphens and parentheses are kept")
+
 # ---------------------------------------------------------- symbol and product from one source
 print("\n# Symbol and product name the same gene")
 output.configure_existing(bnf)
@@ -306,6 +332,11 @@ check(cp("Avp", "uncharacterized protein LOC122519524", "OXT", "oxytocin-neuroph
 check(cp("LOC7", "ichor-like", "", "ichor", "fill") == ("LOC7", "input", "ichor-like", "input")
       and cp("", "", "ABC1", "abc protein 1", "fill") == ("ABC1", "goannotate", "abc protein 1", "goannotate"),
       "without a GOAnnotate symbol the input product stays; without input both come from GOAnnotate")
+check(cp("LOC5", "trace amine-associated receptor 9", "TAAR9", "G-protein coupled receptors family 1 profile "
+         "domain-containing protein", "fill") == ("TAAR9", "goannotate", "trace amine-associated receptor 9", "input"),
+      "a family-level GOAnnotate product does not replace an input product")
+check(cp("LOC5", "uncharacterized protein LOC122519524", "TAAR9", "Ig-like domain-containing protein", "fill")[3]
+      == "goannotate", "a family-level GOAnnotate product still fills a missing product")
 check(cp("Avp", "vasopressin", "OXT", "oxytocin-neurophysin 1", "replace")
       == ("OXT", "goannotate", "oxytocin-neurophysin 1", "goannotate"), "replace takes GOAnnotate's pair")
 output.configure_existing(None)

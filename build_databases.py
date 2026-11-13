@@ -35,7 +35,11 @@ Protein databases (with --protein-dbs LINEAGE), for the Diamond searches:
     <lineage>_UniProtKB.dmnd              combined database (only with --combined-db)
 
     LINEAGE is an NCBI taxon name (metazoa, vertebrata, viridiplantae, ...) or
-    a taxon ID (33208); "all" keeps every entry. Entries are assigned through
+    a taxon ID (33208); "all" keeps every entry. Several lineages are given
+    comma-separated (metazoa,viridiplantae) and built from one download. Each
+    lineage FASTA records the UniProt release it was built from
+    (<file>.release); when a later run downloads another release, the FASTA,
+    its taxon map and its Diamond database are rebuilt. Entries are assigned through
     the OX= taxon of each UniProt header and the NCBI taxonomy tree (merged
     taxon IDs resolved). The Diamond databases carry taxonomy, so searches can
     be restricted further with --taxonlist.
@@ -54,6 +58,7 @@ Usage:
     ./build_databases.py -o /path/to/databases --yes
     ./build_databases.py -o /path/to/databases --protein-dbs metazoa --threads 64 --yes
     ./build_databases.py -o /path/to/databases --protein-dbs 7742 --combined-db --keep-downloads
+    ./build_databases.py -o /path/to/databases --protein-dbs metazoa,viridiplantae --skip-sqlite --yes
     ./build_databases.py -o /path/to/databases --tables go,taxonomy --update --yes
 
 Disk: about 80 GB of downloads (GAF 29 GB, ID mapping 7 GB, gene_info 1.6 GB;
@@ -906,11 +911,29 @@ def load_taxonomy(nodes_path, merged_path, root_taxid):
     return descendants, all_ids, merged
 
 
-def filter_lineage(src_gz, out_fasta, out_map, descendants, all_ids, merged):
-    """Entries of src_gz whose OX= taxon is in descendants (all entries when None), with a taxon map."""
+def filter_lineage(src_gz, out_fasta, out_map, descendants, all_ids, merged, release="", derived=()):
+    """
+    Entries of src_gz whose OX= taxon is in descendants (all entries when None), with a taxon map.
+
+    release: release of src_gz, recorded in <out_fasta>.release. Existing
+    files recorded with another release are rebuilt, together with the
+    derived files (Diamond databases) named in derived; existing files
+    without a record are kept, with a warning.
+    """
+    record = out_fasta.with_name(out_fasta.name + ".release")
     if out_fasta.exists() and out_map.exists():
-        logger.info(f"  [SKIP] {out_fasta.name} and {out_map.name} exist")
-        return None
+        built = record.read_text().strip() if record.exists() else None
+        if built is None:
+            logger.warning(f"  [SKIP] {out_fasta.name} exists without a release record; it is kept as it is. "
+                           f"Delete it to rebuild it from {release or 'the current download'}.")
+            return None
+        if not release or built == release:
+            logger.info(f"  [SKIP] {out_fasta.name} and {out_map.name} exist ({built or 'release unknown'})")
+            return None
+        logger.info(f"  {out_fasta.name} was built from {built}; rebuilding it from {release}")
+        for old in (out_fasta, out_map, record, *derived):
+            if Path(old).exists():
+                Path(old).unlink()
     tmp_fasta = out_fasta.with_name(out_fasta.name + ".tmp")
     tmp_map = out_map.with_name(out_map.name + ".tmp")
     logger.info(f"Filtering {src_gz.name} -> {out_fasta.name} ...")
@@ -944,6 +967,7 @@ def filter_lineage(src_gz, out_fasta, out_map, descendants, all_ids, merged):
     close_gz_stream(proc, src_gz)
     tmp_fasta.rename(out_fasta)
     tmp_map.rename(out_map)
+    record.write_text((release or "") + "\n")
     logger.info(f"  {total:,} entries read; {kept:,} kept; {no_ox:,} without OX=; "
                 f"{unknown:,} with a taxon ID absent from the NCBI taxonomy")
     return {"read": total, "kept": kept}
@@ -1035,7 +1059,9 @@ def main():
     ap.add_argument("-o", "--output-dir", required=True, help="Directory for all files")
     ap.add_argument("--protein-dbs", metavar="LINEAGE",
                     help="Also download UniProtKB Swiss-Prot and TrEMBL and build Diamond databases of the\n"
-                         "entries in LINEAGE: an NCBI taxon name (metazoa) or taxon ID (33208), or 'all'")
+                         "entries in LINEAGE: an NCBI taxon name (metazoa) or taxon ID (33208), or 'all'.\n"
+                         "Several lineages, comma-separated, build one pair of databases each\n"
+                         "(metazoa,viridiplantae) from a single download")
     ap.add_argument("--combined-db", action="store_true",
                     help="With --protein-dbs, also build <lineage>_UniProtKB.dmnd (Swiss-Prot and TrEMBL together)")
     ap.add_argument("--threads", type=int, default=os.cpu_count() or 8, help="Threads for Diamond (default: all)")
@@ -1103,10 +1129,13 @@ def main():
     titles += [step_titles[g] for g in groups]
     if groups:
         titles += ["Finish SQLite"]
-    if args.protein_dbs:
-        titles += ["Taxonomy and lineage", "Swiss-Prot database", "TrEMBL database"]
-        if args.combined_db:
-            titles += ["Combined database"]
+    lineages = [x.strip() for x in (args.protein_dbs or "").split(",") if x.strip()]
+    if lineages:
+        titles += ["Taxonomy and lineage"]
+        for x in lineages:
+            titles += [f"Swiss-Prot database ({x})", f"TrEMBL database ({x})"]
+            if args.combined_db:
+                titles += [f"Combined database ({x})"]
     steps = Steps(titles)
 
     # ------------------------------------------------------------------
@@ -1217,43 +1246,48 @@ def main():
         steps.start("Taxonomy and lineage")
         extract_taxdump(Path(records["taxdump"]["path"]), taxdump_dir)
         nodes, names_dmp, merged_dmp = taxdump_dir / "nodes.dmp", taxdump_dir / "names.dmp", taxdump_dir / "merged.dmp"
-        taxid, label = resolve_lineage(args.protein_dbs, names_dmp)
-        logger.info(f"  Lineage: {label}" + (f" (taxon {taxid})" if taxid else " (every entry)"))
-        descendants, all_ids, merged = load_taxonomy(nodes, merged_dmp, taxid)
-        sp_fasta, tr_fasta = outdir / f"{label}_SwissProt.fasta", outdir / f"{label}_TrEMBL.fasta"
-        sp_map, tr_map = outdir / f"{label}_SwissProt_taxonmap.tsv.gz", outdir / f"{label}_TrEMBL_taxonmap.tsv.gz"
-        sp_dmnd, tr_dmnd = outdir / f"{label}_SwissProt.dmnd", outdir / f"{label}_TrEMBL.dmnd"
-        protein_meta = {"protein_dbs_lineage": f"{label} ({taxid or 'all'})",
-                        "protein_dbs_release": records["sprot_fasta"]["release"]}
+        resolved = [resolve_lineage(x, names_dmp) for x in lineages]
+        for taxid, label in resolved:
+            logger.info(f"  Lineage: {label}" + (f" (taxon {taxid})" if taxid else " (every entry)"))
+        sp_release, tr_release = records["sprot_fasta"]["release"], records["trembl_fasta"]["release"]
+        protein_meta = {"protein_dbs_lineage": "; ".join(f"{label} ({taxid or 'all'})" for taxid, label in resolved),
+                        "protein_dbs_release": sp_release}
 
-        steps.start("Swiss-Prot database")
-        c = filter_lineage(Path(records["sprot_fasta"]["path"]), sp_fasta, sp_map, descendants, all_ids, merged)
-        if c:
-            protein_meta["protein_dbs_swissprot_entries"] = f"{c['kept']} of {c['read']}"
-        build_diamond([sp_fasta], sp_dmnd, sp_map, nodes, names_dmp, threads)
-        check_diamond_taxonomy(sp_dmnd, sp_fasta, outdir, taxid, threads)
+        for taxid, label in resolved:
+            descendants, all_ids, merged = load_taxonomy(nodes, merged_dmp, taxid)
+            sp_fasta, tr_fasta = outdir / f"{label}_SwissProt.fasta", outdir / f"{label}_TrEMBL.fasta"
+            sp_map, tr_map = outdir / f"{label}_SwissProt_taxonmap.tsv.gz", outdir / f"{label}_TrEMBL_taxonmap.tsv.gz"
+            sp_dmnd, tr_dmnd = outdir / f"{label}_SwissProt.dmnd", outdir / f"{label}_TrEMBL.dmnd"
+            all_map, all_dmnd = outdir / f"{label}_UniProtKB_taxonmap.tsv.gz", outdir / f"{label}_UniProtKB.dmnd"
 
-        steps.start("TrEMBL database")
-        c = filter_lineage(Path(records["trembl_fasta"]["path"]), tr_fasta, tr_map, descendants, all_ids, merged)
-        if c:
-            protein_meta["protein_dbs_trembl_entries"] = f"{c['kept']} of {c['read']}"
-        build_diamond([tr_fasta], tr_dmnd, tr_map, nodes, names_dmp, threads)
-        check_diamond_taxonomy(tr_dmnd, tr_fasta, outdir, taxid, threads)
+            steps.start(f"Swiss-Prot database ({label})")
+            c = filter_lineage(Path(records["sprot_fasta"]["path"]), sp_fasta, sp_map, descendants, all_ids, merged,
+                               release=sp_release, derived=(sp_dmnd, all_map, all_dmnd))
+            if c:
+                protein_meta[f"protein_dbs_swissprot_entries_{label}"] = f"{c['kept']} of {c['read']}"
+            build_diamond([sp_fasta], sp_dmnd, sp_map, nodes, names_dmp, threads)
+            check_diamond_taxonomy(sp_dmnd, sp_fasta, outdir, taxid, threads)
 
-        if args.combined_db:
-            steps.start("Combined database")
-            all_map = outdir / f"{label}_UniProtKB_taxonmap.tsv.gz"
-            if not all_map.exists():
-                tmp = all_map.with_name(all_map.name + ".tmp")
-                with gzip.open(tmp, "wt", compresslevel=1) as fout:
-                    fout.write(TAXONMAP_HEADER)
-                    for p in (sp_map, tr_map):
-                        with gzip.open(p, "rt") as fin:
-                            next(fin)
-                            shutil.copyfileobj(fin, fout)
-                tmp.rename(all_map)
-            build_diamond([sp_fasta, tr_fasta], outdir / f"{label}_UniProtKB.dmnd", all_map,
-                          nodes, names_dmp, threads)
+            steps.start(f"TrEMBL database ({label})")
+            c = filter_lineage(Path(records["trembl_fasta"]["path"]), tr_fasta, tr_map, descendants, all_ids, merged,
+                               release=tr_release, derived=(tr_dmnd, all_map, all_dmnd))
+            if c:
+                protein_meta[f"protein_dbs_trembl_entries_{label}"] = f"{c['kept']} of {c['read']}"
+            build_diamond([tr_fasta], tr_dmnd, tr_map, nodes, names_dmp, threads)
+            check_diamond_taxonomy(tr_dmnd, tr_fasta, outdir, taxid, threads)
+
+            if args.combined_db:
+                steps.start(f"Combined database ({label})")
+                if not all_map.exists():
+                    tmp = all_map.with_name(all_map.name + ".tmp")
+                    with gzip.open(tmp, "wt", compresslevel=1) as fout:
+                        fout.write(TAXONMAP_HEADER)
+                        for p in (sp_map, tr_map):
+                            with gzip.open(p, "rt") as fin:
+                                next(fin)
+                                shutil.copyfileobj(fin, fout)
+                    tmp.rename(all_map)
+                build_diamond([sp_fasta, tr_fasta], all_dmnd, all_map, nodes, names_dmp, threads)
         metadata.update(protein_meta)
         if sqlite_db.exists():
             conn = sqlite3.connect(str(sqlite_db))

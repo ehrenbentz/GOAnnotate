@@ -183,6 +183,7 @@ class QueryAnnotation:
                                                         # the replaced voted symbol, reference-species synonyms)
     go_interpro: dict = field(default_factory=dict)     # GO ID -> InterPro entries that carry it (InterProScan module)
     go_reference: dict = field(default_factory=dict)    # GO ID -> reference proteins of the gene's symbol carrying it
+    reference_unnamed: str = ""  # reference gene named only by an identifier that is the gene's reciprocal best hit
 
 
 @dataclass

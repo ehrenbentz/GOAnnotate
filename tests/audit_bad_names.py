@@ -8,7 +8,7 @@ ortholog resolution here). Optionally reports how often discarded and kept
 hits carry GO terms in the SQLite database.
 
 Usage:
-    audit_bad_names.py --blast-results results.tsv [--bad-names FILE] [--bad-names-extra FILE]
+    audit_bad_names.py --blast-results results.tsv [--bad-patterns FILE] [--bad-patterns-extra FILE]
                        [--db GOAnnotate_db.sqlite] [--sample 500000] [--top 40] [-o report.txt]
 """
 import argparse
@@ -18,22 +18,22 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from goannotate.filters import BadNameFilter, NameAudit, default_bad_names_path, write_name_audit  # noqa: E402
+from goannotate.filters import BadNameFilter, NameAudit, default_bad_patterns_path, write_name_audit  # noqa: E402
 from goannotate.models import BlastHit  # noqa: E402
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--blast-results", required=True)
-    ap.add_argument("--bad-names", default=str(default_bad_names_path()))
-    ap.add_argument("--bad-names-extra", action="append", default=[])
+    ap.add_argument("--bad-patterns", default=str(default_bad_patterns_path()))
+    ap.add_argument("--bad-patterns-extra", action="append", default=[])
     ap.add_argument("--db", help="GOAnnotate SQLite database, to test GO coverage of discarded hits")
     ap.add_argument("--sample", type=int, default=500_000, help="Hits to sample (default 500,000)")
     ap.add_argument("--top", type=int, default=40)
     ap.add_argument("-o", "--output", default="/dev/stdout")
     args = ap.parse_args()
 
-    bnf = BadNameFilter(args.bad_names, extra_files=args.bad_names_extra)
+    bnf = BadNameFilter(args.bad_patterns, extra_files=args.bad_patterns_extra)
     audit = NameAudit()
 
     random.seed(1)

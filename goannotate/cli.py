@@ -7,7 +7,7 @@ import shutil
 import sys
 
 from goannotate import GOAnnotateError, __version__
-from goannotate.filters import default_bad_names_path
+from goannotate.filters import default_bad_patterns_path
 
 logger = logging.getLogger("goannotate")
 
@@ -262,11 +262,14 @@ Examples:
                         "  off:      every word 1 (1.x behaviour)")
     g.add_argument("--stop-words", metavar="FILE",
                    help="Stop word list, one per line (default: the list shipped with GOAnnotate)")
-    g.add_argument("--bad-names", metavar="FILE", default=None,
-                   help="Name and symbol pattern file (default: the file shipped with GOAnnotate)")
-    g.add_argument("--bad-names-extra", metavar="FILE", action="append", default=[],
-                   help="Additional pattern file layered on top of --bad-names, e.g. locus-tag patterns\n"
-                        "for your taxon; may be given more than once")
+    g.add_argument("--bad-patterns", "--bad_patterns", "--bad-names", dest="bad_patterns", metavar="FILE",
+                   default=None,
+                   help="Pattern file for names, symbols and products, used in place of the bundled\n"
+                        "goannotate/data/bad_patterns.txt (copy that file, edit it, and pass the copy)")
+    g.add_argument("--bad-patterns-extra", "--bad_patterns_extra", "--bad-names-extra", dest="bad_patterns_extra",
+                   metavar="FILE", action="append", default=[],
+                   help="Additional pattern file read after the main one, e.g. locus-tag patterns for\n"
+                        "your taxon; may be given more than once")
     g.add_argument("--consensus-threshold", type=float, default=0.5,
                    help="Similarity threshold for name clustering, 0-1 (default: %(default)s)")
 
@@ -487,8 +490,8 @@ def validate(args, parser) -> None:
         parser.error("--min-identity is a percentage between 0 and 100")
     if args.go_iea_min_hits < 1 or args.go_min_hits < 1 or args.go_source_hits < 1:
         parser.error("--go-source-hits, --go-min-hits and --go-iea-min-hits must be at least 1")
-    if args.bad_names is None:
-        args.bad_names = str(default_bad_names_path())
+    if args.bad_patterns is None:
+        args.bad_patterns = str(default_bad_patterns_path())
     if args.threads is None:
         args.threads = os.cpu_count()
 

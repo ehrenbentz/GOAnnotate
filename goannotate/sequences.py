@@ -219,6 +219,8 @@ def _write_fasta_record(fh, header: str, seq: str, width: int = 80) -> None:
 
 HEADER_FIELD_ORDER = ("gene", "symbol", "product", "type", "locus")
 _HEADER_FIELD = re.compile(r'(\w+)=(?:"([^"]*)"|(\S+))')
+# An unquoted product runs to the next key=value field or the end of the header
+_HEADER_PRODUCT = re.compile(r'(\w*product)=(?!")(.*?)(?=\s+\w+=|\s*$)')
 
 
 def gene_symbol_of(gene) -> str:
@@ -269,6 +271,8 @@ def parse_header(header: str) -> tuple:
     if len(parts) > 1:
         for m in _HEADER_FIELD.finditer(parts[1]):
             fields[m.group(1)] = m.group(2) if m.group(2) is not None else m.group(3)
+        for m in _HEADER_PRODUCT.finditer(parts[1]):
+            fields[m.group(1)] = m.group(2).strip()
     return seq_id, fields
 
 

@@ -93,6 +93,9 @@ with tempfile.TemporaryDirectory() as tmp:
     _, fields = sequences.parse_header(records["DN1_c0_g1_i1"][0])
     check(fields.get("orf") == f"{len(utr5) + 1}-{len(utr5) + len(cds)}" and fields.get("strand") == "+"
           and fields.get("orf_status") == "complete", f"ORF fields in the protein header {fields}")
+    _, fields = sequences.parse_header(">t1 gene=G1 product=Tripartite motif containing 54 type=mRNA")
+    check(fields == {"gene": "G1", "product": "Tripartite motif containing 54", "type": "mRNA"},
+          f"an unquoted product runs to the next field {fields}")
     header_fields = orfs.orf_header_fields(tmp / "orf.tsv")
     check(header_fields["DN1_c0_g1_i2"]["strand"] == "-" and header_fields["DN2_c0_g1_i1"]["orf_status"] == "5_partial",
           "ORF fields read back from the report")

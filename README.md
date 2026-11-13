@@ -17,7 +17,7 @@ GOAnnotate assigns protein names, gene symbols, and Gene Ontology (GO) terms to 
 - [How It Works](#how-it-works)
 - [Output Files](#output-files)
 - [Optional Modules](#optional-modules)
-- [The bad_names.txt File](#the-bad_namestxt-file)
+- [The bad_patterns.txt File](#the-bad_patternstxt-file)
 - [Parameters](#parameters)
 - [Utility Scripts](#utility-scripts)
 
@@ -73,6 +73,8 @@ GOAnnotate extracts the proteins, searches them against SwissProt and TrEMBL wit
 ```bash
 ./build_databases.py -o /path/to/databases --protein-dbs metazoa --threads 64 --yes
 ```
+
+`--protein-dbs` takes the lineage of the protein databases as an NCBI taxon name or taxon ID (`metazoa`, `viridiplantae`, `fungi`, `7742`), or `all`. Several lineages are given comma-separated and built from one download, one pair of Diamond databases each (`--protein-dbs metazoa,viridiplantae`); `--skip-sqlite` adds a lineage beside an existing SQLite database. Each lineage FASTA records the UniProt release it was built from, and a later run that downloads another release rebuilds it with its Diamond database.
 
 **SQLite database** (`GOAnnotate_db.sqlite`, always built; pass it with `--db`):
 
@@ -235,8 +237,8 @@ goannotate \
 | `--no-coverage-fallback` | off | Leave transcripts without hits when none passes the coverage filter (default: use their unfiltered hits and mark the gene) |
 | `--word-weighting` | idf | Token weights in the name similarity: `idf`, `stoplist`, `off` |
 | `--stop-words` | bundled file | Stop word list for the name similarity |
-| `--bad-names` | bundled file | Name, symbol and product pattern file |
-| `--bad-names-extra` | none | Additional pattern file layered on the bundled one (repeatable) |
+| `--bad-patterns` | bundled file | Name, symbol and product pattern file |
+| `--bad-patterns-extra` | none | Additional pattern file layered on the bundled one (repeatable) |
 | `--consensus-threshold` | 0.5 | Similarity threshold for name clustering |
 | `--namespace` | BP MF CC | GO namespaces to include |
 | `--go-evidence` | all | GO annotations used by evidence code: `all` (except ND), `non-electronic` (no IEA), `experimental` |
@@ -327,7 +329,7 @@ Proteins (or transcripts) are searched against SwissProt and TrEMBL in two separ
 
 ### Phase 2: Hit Cleaning and Top-N Selection
 
-Each hit's protein name is cleaned and tested with the patterns in `bad_names.txt`. The purpose is to stop designations that belong to another genome or annotation pipeline from being carried into this one, and to keep names that carry no information from being used as products:
+Each hit's protein name is cleaned and tested with the patterns in `bad_patterns.txt`. The purpose is to stop designations that belong to another genome or annotation pipeline from being carried into this one, and to keep names that carry no information from being used as products:
 
 1. **Qualifiers** (`qualifier_regex:`) are stripped: database prefixes, `PREDICTED:`, `LOW QUALITY PROTEIN:`, `(Fragment)`, isoform and variant designations, `putative`/`probable`, and a trailing `-like` (the NCBI pipeline's paralog marker for one genome).
 2. **Identifiers** (`identifier_regex:`) are removed as tokens: LOC numbers, RIKEN clone IDs, C#orf# names in short and long form, KIAA/FLJ/MGC/DKFZ clone IDs, UPF and DUF numbers, Gm numbers, clone accessions. "Bombesin receptor-activated protein C6orf89" becomes "Bombesin receptor-activated protein".
@@ -391,7 +393,7 @@ GO terms are collected in two steps:
 
 **Evidence.** Databases built by the current `build_databases.py` store the GO evidence codes behind every accession-term pair. `--go-evidence` chooses which annotations are used: `all` (default; every code except ND, whose terms are the ontology roots), `non-electronic` (no IEA annotations), or `experimental` (EXP, IDA, IPI, IMP, IGI, IEP and the high-throughput codes). **Support.** Once every source of GO terms has been added (the hits, the reference gene, InterProScan), a term that comes from the hits alone must be supported by `--go-min-hits` (default 5) of the source hits, or by a majority of the gene's source hits with GO annotations when that is fewer (counting at most 10, and never fewer than 2: a gene with two such hits needs both, one with four needs three), and a term whose only evidence is electronic (IEA) by at least `--go-iea-min-hits` (default 2), never by fewer hits than other terms of the gene. A gene with a single source hit keeps that hit's non-electronic terms when the alignment covers at least 70% of both proteins (`--go-single-hit-coverage`) at 50% identity or more (`--go-single-hit-identity`); such a hit stands for the same protein, the inference a curator records as ISS. A hit supports a term when its protein is annotated with the term or with a more specific one. Exempt are terms with an experimental annotation (EXP, IDA, IPI, IMP, IGI, IEP and the high-throughput codes), terms that a SwissProt entry of the gene itself (GN= symbol equal to the gene's symbol) carries with non-electronic evidence, and terms confirmed by the reference gene or by InterPro. A removed term is replaced by its most specific ancestors that pass the requirement, so the supported part of the claim stays ("kinase activity" where only one hit says "MAP kinase kinase activity"). Terms from the reference gene are kept, except one that none of the gene's hits carries, whose only evidence for the reference gene is electronic (IEA), and that no close relative's one-to-one ortholog carries either (with the orthology module, each close relative whose ortholog's UniProt entries carry a term, or a more specific one, also counts as one supporting source for terms from the hits). Removed terms are listed in `reports/{prefix}_go_evidence.tsv` with status `removed_support` and their source (`hits` or `reference`); `--go-min-hits 1 --go-iea-min-hits 1` keeps every term. The codes behind each assigned term, its strongest evidence class and the number of supporting hits are written to `reports/{prefix}_go_evidence.tsv`; the evidence table summarizes them per gene (`go_evidence_classes`).
 
-**From the reference gene.** Once the symbols are final (after Phase 8b and the orthology module), a gene whose symbol is supported or unverified (`rbh`, `rbh_override`, `rbh_added`, `vote_supported`, `vote_unverified`, `reference_best_hit`, `foreign_ortholog`, `ortholog`, `ortholog_fill`) also receives the GO terms of the reference gene that symbol names: the terms of the reference proteome's proteins carrying the symbol, under the same `--go-evidence` policy, taxon constraints and namespaces. With `--reference-go add` (default) they join the gene's terms without redundancy (a term already present, or an ancestor of one, adds nothing); `fill` gives them only to genes without GO terms from hits; `off` leaves GO to the hits and InterProScan. For a human reference these are the curated GOA annotations of the human gene; `reports/{prefix}_go_evidence.tsv` marks their source (`reference`) and lists the proteins behind each term.
+**From the reference gene.** Once the symbols are final (after Phase 8b and the orthology module), a gene whose symbol is supported or unverified (`rbh`, `rbh_override`, `rbh_added`, `vote_supported`, `vote_unverified`, `reference_best_hit`, `foreign_ortholog`, `ortholog`, `ortholog_fill`) also receives the GO terms of the reference gene that symbol names: the terms of the reference proteome's proteins carrying the symbol, under the same `--go-evidence` policy, taxon constraints and namespaces. A reference gene whose only name is an identifier (FlyBase `BcDNA:SD01241`, human `C1orf122`) gives no symbol; a gene left without a symbol that is its reciprocal best hit still receives its terms. With `--reference-go add` (default) they join the gene's terms without redundancy (a term already present, or an ancestor of one, adds nothing); `fill` gives them only to genes without GO terms from hits; `off` leaves GO to the hits and InterProScan. For a human reference these are the curated GOA annotations of the human gene; `reports/{prefix}_go_evidence.tsv` marks their source (`reference`) and lists the proteins behind each term.
 
 **Taxon constraints.** The Gene Ontology states for many terms the taxa they apply to (`in_taxon`, `never_in_taxon`; constraints pass to subtypes and parts). With `--taxid` (the NCBI taxon of the organism being annotated) GOAnnotate computes the organism's lineage from the taxonomy tables of the database (or `--taxdump`), expands GO's taxon union classes, and removes every GO term that a constraint on it or on one of its ancestors excludes for that lineage: photosynthesis terms from a mammal, lactation from a fish. The constraints come from the database tables or from `--taxon-constraints-obo` and `--taxon-groupings-obo`; removed terms are listed in `reports/{prefix}_go_evidence.tsv` with the constraint that removed them. `--taxon-constraints off` disables the step; without `--taxid` it is skipped.
 
@@ -505,7 +507,7 @@ Two tab-delimited tables for everyday lookup (grep, a spreadsheet, R): one row p
 | `{prefix}_gene_annotations.tsv` | gene_id, symbol, symbol_aliases, secondary_symbol, product, gene_type, coding, locus, n_transcripts, transcripts, confidence, symbol_source, product_source, uniprot_accession, go_terms, then one column per module that ran |
 | `{prefix}_transcript_annotations.tsv` | gene_id, transcript_id, symbol, symbol_aliases, secondary_symbol, product, transcript_type, coding, locus, cds_locus, protein_length, confidence, symbol_source, product_source, uniprot_accession, go_terms, then the module columns |
 
-`symbol` and `product` follow `--annotation-mode`, as in the annotated GFF3 and FASTA: with `fill` (default) and `add` the input annotation is kept where it exists and GOAnnotate's result fills the rest; with `replace` GOAnnotate's result is used wherever there is one. `symbol_source` and `product_source` say which (`input` or `goannotate`). The symbol and the product name the same gene: where GOAnnotate gives the symbol, its product is used unless the input product agrees with it (at least half of the informative words of the shorter name), in which case the input product is kept; where the input symbol is kept, GOAnnotate's product fills a missing product only when GOAnnotate names the same symbol or none. Transcript rows keep the input transcript's own product, including its isoform label, under `fill` and `add` when the gene keeps the input product; the gene row uses the gene description or the first coding transcript's product without the isoform label. Loci are 1-based and inclusive (`chr1:23246-24202(-)`); `protein_length` is the length of the searched protein. `uniprot_accession` is the best hit of the winning symbol group. Without a GFF3 (transcript FASTA input) the rows come from the FASTA, with input values read from `symbol=`, `product=`, `type=` and `locus=` header fields.
+`symbol` and `product` follow `--annotation-mode`, as in the annotated GFF3 and FASTA: with `fill` (default) and `add` the input annotation is kept where it exists and GOAnnotate's result fills the rest; with `replace` GOAnnotate's result is used wherever there is one. `symbol_source` and `product_source` say which (`input` or `goannotate`). The symbol and the product name the same gene: where GOAnnotate gives the symbol, its product is used unless the input product agrees with it (at least half of the informative words of the shorter name) or GOAnnotate's product is family-level (a `generic_regex:` name such as "ig-like domain-containing protein"), in which cases the input product is kept; where the input symbol is kept, GOAnnotate's product fills a missing product only when GOAnnotate names the same symbol or none. Transcript rows keep the input transcript's own product, including its isoform label, under `fill` and `add` when the gene keeps the input product; the gene row uses the gene description or the first coding transcript's product without the isoform label. Loci are 1-based and inclusive (`chr1:23246-24202(-)`); `protein_length` is the length of the searched protein. `uniprot_accession` is the best hit of the winning symbol group. Without a GFF3 (transcript FASTA input) the rows come from the FASTA, with input values read from `symbol=`, `product=`, `type=` and `locus=` header fields.
 
 ### Simple Mapping Files
 
@@ -703,11 +705,20 @@ Outputs:
 | `reports/{prefix}_interproscan.tsv` | every match: gene_id, transcript_id, analysis, signature, signature_description, start, end, score, interpro, interpro_description, interpro_type, go_terms |
 | `intermediate/{prefix}_interproscan/` | the protein input, InterProScan's TSV, the Nextflow console output and `.nextflow.log` |
 
-## The bad_names.txt File
+## The bad_patterns.txt File
 
-The `bad_names.txt` file controls how protein names and gene symbols from database hits are cleaned and which are rejected. Its purpose is to prevent carryover of designations that are specific to another genome or annotation pipeline (LOC numbers, locus tags, RIKEN and other clone IDs, chromosome ORF names, the NCBI `-like` paralog suffix) and to keep uninformative names ("uncharacterized protein") from being applied as products.
+`bad_patterns.txt` is the list of rules that decide which text from database hits is unusable in another genome: which words are removed from protein names, which names and gene symbols are rejected, which names count as family-level, and how final product names are tidied. Its purpose is to prevent carryover of designations that belong to another genome or annotation pipeline (LOC numbers, locus tags, clone IDs, chromosome ORF names, the NCBI `-like` suffix) and to keep uninformative names ("uncharacterized protein") from being applied as products.
 
-The copy shipped inside the package (`goannotate/data/bad_names.txt`) is used by default. `--bad-names FILE` replaces it; `--bad-names-extra FILE` (repeatable) adds patterns on top of it, which is the recommended way to tune for a taxon, for example with the locus-tag style of the genomes that dominate your hits. Every run writes `reports/{prefix}_name_audit.txt`, which reports discards by reason, identifiers and qualifiers removed by pattern, the most frequent surviving names (family-level names marked `G`), surviving names and symbols that look like identifiers, and the family-level products assigned to genes. `tests/audit_bad_names.py` produces the same report for a Diamond results file without running the pipeline.
+Each rule is one line of the file. A rule is switched off by putting `#` in front of its line or deleting it, and a rule is added by adding a line. A user who wants zebrafish clone symbols kept, for example, comments out the `symbol_regex:^SI:` line.
+
+| To do this | Use |
+|---|---|
+| Run with the bundled rules | nothing; `goannotate/data/bad_patterns.txt` is read by default |
+| Change or switch off bundled rules | copy `goannotate/data/bad_patterns.txt`, edit the copy, pass it with `--bad-patterns FILE` |
+| Add rules and keep the bundled ones | put the new lines in a file of their own and pass it with `--bad-patterns-extra FILE` (repeatable) |
+| See what the rules did in a run | `reports/{prefix}_name_audit.txt`: discards by reason, identifiers and qualifiers removed by pattern, the most frequent surviving names (family-level names marked `G`), and surviving names and symbols that look like identifiers |
+
+The pattern file used is named in the log and in the summary of every run. `tests/audit_bad_names.py` writes the audit report for a Diamond results file without running the pipeline.
 
 ### Text classes and pattern types
 
@@ -789,7 +800,7 @@ python3 tests/validate_extraction.py --gff3 Annotations.gff3 --genome Genome.fas
 | `GOAnnotate.py` | Wrapper script; runs the package from a checkout |
 | `goannotate/` | The package: `cli.py`, `pipeline.py`, `gff3.py`, `sequences.py`, `search.py`, `blast.py`, `filters.py`, `annotate.py`, `assign.py`, `refgo.py` (GO terms from the reference gene), `reference.py`, `go.py`, `taxon.py`, `mappings.py`, `compare.py`, `output.py`, `models.py` |
 | `goannotate/modules/` | Optional modules: `base.py` (framework), `signalp.py`, `orthology.py`, `interproscan.py` |
-| `goannotate/data/bad_names.txt` | Default name, symbol and product patterns |
+| `goannotate/data/bad_patterns.txt` | Default name, symbol and product patterns |
 | `goannotate/data/stop_words.txt` | Default stop words for the name similarity |
 | `build_databases.py` | Database download and build script |
 | `clean_gff3.py` | GFF3 ID cleanup utility |

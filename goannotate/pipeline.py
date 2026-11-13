@@ -96,7 +96,7 @@ def run(args) -> None:
                         (args.transcripts, "Transcripts FASTA"), (args.blast_results, "BLAST results"),
                         (args.db, "SQLite database"), (args.go_mapping, "GO mapping file"),
                         (args.ncbi_idmapping, "NCBI ID mapping file"), (args.ncbi_geneinfo, "NCBI gene_info file"),
-                        (args.bad_names, "Bad names file"), (args.tx2gene, "Transcript-to-gene file")):
+                        (args.bad_patterns, "Pattern file"), (args.tx2gene, "Transcript-to-gene file")):
         _require_file(path, label)
 
     args.go_obo = resolve_go_obo(args.go_obo)
@@ -202,10 +202,10 @@ def run(args) -> None:
         logger.warning(f"{len(unknown):,} query IDs in the BLAST results are not in the gene universe "
                        f"(first: {unknown[0]}); their hits are kept under their own IDs")
 
-    extra = getattr(args, "bad_names_extra", None) or []
+    extra = getattr(args, "bad_patterns_extra", None) or []
     for path in extra:
         _require_file(path, "Bad names file")
-    bad_name_filter = BadNameFilter(args.bad_names, extra_files=extra)
+    bad_name_filter = BadNameFilter(args.bad_patterns, extra_files=extra)
     output.configure_products(bad_name_filter, cleanup=not getattr(args, "no_product_cleanup", False))
     output.configure_existing(bad_name_filter, keep_identifiers=getattr(args, "keep_existing_identifiers", False))
     name_audit = NameAudit()
@@ -302,6 +302,7 @@ def run(args) -> None:
     ############################################################
     assignment = None
     ref_symbols, ref_descriptions = {}, {}
+    ref_unnamed = {}
     forward = None
     # Fragments: genes whose translated transcripts all lack one or both ends
     partial_genes = set()
@@ -329,6 +330,8 @@ def run(args) -> None:
         # (C1orf122, KIAA1191) are not used to name genes, and uninformative
         # reference names are not used as products.
         n_before = len(ref_symbols)
+        ref_unnamed = {acc: sym for acc, sym in ref_symbols.items()
+                       if sym and bad_name_filter.is_bad_symbol(sym)}
         ref_symbols = {acc: sym for acc, sym in ref_symbols.items()
                        if not bad_name_filter.is_bad_symbol(sym)}
         clean_descriptions = {}
@@ -354,6 +357,8 @@ def run(args) -> None:
             rbh_margin=getattr(args, "rbh_margin", 0.9), existence=assign.read_reference_existence(ref_proteome),
             name_threshold=args.consensus_threshold, partial_genes=partial_genes,
             partial_query_coverage=getattr(args, "symbol_min_fragment_coverage", 0.6))
+        assign.unnamed_reference_genes(annotations, universe, forward, reverse, ref_unnamed,
+                                       nomenclature=nomenclature)
         if not getattr(args, "keep_paralog_designators", False):
             assignment.update(assign.strip_paralog_designators(
                 annotations, ref_descriptions, bad_name_filter.normalize_for_comparison))
@@ -407,6 +412,7 @@ def run(args) -> None:
         modules_run = modules.integrate_modules(early_modules, ctx)
     reference_go = refgo.add_reference_go(
         annotations, ref_symbols, args.db, go_hierarchy, set(forbidden_go), list(args.namespace),
+        unnamed=ref_unnamed,
         evidence_policy=getattr(args, "go_evidence", "all"), mode=getattr(args, "reference_go", "add"))
     if ctx is not None:
         modules_run += modules.run_modules([m for m in selected if not m.runs_before_vote], ctx, auto=modules_auto)

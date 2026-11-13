@@ -722,6 +722,66 @@ def assign_symbols(annotations: dict, universe, forward: Path, reverse: Path, re
 # SECONDARY NOMENCLATURE
 ####################
 
+def unnamed_reference_genes(annotations: dict, universe, forward: Path, reverse: Path, unnamed: dict,
+                            nomenclature=None) -> int:
+    """
+    Reciprocal best hits to reference genes whose only name is an identifier.
+
+    unnamed: reference proteome accession -> symbol, for the proteins the
+    symbol patterns excluded (BcDNA:SD01241, C1orf122). Such a gene gives no
+    symbol, and its curated GO terms still describe its ortholog. A gene
+    left without a symbol that is the best query gene of one of them, and
+    has it among its own reference hits, records that reference gene in
+    annot.reference_unnamed (the strongest when there are several);
+    refgo.add_reference_go transfers its terms. Returns the number of genes.
+    """
+    if not unnamed:
+        return 0
+    tx2gene = universe.transcript_to_gene
+    gene_forward = defaultdict(dict)
+    with open(forward) as fh:
+        for line in fh:
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) < 6:
+                continue
+            symbol = unnamed.get(_accession(parts[1]))
+            if not symbol:
+                continue
+            gene = tx2gene.get(parts[0], parts[0])
+            key = symbol.upper()
+            bits = float(parts[5])
+            if bits > gene_forward[gene].get(key, -1.0):
+                gene_forward[gene][key] = bits
+    symbol_reverse = {}
+    for ref_sid, (tx, bits) in best_hits(reverse).items():
+        symbol = unnamed.get(_accession(ref_sid))
+        if not symbol:
+            continue
+        key = symbol.upper()
+        if key not in symbol_reverse or bits > symbol_reverse[key][1]:
+            symbol_reverse[key] = (tx2gene.get(tx, tx), bits)
+
+    def excluded(symbol):
+        if not nomenclature:
+            return False
+        if hasattr(nomenclature, "is_excluded"):
+            return nomenclature.is_excluded(symbol)
+        return nomenclature.is_pseudogene(symbol)
+
+    n = 0
+    for gene, hits in gene_forward.items():
+        annot = annotations.get(gene)
+        if annot is None or annot.consensus_symbol:
+            continue
+        reciprocal = [(bits, sym) for sym, bits in hits.items()
+                      if symbol_reverse.get(sym, (None,))[0] == gene and not excluded(sym)]
+        if reciprocal:
+            annot.reference_unnamed = max(reciprocal)[1]
+            n += 1
+    logger.info(f"  Genes without a symbol whose reciprocal best hit is a reference gene named by an identifier: {n:,}")
+    return n
+
+
 def secondary_symbols(annotations: dict, universe, forward: Path, reverse: Path, ref_symbols: dict,
                       symbol_case_fn, nomenclature=None, min_coverage: float = 0.5,
                       min_query_coverage: float = 0.8, rbh_margin: float = 0.9) -> dict:
