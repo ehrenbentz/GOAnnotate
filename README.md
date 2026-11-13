@@ -137,6 +137,10 @@ The gene universe is every gene in the GFF3, coding or not. Non-coding genes app
 
 Proteins are searched with `diamond blastp`.
 
+### GTF input: `--gtf`
+
+`--gtf annotation.gtf` takes the place of `--gff3` in every input mode and selects the GTF parser. Features are grouped by their `gene_id` and `transcript_id` attributes, which are the gene and transcript identifiers of the outputs. `gene` and `transcript` lines are used when the file has them; a gene or a transcript without a line of its own is built from the span of its exon and CDS lines, with the `gene*` and `transcript*` attributes of its first line. Column 9 holding a bare identifier on gene and transcript lines (AUGUSTUS) is accepted. `stop_codon` features are joined to the CDS, so that the CDS includes the stop codon as in GFF3 whether or not the GTF excludes it; a GTF with CDS features and no `stop_codon` features is used as given, and a warning is logged. The frame column is read as the phase. The transcript type is `transcript_biotype` or `transcript_type` when present, and the gene type `gene_biotype` or `gene_type`. The existing gene symbol is read from `gene` (NCBI) or `gene_name` (Ensembl, GENCODE), products from `product` and `description`. A key that occurs several times on a line (`transl_except`, `db_xref`, `tag`) is read as one comma-separated value. The annotated output is a GTF (see Output Files).
+
 ### Pre-extracted proteins: `--gff3` and `--proteins`
 
 A protein FASTA made from the same GFF3 (for example GRAFT's `<name>_graft_proteins.fasta`) is searched instead of an extraction. It is checked against the GFF3 before use:
@@ -201,7 +205,7 @@ goannotate \
 
 | Argument | Description |
 |----------|-------------|
-| `--gff3` + `--genome`, `--gff3` + `--proteins`, or `--transcripts` | Input (see Input Modes) |
+| `--gff3` or `--gtf` + `--genome`, `--gff3` or `--gtf` + `--proteins`, or `--transcripts` | Input (see Input Modes) |
 | `--db` or `--go-mapping` | SQLite database or flat-file GO mapping |
 | `--diamond-swissprot` and/or `--diamond-trembl` | Diamond databases (not needed with `--blast-results`) |
 | `--output` | Output directory |
@@ -462,6 +466,7 @@ The annotation files are written to the top level of the `--output` directory; r
 ```
 {output}/
     {prefix}_annotated.gff3                  input GFF3 with GOAnnotate results
+    {prefix}_annotated.gtf                   input GTF with GOAnnotate results (with --gtf)
     {prefix}_annotated_AA.faa                proteins with annotated headers
     {prefix}_annotated_CDS.fna               coding sequences with annotated headers (genome extraction)
     {prefix}_annotated_transcripts.fna       spliced transcripts with annotated headers (genome extraction,
@@ -500,7 +505,7 @@ Two tab-delimited tables for everyday lookup (grep, a spreadsheet, R): one row p
 | `{prefix}_gene_annotations.tsv` | gene_id, symbol, symbol_aliases, secondary_symbol, product, gene_type, coding, locus, n_transcripts, transcripts, confidence, symbol_source, product_source, uniprot_accession, go_terms, then one column per module that ran |
 | `{prefix}_transcript_annotations.tsv` | gene_id, transcript_id, symbol, symbol_aliases, secondary_symbol, product, transcript_type, coding, locus, cds_locus, protein_length, confidence, symbol_source, product_source, uniprot_accession, go_terms, then the module columns |
 
-`symbol` and `product` follow `--annotation-mode`, as in the annotated GFF3 and FASTA: with `fill` (default) and `add` the input annotation is kept where it exists and GOAnnotate's result fills the rest; with `replace` GOAnnotate's result is used wherever there is one. `symbol_source` and `product_source` say which (`input` or `goannotate`). Transcript rows keep the input transcript's own product, including its isoform label, under `fill` and `add`; the gene row uses the gene description or the first coding transcript's product without the isoform label. Loci are 1-based and inclusive (`chr1:23246-24202(-)`); `protein_length` is the length of the searched protein. `uniprot_accession` is the best hit of the winning symbol group. Without a GFF3 (transcript FASTA input) the rows come from the FASTA, with input values read from `symbol=`, `product=`, `type=` and `locus=` header fields.
+`symbol` and `product` follow `--annotation-mode`, as in the annotated GFF3 and FASTA: with `fill` (default) and `add` the input annotation is kept where it exists and GOAnnotate's result fills the rest; with `replace` GOAnnotate's result is used wherever there is one. `symbol_source` and `product_source` say which (`input` or `goannotate`). The symbol and the product name the same gene: where GOAnnotate gives the symbol, its product is used unless the input product agrees with it (at least half of the informative words of the shorter name), in which case the input product is kept; where the input symbol is kept, GOAnnotate's product fills a missing product only when GOAnnotate names the same symbol or none. Transcript rows keep the input transcript's own product, including its isoform label, under `fill` and `add` when the gene keeps the input product; the gene row uses the gene description or the first coding transcript's product without the isoform label. Loci are 1-based and inclusive (`chr1:23246-24202(-)`); `protein_length` is the length of the searched protein. `uniprot_accession` is the best hit of the winning symbol group. Without a GFF3 (transcript FASTA input) the rows come from the FASTA, with input values read from `symbol=`, `product=`, `type=` and `locus=` header fields.
 
 ### Simple Mapping Files
 
@@ -571,8 +576,10 @@ The annotated GFF3 is the input file passed through line by line: every feature,
 | Mode | Behaviour |
 |------|-----------|
 | `add` | Only the attributes above are added |
-| `fill` (default) | `gene`, `Name` and `description` on genes and `product` on transcripts and CDS are written where the input has none; with `--hypothetical`, coding models still without a product receive `product=hypothetical protein` (off by default, since table2asn assigns it itself). Existing symbols that are identifiers (LOC numbers of an NCBI annotation, locus tags) and placeholder products ("uncharacterized protein LOC122519524") count as missing and are filled; `--keep-existing-identifiers` keeps them |
+| `fill` (default) | `gene`, `Name` and `description` on genes and `product` on transcripts and CDS are written where the input has none, and, where GOAnnotate gives the symbol, an existing product that names another protein is replaced by GOAnnotate's so that symbol and product name the same gene; with `--hypothetical`, coding models still without a product receive `product=hypothetical protein` (off by default, since table2asn assigns it itself). Existing symbols that are identifiers (LOC numbers of an NCBI annotation, locus tags) and placeholder products ("uncharacterized protein LOC122519524") count as missing and are filled; `--keep-existing-identifiers` keeps them |
 | `replace` | The same attributes are overwritten with GOAnnotate values wherever GOAnnotate has one |
+
+With `--gtf` the file is `{prefix}_annotated.gtf`, the input GTF passed through in the same way; lines that receive nothing are written unchanged. A gene's results (`goannotate_symbol`, `goannotate_product`, `goannotate_confidence`, one `Ontology_term "GO:..."` per specific GO term, `db_xref "UniProtKB:ACC"`, module attributes) are written on its gene line. A gene without a gene line has them on its transcript lines, and a transcript without a line of its own on its exon and CDS lines. The modes act as for GFF3 with the GTF keys: the symbol is written on every line of the gene, under `gene` when the input uses that key and under `gene_name` otherwise; `description` is written on the gene line and `product` on transcript and CDS lines. List values of modules (`Dbxref`) are written as one `db_xref` per value, and `sig_peptide` features as GTF lines with `gene_id` and `transcript_id`.
 
 ### Summary
 

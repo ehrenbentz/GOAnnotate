@@ -1,4 +1,4 @@
-"""Output writers: mapping files, evidence, annotated FASTA and GFF3, summary."""
+"""Output writers: mapping files, evidence, annotated FASTA, GFF3 and GTF, summary."""
 
 import logging
 import re
@@ -9,7 +9,8 @@ from datetime import datetime
 from pathlib import Path
 
 from goannotate import __version__
-from goannotate.gff3 import encode_attribute_value, is_gene_type
+from goannotate.gff3 import DERIVED_TYPES, encode_attribute_value, is_gene_type, parse_attributes
+from goannotate.gtf import gtf_line_pairs, unquote_gtf_value
 from goannotate.models import BlastStats, GeneUniverse
 
 logger = logging.getLogger(__name__)
@@ -285,21 +286,54 @@ def write_go_evidence(annotations: dict, go_hierarchy, path: Path, forbidden_go:
 _ISOFORM_SUFFIX = re.compile(r",?\s+(?:isoform|transcript variant)\s+\S+$", re.I)
 
 
-def _choose(input_value: str, goa_value: str, mode: str, kind: str = "symbol") -> tuple:
+_stop_words = None
+
+
+def products_agree(a: str, b: str) -> bool:
+    """Two products name the same protein: they share at least half of the informative words of the shorter."""
+    global _stop_words
+    from goannotate.annotate import load_stop_words
+    from goannotate.evaluate import _names_agree
+    if _stop_words is None:
+        _stop_words = load_stop_words()
+    return _names_agree(a, b, _stop_words)
+
+
+def choose_pair(in_symbol: str, in_product: str, goa_symbol: str, goa_product: str, mode: str) -> tuple:
     """
-    (value, source) under the annotation mode: replace prefers GOAnnotate;
-    fill and add keep the input unless it counts as missing (an identifier
-    such as a LOC number, see configure_existing), in which case
-    GOAnnotate's value is used when there is one.
+    (symbol, symbol source, product, product source) under the annotation
+    mode, with the symbol and the product naming the same gene.
+
+    The symbol: replace prefers GOAnnotate's; fill and add keep the input's
+    unless it counts as missing (an identifier such as a LOC number, see
+    configure_existing) and GOAnnotate has one.
+
+    The product follows the symbol. With GOAnnotate's symbol, GOAnnotate's
+    product is used; an input product that agrees with it is kept (fill,
+    add). With the input's symbol, the input's product is kept; when it is
+    missing, GOAnnotate's product is used only when GOAnnotate names the
+    same symbol or none. Without any symbol the input's product is kept
+    unless it is missing.
     """
-    if mode == "replace":
-        if goa_value:
-            return goa_value, "goannotate"
-        return (input_value, "input") if input_value else ("", "")
-    missing = missing_symbol if kind == "symbol" else missing_product
-    if input_value and not (goa_value and missing(input_value)):
-        return input_value, "input"
-    return (goa_value, "goannotate") if goa_value else ("", "")
+    in_sym_ok = bool(in_symbol) and not missing_symbol(in_symbol)
+    in_prod_ok = bool(in_product) and not missing_product(in_product)
+    if goa_symbol and (mode == "replace" or not in_sym_ok):
+        symbol, sym_src = goa_symbol, "goannotate"
+    elif in_symbol:
+        symbol, sym_src = in_symbol, "input"
+    else:
+        symbol, sym_src = "", ""
+
+    if sym_src == "goannotate":
+        if goa_product and not (mode != "replace" and in_prod_ok and products_agree(in_product, goa_product)):
+            return symbol, sym_src, goa_product, "goannotate"
+    elif in_sym_ok:
+        same = not goa_symbol or goa_symbol.upper() == in_symbol.upper()
+        if goa_product and same and (mode == "replace" or not in_prod_ok):
+            return symbol, sym_src, goa_product, "goannotate"
+    elif goa_product and (mode == "replace" or not in_prod_ok):
+        return symbol, sym_src, goa_product, "goannotate"
+    return (symbol, sym_src, in_product, "input") if in_product else (symbol, sym_src, "", "")
 
 
 def _tx_input_product(tx) -> str:
@@ -404,8 +438,8 @@ def write_annotation_tables(output_dir: Path, prefix: str, annotations: dict, un
             for gene in genes:
                 a, g_sym, g_prod, conf, go = goa(gene.key)
                 acc = top_hit_accession(a)
-                symbol, sym_src = _choose(gene_symbol_of(gene), g_sym, mode)
-                product, prod_src = _choose(_gene_input_product(gene), g_prod, mode, "product")
+                symbol, sym_src, product, prod_src = choose_pair(gene_symbol_of(gene), _gene_input_product(gene),
+                                                                 g_sym, g_prod, mode)
                 txs = gene.transcripts
                 al = aliases(a, symbol)
                 sec = a.secondary_symbol if a is not None else ""
@@ -416,7 +450,10 @@ def write_annotation_tables(output_dir: Path, prefix: str, annotations: dict, un
                     + extra(gene_extra, gene.key)) + "\n")
                 n_genes += 1
                 for tx in txs:
-                    t_prod, t_src = _choose(_tx_input_product(tx), g_prod, mode, "product")
+                    if prod_src == "goannotate" or not _tx_input_product(tx):
+                        t_prod, t_src = product, prod_src
+                    else:
+                        t_prod, t_src = _tx_input_product(tx), "input"
                     if tx.exons:
                         start, end = min(s for s, _ in tx.exons), max(e for _, e in tx.exons)
                     else:
@@ -447,9 +484,8 @@ def write_annotation_tables(output_dir: Path, prefix: str, annotations: dict, un
                 acc = top_hit_accession(a)
                 txs = universe.gene_to_transcripts.get(gene_id, [])
                 first = fields.get(txs[0], {}) if txs else {}
-                symbol, sym_src = _choose(first.get("symbol", ""), g_sym, mode)
                 in_prod = _ISOFORM_SUFFIX.sub("", first.get("product", ""))
-                product, prod_src = _choose(in_prod, g_prod, mode, "product")
+                symbol, sym_src, product, prod_src = choose_pair(first.get("symbol", ""), in_prod, g_sym, g_prod, mode)
                 coding = universe.coding.get(gene_id) if universe.coding else None
                 al = aliases(a, symbol)
                 sec = a.secondary_symbol if a is not None else ""
@@ -460,7 +496,10 @@ def write_annotation_tables(output_dir: Path, prefix: str, annotations: dict, un
                 n_genes += 1
                 for t in txs:
                     f = fields.get(t, {})
-                    t_prod, t_src = _choose(f.get("product", ""), g_prod, mode, "product")
+                    if prod_src == "goannotate" or not f.get("product", ""):
+                        t_prod, t_src = product, prod_src
+                    else:
+                        t_prod, t_src = f.get("product", ""), "input"
                     ft.write("\t".join([
                         gene_id, t, symbol, al, sec, t_prod, f.get("type", ""), "", f.get("locus", ""), "", "",
                         conf, sym_src, t_src, acc, go] + extra(tx_extra, t)) + "\n")
@@ -521,11 +560,12 @@ def write_annotated_fasta(input_fasta: str, annotations: dict, output_file: Path
                 fields["goannotate_symbol"] = symbol
                 fields["goannotate_product"] = product
             else:
-                overwrite = (mode == "replace")
-                if symbol and (overwrite or missing_symbol(fields.get("symbol", ""))):
-                    fields["symbol"] = symbol
-                if product and (overwrite or missing_product(fields.get("product", ""))):
-                    fields["product"] = product
+                out_sym, sym_src, out_prod, prod_src = choose_pair(
+                    fields.get("symbol", ""), _ISOFORM_SUFFIX.sub("", fields.get("product", "")), symbol, product, mode)
+                if sym_src == "goannotate":
+                    fields["symbol"] = out_sym
+                if prod_src == "goannotate":
+                    fields["product"] = out_prod
             fout.write(">" + format_header(seq_id, fields) + "\n")
 
     logger.info(f"Annotated {annotated_count:,} of {total_count:,} sequences in FASTA")
@@ -588,6 +628,57 @@ def _merge_list(pairs: list, key: str, values: list) -> None:
     pairs.append([key, ",".join(encoded)])
 
 
+def _annotation_decisions(genes: list, annotations: dict, mode: str, hypothetical: bool,
+                          unlisted_transcripts: bool = False) -> tuple:
+    """
+    Decide once per gene and per transcript which standard attributes
+    receive GOAnnotate values, from the parsed (decoded) input attributes,
+    so that the decision does not depend on line order in the file.
+
+    Returns (gene_key_by_feature, gene_decision, tx_decision, tx_objects).
+    Transcripts without a line of their own in the input are left out
+    unless unlisted_transcripts is set.
+    """
+    from goannotate.sequences import gene_symbol_of
+    standard = mode in ("fill", "replace")
+    tx_objects = {}        # transcript feature ID -> (Transcript, Gene), for module features
+    gene_key_by_feature = {}
+    gene_decision = {}    # gene key -> dict
+    tx_decision = {}      # transcript feature ID -> dict
+    for g in genes:
+        annot = annotations.get(g.key)
+        symbol = annot.consensus_symbol if annot else ""
+        product = product_for(annot)
+        _, sym_src, _, prod_src = choose_pair(gene_symbol_of(g), _gene_input_product(g), symbol, product, mode)
+        use_symbol = standard and sym_src == "goannotate"
+        use_product = standard and prod_src == "goannotate"
+        gene_decision[g.key] = {
+            "symbol": symbol,
+            "product": product,
+            "write_gene": bool(use_symbol),
+            "write_name": bool(use_symbol),
+            "write_description": bool(use_product),
+        }
+        if not g.wrapper:
+            gene_key_by_feature[g.id] = g.key
+        for t in g.transcripts:
+            if t.implicit and not unlisted_transcripts:
+                continue
+            has_product = not missing_product(_tx_input_product(t) if unlisted_transcripts
+                                              else t.attrs.get("product", ""))
+            tx_objects[t.id] = (t, g)
+            tx_decision[t.id] = {
+                "gene_key": g.key,
+                "tx_key": t.key,
+                "wrapper": g.wrapper,
+                "listed": not t.implicit,
+                "write_product": bool(use_product),
+                "write_hypothetical": bool(standard and hypothetical and t.coding
+                                           and not product and not has_product),
+            }
+    return gene_key_by_feature, gene_decision, tx_decision, tx_objects
+
+
 # GFF3 attributes holding comma-separated lists: module values are merged into them, not overwritten
 _LIST_ATTRIBUTES = {"Dbxref", "Ontology_term"}
 
@@ -605,7 +696,9 @@ def write_annotated_gff3(input_gff: str, output_file: Path, annotations: dict, g
     mode controls the standard attributes:
       add      nothing else is changed
       fill     gene, Name and description on the gene, product on
-               transcripts and CDS, written only where absent
+               transcripts and CDS, written where absent; where GOAnnotate
+               gives the symbol, its product replaces an existing product
+               that names another protein (choose_pair)
       replace  the same attributes, overwritten with GOAnnotate values
 
     With hypothetical, coding transcripts and CDS that end up without any
@@ -619,44 +712,9 @@ def write_annotated_gff3(input_gff: str, output_file: Path, annotations: dict, g
     """
     logger.info(f"Writing annotated GFF3 to {output_file} (mode: {mode})")
 
-    overwrite = (mode == "replace")
-    standard = mode in ("fill", "replace")
     modules = modules or []
-    tx_objects = {}        # transcript feature ID -> (Transcript, Gene), for module features
-
-    # Decide once per gene and per transcript which standard attributes
-    # receive GOAnnotate values, from the parsed (decoded) input attributes,
-    # so that the decision does not depend on line order in the file.
-    gene_key_by_feature = {}
-    gene_decision = {}    # gene key -> dict
-    tx_decision = {}      # transcript feature ID -> dict
-    for g in genes:
-        annot = annotations.get(g.key)
-        symbol = annot.consensus_symbol if annot else ""
-        product = product_for(annot)
-        gene_decision[g.key] = {
-            "symbol": symbol,
-            "product": product,
-            "write_gene": bool(standard and symbol and (overwrite or missing_symbol(g.attrs.get("gene", "")))),
-            "write_name": bool(standard and symbol and (overwrite or missing_symbol(g.attrs.get("Name", "")))),
-            "write_description": bool(standard and product
-                                      and (overwrite or missing_product(g.attrs.get("description", "")))),
-        }
-        if not g.wrapper:
-            gene_key_by_feature[g.id] = g.key
-        for t in g.transcripts:
-            if t.implicit:
-                continue
-            has_product = not missing_product(t.attrs.get("product", ""))
-            tx_objects[t.id] = (t, g)
-            tx_decision[t.id] = {
-                "gene_key": g.key,
-                "tx_key": t.key,
-                "wrapper": g.wrapper,
-                "write_product": bool(standard and product and (overwrite or not has_product)),
-                "write_hypothetical": bool(standard and hypothetical and t.coding
-                                           and not product and not has_product),
-            }
+    gene_key_by_feature, gene_decision, tx_decision, tx_objects = _annotation_decisions(
+        genes, annotations, mode, hypothetical)
 
     counts = {"genes_annotated": 0, "transcripts_annotated": 0, "hypothetical": 0}
 
@@ -776,6 +834,216 @@ def write_annotated_gff3(input_gff: str, output_file: Path, annotations: dict, g
 
 
 ####################
+# ANNOTATED GTF
+####################
+
+# GTF keys used for the GFF3 list attributes; each value is written as a key of its own
+_GTF_LIST_KEYS = {"Dbxref": "db_xref", "Ontology_term": "Ontology_term"}
+
+
+def _gtf_quote(value) -> str:
+    text = str(value).replace('"', "'").replace(";", ",").replace("\t", " ").replace("\n", " ")
+    return f'"{text}"'
+
+
+def _gtf_join(pairs: list) -> str:
+    return " ".join(f"{k};" if v is None else f"{k} {v};" for k, v in pairs)
+
+
+def _gtf_set(pairs: list, key: str, value: str, overwrite: bool) -> None:
+    """Add key "value" or replace the existing value when overwrite is set."""
+    for pair in pairs:
+        if pair[0] == key:
+            if overwrite:
+                pair[1] = _gtf_quote(value)
+            return
+    pairs.append([key, _gtf_quote(value)])
+
+
+def _gtf_add_values(pairs: list, key: str, values: list) -> None:
+    """Add one key "value" pair for each value the line does not carry under that key."""
+    existing = {unquote_gtf_value(v) for k, v in pairs if k == key}
+    for value in values:
+        if value and value not in existing:
+            pairs.append([key, _gtf_quote(value)])
+            existing.add(value)
+
+
+def _gtf_merge_value(pairs: list, key: str, values: list) -> None:
+    """Merge values into a single comma-separated attribute."""
+    if not values:
+        return
+    for pair in pairs:
+        if pair[0] == key:
+            existing = [x for x in unquote_gtf_value(pair[1]).split(",") if x]
+            pair[1] = _gtf_quote(",".join(existing + [v for v in values if v not in existing]))
+            return
+    pairs.append([key, _gtf_quote(",".join(values))])
+
+
+def _gtf_feature_line(gff3_line: str, gene_id: str, transcript_id: str) -> str:
+    """A module's GFF3 feature line as a GTF line of the given gene and transcript."""
+    fields = gff3_line.split("\t")
+    pairs = [["gene_id", _gtf_quote(gene_id)], ["transcript_id", _gtf_quote(transcript_id)]]
+    for key, value in parse_attributes(fields[8]).items():
+        if key not in ("ID", "Parent"):
+            pairs.append([key, _gtf_quote(value)])
+    fields[8] = _gtf_join(pairs)
+    return "\t".join(fields)
+
+
+def write_annotated_gtf(input_gtf: str, output_file: Path, annotations: dict, genes: list,
+                        mode: str = "fill", hypothetical: bool = True, modules: list = None) -> dict:
+    """
+    Stream the input GTF to output_file, passing every line through and
+    adding GOAnnotate results. Lines that receive nothing are written
+    unchanged.
+
+    The results of a gene (goannotate_symbol, goannotate_product,
+    goannotate_confidence, Ontology_term and db_xref "UniProtKB:ACC", one
+    key per value, and module attributes) are written on its gene line. A
+    gene without a gene line has them on its transcript lines, and a
+    transcript without a line of its own on its exon and CDS lines.
+
+    mode controls the standard attributes as in write_annotated_gff3:
+    the symbol is written on every line of the gene, under the key gene
+    when the input uses it and under gene_name otherwise; description is
+    written on the gene line and product on transcript and CDS lines.
+
+    Module feature lines (sig_peptide) are written after the transcript
+    line, with gene_id and transcript_id attributes.
+    """
+    logger.info(f"Writing annotated GTF to {output_file} (mode: {mode})")
+
+    modules = modules or []
+    _, gene_decision, tx_decision, tx_objects = _annotation_decisions(
+        genes, annotations, mode, hypothetical, unlisted_transcripts=True)
+    gene_key_by_id = {g.id: g.key for g in genes}
+    has_gene_line = {g.id: not g.wrapper for g in genes}
+    symbol_key = "gene" if any("gene" in g.attrs for g in genes) else "gene_name"
+
+    annotated_genes = set()
+    product_transcripts = set()
+    hypothetical_transcripts = set()
+    counts = {"module_features": 0}
+
+    def gene_results(pairs, gene_key):
+        annot = annotations.get(gene_key)
+        d = gene_decision[gene_key]
+        if d["symbol"]:
+            _gtf_set(pairs, "goannotate_symbol", d["symbol"], True)
+            if annot is not None and annot.symbol_aliases:
+                _gtf_merge_value(pairs, "goannotate_symbol_aliases", list(annot.symbol_aliases))
+        if annot is not None and annot.secondary_symbol:
+            _gtf_set(pairs, "goannotate_secondary_symbol", annot.secondary_symbol, True)
+        if d["product"]:
+            _gtf_set(pairs, "goannotate_product", d["product"], True)
+        if annot and annot.hits:
+            _gtf_set(pairs, "goannotate_confidence", annot.confidence, True)
+        if annot and annot.specific_go_terms:
+            _gtf_add_values(pairs, "Ontology_term", sorted(annot.specific_go_terms))
+        acc = top_hit_accession(annot)
+        if acc:
+            _gtf_add_values(pairs, "db_xref", [f"UniProtKB:{acc}"])
+        if d["write_description"]:
+            _gtf_set(pairs, "description", d["product"], True)
+        if d["symbol"] or d["product"]:
+            annotated_genes.add(gene_key)
+        for m in modules:
+            for k, v in m.gene_attributes(gene_key).items():
+                if k in _GTF_LIST_KEYS:
+                    _gtf_add_values(pairs, _GTF_LIST_KEYS[k], [x for x in v.split(",") if x])
+                else:
+                    _gtf_set(pairs, k, v, True)
+
+    def transcript_results(pairs, tx_id, with_module_attributes):
+        t = tx_decision[tx_id]
+        g = gene_decision[t["gene_key"]]
+        if t["write_product"]:
+            _gtf_set(pairs, "product", g["product"], True)
+            product_transcripts.add(tx_id)
+        elif t["write_hypothetical"]:
+            _gtf_set(pairs, "product", "hypothetical protein", False)
+            hypothetical_transcripts.add(tx_id)
+        if with_module_attributes:
+            for m in modules:
+                for k, v in m.transcript_attributes(t["tx_key"]).items():
+                    if k in _GTF_LIST_KEYS:
+                        _gtf_add_values(pairs, _GTF_LIST_KEYS[k], [x for x in v.split(",") if x])
+                    else:
+                        _gtf_set(pairs, k, v, True)
+
+    def module_features(tx_id) -> list:
+        if not modules or tx_id not in tx_objects:
+            return []
+        t, g = tx_objects[tx_id]
+        lines = []
+        for m in modules:
+            lines.extend(_gtf_feature_line(l, g.id, t.id) for l in m.transcript_features(t, g))
+        return lines
+
+    with open(input_gtf) as fin, open(output_file, "w") as fout:
+        for line in fin:
+            stripped = line.rstrip("\n")
+            fields = stripped.split("\t")
+            if line.startswith("#") or len(fields) != 9:
+                fout.write(line)
+                continue
+
+            ftype = fields[2]
+            pairs = gtf_line_pairs(ftype, fields[8])
+            before = _gtf_join(pairs)
+            gid = unquote_gtf_value(_get(pairs, "gene_id"))
+            tid = unquote_gtf_value(_get(pairs, "transcript_id"))
+            if not tid and gid and ftype in ("exon", "CDS", "stop_codon"):
+                tid = f"{gid}.mRNA"
+            if tid in tx_objects:
+                gid = tx_objects[tid][1].id
+            gene_key = gene_key_by_id.get(gid)
+            if gene_key is None:
+                fout.write(line)
+                continue
+
+            extra_lines = []
+            if is_gene_type(ftype):
+                gene_results(pairs, gene_key)
+            elif tid in tx_decision and ftype in ("exon", "CDS"):
+                if not tx_decision[tid]["listed"]:
+                    if not has_gene_line[gid]:
+                        gene_results(pairs, gene_key)
+                    if ftype == "exon":
+                        transcript_results(pairs, tid, True)
+                if ftype == "CDS":
+                    transcript_results(pairs, tid, False)
+            elif tid in tx_decision and tx_decision[tid]["listed"] and ftype not in DERIVED_TYPES:
+                if not has_gene_line[gid]:
+                    gene_results(pairs, gene_key)
+                transcript_results(pairs, tid, True)
+                extra_lines = module_features(tid)
+            if gene_decision[gene_key]["write_gene"]:
+                _gtf_set(pairs, symbol_key, gene_decision[gene_key]["symbol"], True)
+
+            after = _gtf_join(pairs)
+            if after == before:
+                fout.write(line)
+            else:
+                fields[8] = after
+                fout.write("\t".join(fields) + "\n")
+            for extra_line in extra_lines:
+                fout.write(extra_line + "\n")
+                counts["module_features"] += 1
+
+    counts["genes_annotated"] = len(annotated_genes)
+    counts["transcripts_annotated"] = len(product_transcripts)
+    counts["hypothetical"] = len(hypothetical_transcripts)
+    logger.info(f"  Genes with GOAnnotate symbol or product: {counts['genes_annotated']:,}; "
+                f"transcripts given a product: {counts['transcripts_annotated']:,}; "
+                f"coding transcripts set to hypothetical protein: {counts['hypothetical']:,}"
+                + (f"; module features written: {counts['module_features']:,}" if counts["module_features"] else ""))
+    return counts
+
+
+####################
 # SUMMARY
 ####################
 
@@ -830,6 +1098,8 @@ def write_summary(output_dir: Path, prefix: str, annotations: dict, args, blast_
         f.write("-" * 70 + "\n")
         if getattr(args, "gff3", None):
             f.write(f"  GFF3:           {args.gff3}\n")
+        if getattr(args, "gtf", None):
+            f.write(f"  GTF:            {args.gtf}\n")
         if getattr(args, "genome", None):
             f.write(f"  Genome:         {args.genome}\n")
         if getattr(args, "proteins", None):
@@ -874,20 +1144,25 @@ def write_summary(output_dir: Path, prefix: str, annotations: dict, args, blast_
         f.write(f"  Product naming rules:     {'off' if getattr(args, 'no_product_cleanup', False) else 'on'}\n")
         if getattr(args, "gff3", None):
             f.write(f"  GFF3 annotation mode:     {args.annotation_mode}\n")
+        if getattr(args, "gtf", None):
+            f.write(f"  GTF annotation mode:      {args.annotation_mode}\n")
         f.write(f"  Modules:                  {getattr(args, 'modules', None) or 'none'}\n")
         f.write("\n")
 
         if gff_stats is not None:
-            f.write("GFF3 Input:\n")
+            is_gtf = getattr(gff_stats, "format", "GFF3") == "GTF"
+            f.write("GTF Input:\n" if is_gtf else "GFF3 Input:\n")
             f.write("-" * 70 + "\n")
             f.write(f"  Genes:                        {gff_stats.n_genes:,} "
                     f"({gff_stats.n_coding_genes:,} coding)\n")
             f.write(f"  Transcripts:                  {gff_stats.n_transcripts:,} "
                     f"({gff_stats.n_coding_transcripts:,} coding)\n")
             if gff_stats.n_wrapper_genes:
-                f.write(f"  Parentless transcripts:       {gff_stats.n_wrapper_genes:,}\n")
+                label = "Genes without a gene line:   " if is_gtf else "Parentless transcripts:      "
+                f.write(f"  {label} {gff_stats.n_wrapper_genes:,}\n")
             if gff_stats.n_implicit_transcripts:
-                f.write(f"  Implicit transcripts:         {gff_stats.n_implicit_transcripts:,}\n")
+                label = "Transcripts without a line:  " if is_gtf else "Implicit transcripts:        "
+                f.write(f"  {label} {gff_stats.n_implicit_transcripts:,}\n")
             f.write("\n")
 
         if extraction is not None:

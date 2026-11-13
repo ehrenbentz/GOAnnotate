@@ -285,6 +285,31 @@ check(bnf.clean_name("Ras-related protein Rab-11b, tandem duplicate 1") == "Ras-
       "tandem duplicate stripped from hit names (qualifier)")
 check(bnf.process_name("Not available") is None and bnf.process_name("NA") is None, "'not available' placeholder")
 
+
+# ---------------------------------------------------------- symbol and product from one source
+print("\n# Symbol and product name the same gene")
+output.configure_existing(bnf)
+cp = output.choose_pair
+check(cp("LOC122520690", "luc7-like protein 3", "RpS9", "small ribosomal subunit protein uS4", "fill")
+      == ("RpS9", "goannotate", "small ribosomal subunit protein uS4", "goannotate"),
+      "GOAnnotate's symbol brings its product when the input product names another protein")
+check(cp("LOC1", "serine/threonine-protein kinase 24", "STK24", "Serine/threonine-protein kinase 24", "fill")
+      == ("STK24", "goannotate", "serine/threonine-protein kinase 24", "input"),
+      "an input product that agrees with GOAnnotate's is kept")
+check(cp("Avp", "vasopressin-neurophysin 2-copeptin", "OXT", "oxytocin-neurophysin 1", "fill")
+      == ("Avp", "input", "vasopressin-neurophysin 2-copeptin", "input"), "an input symbol keeps its product")
+check(cp("Avp", "uncharacterized protein LOC122519524", "OXT", "oxytocin-neurophysin 1", "fill")[2:]
+      == ("uncharacterized protein LOC122519524", "input")
+      and cp("Avp", "uncharacterized protein LOC122519524", "AVP", "vasopressin-neurophysin 2-copeptin", "fill")[2:]
+      == ("vasopressin-neurophysin 2-copeptin", "goannotate"),
+      "a missing input product is filled only when GOAnnotate names the same symbol")
+check(cp("LOC7", "ichor-like", "", "ichor", "fill") == ("LOC7", "input", "ichor-like", "input")
+      and cp("", "", "ABC1", "abc protein 1", "fill") == ("ABC1", "goannotate", "abc protein 1", "goannotate"),
+      "without a GOAnnotate symbol the input product stays; without input both come from GOAnnotate")
+check(cp("Avp", "vasopressin", "OXT", "oxytocin-neurophysin 1", "replace")
+      == ("OXT", "goannotate", "oxytocin-neurophysin 1", "goannotate"), "replace takes GOAnnotate's pair")
+output.configure_existing(None)
+
 # ---------------------------------------------------------- ortholog prior
 print("\n# Ortholog symbols in the vote")
 

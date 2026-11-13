@@ -127,8 +127,9 @@ class Gene:
 
     @property
     def biotype(self) -> str:
-        """gene_biotype or biotype attribute, else the feature type."""
-        return self.attrs.get("gene_biotype") or self.attrs.get("biotype") or self.ftype
+        """gene_biotype, biotype or gene_type attribute, else the feature type."""
+        return (self.attrs.get("gene_biotype") or self.attrs.get("biotype")
+                or self.attrs.get("gene_type") or self.ftype)
 
 
 @dataclass
@@ -144,6 +145,7 @@ class GFF3Stats:
     n_orphan_children: int = 0
     n_ignored_features: int = 0
     n_coding_genes: int = 0
+    format: str = "GFF3"
 
 
 def parse_gff3(path: str) -> tuple:
@@ -378,6 +380,6 @@ def universe_from_genes(genes: list) -> GeneUniverse:
                             gene_to_transcripts=gene_to_transcripts,
                             total_sequences=total_sequences, gene_types=gene_types, coding=coding)
     n_multi = sum(1 for txs in gene_to_transcripts.values() if len(txs) > 1)
-    logger.info(f"Gene universe from GFF3: {len(gene_ids):,} genes, {total_sequences:,} transcripts, "
+    logger.info(f"Gene universe from the annotation: {len(gene_ids):,} genes, {total_sequences:,} transcripts, "
                 f"{n_multi:,} genes with multiple transcripts")
     return universe

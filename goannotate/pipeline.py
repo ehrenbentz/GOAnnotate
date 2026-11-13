@@ -8,7 +8,7 @@ from pathlib import Path
 
 from goannotate import GOAnnotateError
 from goannotate import annotate as annotate_mod
-from goannotate import (assign, blast, compare, evaluate, gff3, mappings, modules, orfs, output, refgo, reference, search,
+from goannotate import (assign, blast, compare, evaluate, gff3, gtf, mappings, modules, orfs, output, refgo, reference, search,
                         sequences, taxon)
 from goannotate.filters import BadNameFilter, NameAudit, write_name_audit
 from goannotate.go import GOHierarchy, resolve_go_obo
@@ -85,7 +85,13 @@ def run(args) -> None:
     work_dir.mkdir(exist_ok=True)
     _migrate_old_layout(output_dir, work_dir, prefix)
 
-    for path, label in ((args.gff3, "GFF3 file"), (args.genome, "Genome FASTA"),
+    args.gtf = getattr(args, "gtf", None)
+    annotation_file = args.gff3 or args.gtf
+    parse_annotation = gtf.parse_gtf if args.gtf else gff3.parse_gff3
+    if args.gtf and "gene_name" not in args.existing_symbol_attr:
+        args.existing_symbol_attr = list(args.existing_symbol_attr) + ["gene_name"]
+
+    for path, label in ((args.gff3, "GFF3 file"), (args.gtf, "GTF file"), (args.genome, "Genome FASTA"),
                         (getattr(args, "proteins", None), "Protein FASTA"),
                         (args.transcripts, "Transcripts FASTA"), (args.blast_results, "BLAST results"),
                         (args.db, "SQLite database"), (args.go_mapping, "GO mapping file"),
@@ -104,8 +110,8 @@ def run(args) -> None:
     extraction = None
 
     protein_check = None
-    if args.gff3 and (args.genome or getattr(args, "proteins", None)):
-        genes, gff_stats = gff3.parse_gff3(args.gff3)
+    if annotation_file and (args.genome or getattr(args, "proteins", None)):
+        genes, gff_stats = parse_annotation(annotation_file)
         gff3.assign_keys(genes, args.gene_id_attr, args.transcript_id_attr)
         universe = gff3.universe_from_genes(genes)
         if args.genome:
@@ -137,11 +143,11 @@ def run(args) -> None:
         if search_mode == "blastp":
             logger.info("Input FASTA contains protein sequences; Diamond blastp will be used")
         annotated_fasta_source = query_fasta
-        if args.gff3:
-            genes, gff_stats = gff3.parse_gff3(args.gff3)
+        if annotation_file:
+            genes, gff_stats = parse_annotation(annotation_file)
             gff3.assign_keys(genes, args.gene_id_attr, args.transcript_id_attr)
     else:
-        raise GOAnnotateError("Provide --gff3 with --genome, or --transcripts")
+        raise GOAnnotateError("Provide --gff3 or --gtf with --genome, or --transcripts")
 
     ############################################################
     # Stage 2: Diamond search (or precomputed results)
@@ -433,7 +439,7 @@ def run(args) -> None:
                 gene_strata=args.strata_gene, transcript_strata=args.strata_transcript,
                 is_bad_symbol=bad_name_filter.is_bad_symbol)
         else:
-            logger.info("No existing functional annotation found in the GFF3; comparison skipped")
+            logger.info("No existing functional annotation found in the input annotation; comparison skipped")
 
     ############################################################
     # Stage 5: outputs
@@ -506,7 +512,11 @@ def run(args) -> None:
                                      transcript_to_gene=universe.transcript_to_gene,
                                      mode=args.annotation_mode,
                                      header_fields=header_fields)
-    if genes is not None:
+    if genes is not None and args.gtf:
+        output.write_annotated_gtf(args.gtf, output_dir / f"{prefix}_annotated.gtf",
+                                   annotations, genes, mode=args.annotation_mode,
+                                   hypothetical=args.hypothetical, modules=modules_run)
+    elif genes is not None:
         output.write_annotated_gff3(args.gff3, output_dir / f"{prefix}_annotated.gff3",
                                     annotations, genes, mode=args.annotation_mode,
                                     hypothetical=args.hypothetical, modules=modules_run)

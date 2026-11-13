@@ -35,6 +35,7 @@ Input modes:
   Genome:        --gff3 FILE --genome FILE       extract CDS, translate, search proteins (blastp)
   Proteins:      --gff3 FILE --proteins FILE     search pre-extracted proteins (blastp); IDs checked
                                                  against the GFF3 transcripts before use
+  GTF:           --gtf FILE                      in place of --gff3 FILE in either mode
   Transcriptome: --transcripts FILE              nucleotide sequences: blastx, translation of each
                                                  transcript in the frame of its best hit, then blastp
                                                  of the proteins (--orf-translation off: blastx only);
@@ -59,7 +60,11 @@ Examples:
     g.add_argument("--gff3", "--gff", dest="gff3", metavar="FILE",
                    help="GFF3 annotation. With --genome, sequences are extracted from it;\n"
                         "with --transcripts, it is used for the annotated GFF3 output only")
-    g.add_argument("--genome", metavar="FILE", help="Genome FASTA matching the GFF3")
+    g.add_argument("--gtf", metavar="FILE",
+                   help="GTF annotation, used in place of --gff3 in every input mode; genes and\n"
+                        "transcripts are identified by gene_id and transcript_id, and the\n"
+                        "annotated output is a GTF")
+    g.add_argument("--genome", metavar="FILE", help="Genome FASTA matching the GFF3 or GTF")
     g.add_argument("--proteins", metavar="FILE",
                    help="Pre-extracted protein FASTA for the GFF3 (used with --gff3, instead of\n"
                         "extraction from --genome). IDs must be the GFF3 transcript identifiers;\n"
@@ -86,9 +91,11 @@ Examples:
                         "nucleotide transcripts with --orf-translation on, these are the blastx results\n"
                         "used for the translation; the proteins are then searched")
     g.add_argument("--gene-id-attr", default="ID", metavar="ATTR",
-                   help="GFF3 gene attribute used as the gene identifier in outputs (default: ID)")
+                   help="Gene attribute used as the gene identifier in outputs (default: ID, the GFF3 ID\n"
+                        "or the GTF gene_id)")
     g.add_argument("--transcript-id-attr", default="ID", metavar="ATTR",
-                   help="GFF3 transcript attribute used as the transcript identifier (default: ID)")
+                   help="Transcript attribute used as the transcript identifier (default: ID, the GFF3 ID\n"
+                        "or the GTF transcript_id)")
     g.add_argument("--codon-table", type=int, default=1, metavar="N",
                    help="NCBI genetic code for translation (default: 1); transl_table attributes override it")
     g.add_argument("--mito-seqid", nargs="+", default=[], metavar="SEQID",
@@ -283,7 +290,10 @@ Examples:
                    help="How GOAnnotate results enter the annotated GFF3 (default: fill)\n"
                         "  add:     goannotate_* attributes, Ontology_term and Dbxref only\n"
                         "  fill:    also gene/Name/description/product where absent (existing\n"
-                        "           annotation is kept; disagreements go to the review table)\n"
+                        "           annotation is kept; disagreements go to the review table). Symbol\n"
+                        "           and product name the same gene: where GOAnnotate gives the symbol,\n"
+                        "           an existing product that names another protein is replaced by\n"
+                        "           GOAnnotate's\n"
                         "  replace: also overwrite gene/Name/description/product")
     g.add_argument("--keep-existing-identifiers", action="store_true",
                    help="In fill and add modes, keep existing symbols that are identifiers (LOC numbers,\n"
@@ -449,14 +459,17 @@ def validate(args, parser) -> None:
         return
     if not args.output:
         parser.error("--output/-o is required")
-    if not args.gff3 and not args.transcripts:
-        parser.error("one of --gff3 (with --genome or --proteins) or --transcripts is required")
-    if args.gff3 and not args.genome and not args.transcripts and not args.proteins:
-        parser.error("--gff3 requires --genome (to extract sequences), --proteins or --transcripts")
-    if args.genome and not args.gff3:
-        parser.error("--genome requires --gff3")
-    if args.proteins and not args.gff3:
-        parser.error("--proteins requires --gff3 (use --transcripts for a FASTA without annotation)")
+    if args.gff3 and args.gtf:
+        parser.error("--gff3 and --gtf cannot be used together")
+    annotation = args.gff3 or args.gtf
+    if not annotation and not args.transcripts:
+        parser.error("one of --gff3 or --gtf (with --genome or --proteins) or --transcripts is required")
+    if annotation and not args.genome and not args.transcripts and not args.proteins:
+        parser.error("--gff3 and --gtf require --genome (to extract sequences), --proteins or --transcripts")
+    if args.genome and not annotation:
+        parser.error("--genome requires --gff3 or --gtf")
+    if args.proteins and not annotation:
+        parser.error("--proteins requires --gff3 or --gtf (use --transcripts for a FASTA without annotation)")
     if args.proteins and args.transcripts:
         parser.error("--proteins and --transcripts cannot be used together")
     if not args.db and not args.go_mapping:

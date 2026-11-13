@@ -222,10 +222,13 @@ _HEADER_FIELD = re.compile(r'(\w+)=(?:"([^"]*)"|(\S+))')
 
 
 def gene_symbol_of(gene) -> str:
-    """The gene's symbol: the gene attribute, else Name when it is not just the ID or locus tag."""
+    """
+    The gene's symbol: the gene attribute, else Name or gene_name (GTF) when
+    it is not just the ID or locus tag.
+    """
     sym = gene.attrs.get("gene", "")
     if not sym:
-        name = gene.attrs.get("Name", "")
+        name = gene.attrs.get("Name", "") or gene.attrs.get("gene_name", "")
         if name and name not in (gene.attrs.get("locus_tag", ""), gene.id):
             sym = name
     return sym
