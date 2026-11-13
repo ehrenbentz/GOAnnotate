@@ -92,6 +92,28 @@ class NameAudit:
         self.kept_symbols = Counter()            # final symbol -> hits
 
 
+_active = None
+
+
+def set_active(bad_name_filter) -> None:
+    """Make a filter the one module-level helpers read their patterns from (active_patterns)."""
+    global _active
+    _active = bad_name_filter
+
+
+def active_patterns():
+    """The filter set with set_active; the bundled pattern file when none was set."""
+    global _active
+    if _active is None:
+        level = logger.level
+        logger.setLevel(logging.WARNING)
+        try:
+            _active = BadNameFilter(str(default_bad_patterns_path()))
+        finally:
+            logger.setLevel(level)
+    return _active
+
+
 class BadNameFilter:
     """
     Cleans protein names of genome-specific identifiers and qualifiers,
@@ -114,12 +136,17 @@ class BadNameFilter:
         self.normalize_patterns = []
         self.symbol_regex_patterns = []
         self.product_patterns = []       # (compiled, replacement, source text), applied to output products
+        self.symbol_strip_patterns = []      # removed from a hit's gene symbol
+        self.alias_reject_patterns = []      # reference synonyms not used as aliases
+        self.designator_patterns = []        # paralog designators of product names; group 1 is the name
+        self.ortholog_symbol_patterns = []   # rejected symbols accepted from a relative's ortholog
+        self.interpro_identifier_patterns = []   # InterPro entries that give no product name
         self._legacy_plain = 0
 
         files = [patterns_file] + list(extra_files or [])
         for path in files:
             if not Path(path).exists():
-                raise FileNotFoundError(f"Bad names pattern file not found: {path}")
+                raise FileNotFoundError(f"Pattern file not found: {path}")
             with open(path) as f:
                 self._parse_patterns(f.read(), path)
 
@@ -131,7 +158,9 @@ class BadNameFilter:
             f"{len(self.placeholders)} placeholder, {len(self.exact_matches)} exact, {len(self.substrings)} contains, "
             f"{len(self.regex_patterns)} regex, {len(self.generic_patterns)} generic, "
             f"{len(self.normalize_patterns)} normalize, {len(self.symbol_regex_patterns)} symbol, "
-            f"{len(self.product_patterns)} product patterns from {', '.join(repr(str(p)) for p in files)}")
+            f"{len(self.product_patterns)} product, "
+            f"{len(self.symbol_strip_patterns) + len(self.alias_reject_patterns) + len(self.designator_patterns) + len(self.ortholog_symbol_patterns) + len(self.interpro_identifier_patterns)} "
+            f"nomenclature-specific patterns from {', '.join(repr(str(p)) for p in files)}")
 
     # ------------------------------------------------------------------
     # Parsing
@@ -151,7 +180,13 @@ class BadNameFilter:
             ("exact:", "exact"), ("contains:", "contains"), ("regex:", "regex"),
             ("generic_regex:", "generic"), ("normalize_regex:", "normalize"),
             ("symbol_regex:", "symbol"), ("product_regex:", "product"),
+            ("symbol_strip_regex:", "symbol_strip"), ("alias_reject_regex:", "alias_reject"),
+            ("designator_regex:", "designator"), ("ortholog_symbol_regex:", "ortholog_symbol"),
+            ("interpro_identifier_regex:", "interpro_identifier"),
         )
+        simple = {"symbol_strip": self.symbol_strip_patterns, "alias_reject": self.alias_reject_patterns,
+                  "designator": self.designator_patterns, "ortholog_symbol": self.ortholog_symbol_patterns,
+                  "interpro_identifier": self.interpro_identifier_patterns}
         for line in text.split("\n"):
             line = line.strip()
             if not line or line.startswith("#"):
@@ -170,7 +205,11 @@ class BadNameFilter:
             if not body:
                 continue
 
-            if kind == "qualifier":
+            if kind in simple:
+                pat = self._compile(body, f"{kind}_regex", source)
+                if pat:
+                    simple[kind].append(pat)
+            elif kind == "qualifier":
                 pat = self._compile(body, "qualifier_regex", source)
                 if pat:
                     self.qualifier_patterns.append((pat, body))

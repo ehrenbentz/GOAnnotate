@@ -8,7 +8,7 @@ from pathlib import Path
 
 from goannotate import GOAnnotateError
 from goannotate import annotate as annotate_mod
-from goannotate import (assign, blast, compare, evaluate, gff3, gtf, mappings, modules, orfs, output, refgo, reference, search,
+from goannotate import (assign, blast, compare, evaluate, filters, gff3, gtf, mappings, modules, orfs, output, refgo, reference, search,
                         sequences, taxon)
 from goannotate.filters import BadNameFilter, NameAudit, write_name_audit
 from goannotate.go import GOHierarchy, resolve_go_obo
@@ -195,6 +195,11 @@ def run(args) -> None:
     ############################################################
     # Stage 3: annotation
     ############################################################
+    extra = getattr(args, "bad_patterns_extra", None) or []
+    for path in extra:
+        _require_file(path, "Pattern file")
+    bad_name_filter = BadNameFilter(args.bad_patterns, extra_files=extra)
+    filters.set_active(bad_name_filter)
     transcript_hits, blast_stats = blast.parse_blast_results(str(results_path), evalue_threshold=args.evalue)
 
     unknown = [q for q in transcript_hits if q not in universe.transcript_to_gene]
@@ -202,10 +207,6 @@ def run(args) -> None:
         logger.warning(f"{len(unknown):,} query IDs in the BLAST results are not in the gene universe "
                        f"(first: {unknown[0]}); their hits are kept under their own IDs")
 
-    extra = getattr(args, "bad_patterns_extra", None) or []
-    for path in extra:
-        _require_file(path, "Bad names file")
-    bad_name_filter = BadNameFilter(args.bad_patterns, extra_files=extra)
     output.configure_products(bad_name_filter, cleanup=not getattr(args, "no_product_cleanup", False))
     output.configure_existing(bad_name_filter, keep_identifiers=getattr(args, "keep_existing_identifiers", False))
     name_audit = NameAudit()

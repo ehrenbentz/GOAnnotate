@@ -89,11 +89,6 @@ def parse_applications_config(path: Path) -> dict:
     return apps
 
 
-# Entries named after an uncharacterized protein ("UPF0606 protein KIAA1549, alpha/beta domain 1",
-# "C2orf74 domain"): without the identifier only a generic fold remains, so they give no name.
-_IDENTIFIER_ENTRY = re.compile(r"\b(?:UPF\d{4}|KIAA\d{3,4}L?|C(?:\d{1,2}|X|Y)orf\d+[A-Z]?)\b", re.I)
-
-
 def domain_label(description: str, entry_type: str) -> str:
     """
     'EGF-like domain' -> 'EGF-like domain'; 'Protein kinase domain' ->
@@ -101,9 +96,11 @@ def domain_label(description: str, entry_type: str) -> str:
     ordinary first word is put in lower case (acronyms and mixed-case names
     keep their case); commas are removed; the entry type's word is appended
     when the description does not end with it. Entries named after an
-    uncharacterized protein (UPF, KIAA and chromosome-ORF identifiers) give ''.
+    uncharacterized protein (the interpro_identifier_regex patterns: UPF, KIAA and
+    chromosome-ORF identifiers) give ''.
     """
-    if _IDENTIFIER_ENTRY.search(description):
+    from goannotate.filters import active_patterns
+    if any(p.search(description) for p in active_patterns().interpro_identifier_patterns):
         return ""
     suffix = "domain" if entry_type == "Domain" else "repeat"
     m = re.match(r"(?i)^domain of unknown function,?\s*(DUF\d+)", description.strip())

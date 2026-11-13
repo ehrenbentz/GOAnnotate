@@ -239,6 +239,7 @@ goannotate \
 | `--stop-words` | bundled file | Stop word list for the name similarity |
 | `--bad-patterns` | bundled file | Name, symbol and product pattern file |
 | `--bad-patterns-extra` | none | Additional pattern file layered on the bundled one (repeatable) |
+| `--write-bad-patterns [FILE]` | `bad_patterns.txt` | Write a copy of the bundled pattern file and exit; an existing file is not overwritten |
 | `--consensus-threshold` | 0.5 | Similarity threshold for name clustering |
 | `--namespace` | BP MF CC | GO namespaces to include |
 | `--go-evidence` | all | GO annotations used by evidence code: `all` (except ND), `non-electronic` (no IEA), `experimental` |
@@ -714,7 +715,7 @@ Each rule is one line of the file. A rule is switched off by putting `#` in fron
 | To do this | Use |
 |---|---|
 | Run with the bundled rules | nothing; `goannotate/data/bad_patterns.txt` is read by default |
-| Change or switch off bundled rules | copy `goannotate/data/bad_patterns.txt`, edit the copy, pass it with `--bad-patterns FILE` |
+| Change or switch off bundled rules | `goannotate --write-bad-patterns my_patterns.txt` writes a copy of the bundled file (an existing file is not overwritten); edit the copy and pass it with `--bad-patterns my_patterns.txt` |
 | Add rules and keep the bundled ones | put the new lines in a file of their own and pass it with `--bad-patterns-extra FILE` (repeatable) |
 | See what the rules did in a run | `reports/{prefix}_name_audit.txt`: discards by reason, identifiers and qualifiers removed by pattern, the most frequent surviving names (family-level names marked `G`), and surviving names and symbols that look like identifiers |
 
@@ -732,6 +733,11 @@ The pattern file used is named in the log and in the summary of every run. `test
 | `normalize_regex:` | Comparison noise | Ignored when names are compared (e.g. `homolog`); never removed from output |
 | `symbol_regex:` | Genome-specific symbol | Symbol blanked, after ortholog resolution was attempted |
 | `product_regex:` | Naming convention | `PATTERN => REPLACEMENT` applied to the final product names only (without `=>` the match is removed) |
+| `symbol_strip_regex:` | Database-specific symbol suffix | Removed from a hit's gene symbol (FlyBase `kay-RA` becomes `kay`) |
+| `alias_reject_regex:` | Synonym that is not a gene name | A reference gene's synonym matching it is not listed as an alias (human disease-locus names such as `CMT2N`) |
+| `designator_regex:` | Paralog designator of another genome | Group 1, the name without the designator, replaces the product when it is a reference protein name or a name of the gene's own hits ("claudin 15 a") |
+| `ortholog_symbol_regex:` | Exception to `symbol_regex:` | A rejected symbol is accepted when a close relative's one-to-one ortholog maps to a reference gene with that official symbol (`C19orf81`) |
+| `interpro_identifier_regex:` | InterPro entry named after an uncharacterized protein | The entry gives no product name (InterProScan module) |
 
 All patterns are case-insensitive; `(?-i:...)` makes part of a pattern case-sensitive. Lines without a prefix are read as in 1.x (6 characters or fewer as `exact:`, longer as `contains:`), with a note in the log.
 

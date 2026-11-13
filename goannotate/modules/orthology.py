@@ -101,10 +101,6 @@ RBH_STATUSES = {"rbh", "rbh_override", "rbh_added"}
 # A close relatives' reference symbol replaces a supported symbol only when the gene's own alignment to
 # that symbol's reference protein scores at least this fraction of its alignment to the voted symbol's
 TAKE_MARGIN = 0.9
-# Official reference symbols of uncharacterized genes (C19orf81, KIAA1549L). The bad-name rules reject them
-# from hits, where they come with uninformative names; a close relative's one-to-one ortholog mapped to the
-# reference gene identifies the gene, so they are accepted from that route.
-_ORF_SYMBOL = re.compile(r"^(?:C(?:\d{1,2}|X|Y)orf\d+[A-Z]?|KIAA\d{3,4}L?\d*)$", re.I)
 def species_label(name: str) -> str:
     """'Microtus oregoni' -> 'Microtus_oregoni' (file and column names)."""
     return re.sub(r"[^A-Za-z0-9]+", "_", name).strip("_")
@@ -1032,8 +1028,16 @@ class OrthologyModule(Module):
         return kind == "1:1" or (self.fragment_orthologs and kind == "many:1")
 
     def _orf_symbol(self, sym: str) -> bool:
-        """An official reference symbol of an uncharacterized gene (C19orf81, KIAA1549L)."""
-        return bool(_ORF_SYMBOL.match(sym)) and bool(getattr(self, "_names", {}).get(sym.lower(), {}).get("symbol"))
+        """
+        An official reference symbol of an uncharacterized gene (C19orf81,
+        KIAA1549L; the ortholog_symbol_regex patterns). The symbol rules
+        reject them from hits, where they come with uninformative names; a
+        close relative's one-to-one ortholog mapped to the reference gene
+        identifies the gene, so they are accepted from that route.
+        """
+        from goannotate.filters import active_patterns
+        return (any(p.search(sym) for p in active_patterns().ortholog_symbol_patterns)
+                and bool(getattr(self, "_names", {}).get(sym.lower(), {}).get("symbol")))
 
     def prior(self) -> dict:
         """{query gene: (ortholog symbol, close)} for the Diamond vote (weighted mode only)."""

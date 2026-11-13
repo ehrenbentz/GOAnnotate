@@ -564,14 +564,19 @@ class ReferenceNomenclature:
         return self.renamed.get(s, "")
 
 
-# FlyBase transcript and protein identifiers carried as gene symbols by cDNA-clone entries (kay-RA, CG1647-PB)
-_TRANSCRIPT_SUFFIX = re.compile(r"-[RP][A-Z]$")
-
-
 def gene_symbol_of(gn: str) -> str:
-    """A UniProt GN= value as a gene symbol: a FlyBase transcript or protein suffix (-RA, -PB) is dropped."""
-    if gn and _TRANSCRIPT_SUFFIX.search(gn) and len(gn) > 3:
-        return gn[:-3]
+    """
+    A UniProt GN= value as a gene symbol: text matched by a symbol_strip_regex
+    pattern (a FlyBase transcript or protein suffix, -RA, -PB) is removed,
+    unless nothing would remain.
+    """
+    if not gn:
+        return gn
+    from goannotate.filters import active_patterns
+    for pattern in active_patterns().symbol_strip_patterns:
+        stripped = pattern.sub("", gn)
+        if stripped and stripped != gn:
+            return stripped
     return gn
 
 
@@ -584,16 +589,6 @@ def is_readthrough_symbol(symbol: str, official) -> bool:
 
 
 _SYMBOL_LIKE = re.compile(r"^[a-z0-9][a-z0-9._@/-]*$")
-# Disease-locus designations that NCBI gene_info lists among a gene's
-# synonyms (CMT2N, DEE29, SCA3, SPG4, DFNA5, LGMD2A, MODY3, PARK2) and
-# chromosome-band names of translocation partners (AF6Q21)
-_DISEASE_LOCUS = re.compile(
-    r"^(?:cmt|dee|eiee|hdls|ttd|sca|spg|mrd|mrx|mrxs|dfna|dfnb|lgmd|als|cmh|cmd|arvd|arvc|lqt|sqt|opa|lca|"
-    r"cord|crd|mody|hsan|hmsn|nbia|dyt|epm|eca|atx|mcops|coxpd|mc\ddn|pch|pof|srtd|bpes|hpe|iddm|niddm|eofad|"
-    r"park|cdg\d?[a-z]?|ddh|ectd|ehlvic|fhm|hlh|hsp|imd|ipex|jbts|mcph|mgc|mrt|mtdps|nphp|odp|pkd|rp|scar|sccd|"
-    r"sgmd|smd|stgd|tnd|wws|xlid)\d+[a-z]?\d*$")
-_BAND_NAME = re.compile(r"^af\d+q\d+$")
-
 
 def _alias_synonym_ok(name: str, official_lower: str, gene_names: set) -> bool:
     """
@@ -602,7 +597,8 @@ def _alias_synonym_ok(name: str, official_lower: str, gene_names: set) -> bool:
     """
     if not _SYMBOL_LIKE.match(name):
         return False
-    if _DISEASE_LOCUS.match(name) or _BAND_NAME.match(name):
+    from goannotate.filters import active_patterns
+    if any(p.search(name) for p in active_patterns().alias_reject_patterns):
         return False
     # pseudogene named after the gene or one of its synonyms (FKHRL1P2 of FOXO3,
     # FKHRL1 being a FOXO3 synonym)

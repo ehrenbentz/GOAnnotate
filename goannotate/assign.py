@@ -948,25 +948,17 @@ def add_symbol_aliases(annotations: dict, nomenclature, is_bad_symbol, symbol_ca
 # PARALOG DESIGNATORS
 ####################
 
-# Designators that another genome's nomenclature adds to a name for its own
-# duplicates: a trailing " a"/" b" word, a letter glued to a trailing number
-# ("O3b", "11ba"), "-A"/"-B" after a number ("O3-B"). Case-sensitive.
-_DESIGNATOR_FORMS = (
-    re.compile(r"^(.*\S) [ab]$"),
-    re.compile(r"^(.*\d)[ab]{1,2}$"),
-    re.compile(r"^(.*\d)-[AB]$"),
-)
-
-
 def strip_paralog_designators(annotations: dict, ref_descriptions: dict, normalize_fn) -> dict:
     """
-    Remove paralog designators of other genomes from voted product names,
-    in place. A designator is removed only when the name without it is a
+    Remove paralog designators of other genomes (the designator_regex
+    patterns) from voted product names, in place. A designator is removed only when the name without it is a
     reference protein name or a name carried by the gene's own hits
     (winning cluster), so that "Cytochrome b" or "Annexin A" are left
     alone. Products taken from the reference proteome are not touched.
     Returns counts.
     """
+    from goannotate.filters import active_patterns
+    designator_forms = active_patterns().designator_patterns
     ref_names = {normalize_fn(d) for d in ref_descriptions.values() if d}
     from_reference = {"rbh", "rbh_override", "rbh_added", "vote_supported", "reference_best_hit",
                       "foreign_replaced"}
@@ -977,7 +969,7 @@ def strip_paralog_designators(annotations: dict, ref_descriptions: dict, normali
         if not name or (annot.symbol_status in from_reference and normalize_fn(name) in ref_names):
             continue        # a product taken from the reference proteome
         pool = {normalize_fn(n) for n in annot.winning_cluster_names if n}
-        for form in _DESIGNATOR_FORMS:
+        for form in designator_forms:
             m = form.match(name)
             if not m:
                 continue

@@ -44,7 +44,10 @@
 #   symbol_regex:      discard gene symbols matching this regex, applied after
 #                      ortholog resolution has been attempted
 #   product_regex:     "PATTERN => REPLACEMENT" applied to the final product
-#                      names only (naming conventions); see the last section
+#                      names only (naming conventions)
+#   symbol_strip_regex:, alias_reject_regex:, designator_regex:,
+#   ortholog_symbol_regex:, interpro_identifier_regex:
+#                      nomenclature-specific rules, described in section E
 #
 # Order of operations on a hit name: qualifiers are stripped, identifiers are
 # removed, punctuation is tidied, then the name is tested against placeholder/
@@ -526,6 +529,49 @@ symbol_regex:^OS\d{2}G\d{7}$
 #symbol_regex:^PO\d+$
 #symbol_regex:^TPASE$
 #symbol_regex:^TY3B-
+
+# =============================================================================
+# E. NOMENCLATURE-SPECIFIC RULES
+# =============================================================================
+# Rules that follow the conventions of one database or one clade. Comment a
+# line out to switch it off.
+
+# symbol_strip_regex: text removed from a hit's gene symbol before it is used
+# (the symbol is left alone when nothing would remain).
+# FlyBase transcript and protein identifiers carried as gene symbols by
+# cDNA-clone entries (kay-RA -> kay, CG1647-PB -> CG1647)
+symbol_strip_regex:(?<=.)(?-i:-[RP][A-Z])$
+
+# alias_reject_regex: synonyms of a reference gene that are not listed as
+# aliases of its symbol.
+# Human disease-locus designations that NCBI gene_info lists among a gene's
+# synonyms (CMT2N, DEE29, SCA3, SPG4, DFNA5, LGMD2A, MODY3, PARK2)
+alias_reject_regex:^(?:cmt|dee|eiee|hdls|ttd|sca|spg|mrd|mrx|mrxs|dfna|dfnb|lgmd|als|cmh|cmd|arvd|arvc|lqt|sqt|opa|lca|cord|crd|mody|hsan|hmsn|nbia|dyt|epm|eca|atx|mcops|coxpd|mc\ddn|pch|pof|srtd|bpes|hpe|iddm|niddm|eofad|park|cdg\d?[a-z]?|ddh|ectd|ehlvic|fhm|hlh|hsp|imd|ipex|jbts|mcph|mgc|mrt|mtdps|nphp|odp|pkd|rp|scar|sccd|sgmd|smd|stgd|tnd|wws|xlid)\d+[a-z]?\d*$
+# Chromosome-band names of translocation partners (AF6Q21)
+alias_reject_regex:^af\d+q\d+$
+
+# designator_regex: paralog designators that another genome's nomenclature
+# adds to a protein name for its own duplicates. Group 1 is the name without
+# the designator; it replaces the product only when it is a reference protein
+# name or a name carried by the gene's own hits (--keep-paralog-designators
+# switches all of them off). (?-i:...) keeps the letters case-sensitive.
+# A trailing " a" or " b" word ("claudin 15 a")
+designator_regex:^(.*\S) (?-i:[ab])$
+# A letter glued to a trailing number ("O3b", "11ba")
+designator_regex:^(.*\d)(?-i:[ab]{1,2})$
+# "-A" or "-B" after a number ("O3-B")
+designator_regex:^(.*\d)-(?-i:[AB])$
+
+# ortholog_symbol_regex: symbols that the symbol_regex rules reject from hits
+# and that are accepted when a close relative's one-to-one ortholog maps to a
+# reference gene carrying them as its official symbol (orthology module).
+# Official symbols of uncharacterized human genes (C19orf81, KIAA1549L)
+ortholog_symbol_regex:^(?:C(?:\d{1,2}|X|Y)orf\d+[A-Z]?|KIAA\d{3,4}L?\d*)$
+
+# interpro_identifier_regex: InterPro entries named after an uncharacterized
+# protein ("UPF0606 protein KIAA1549, alpha/beta domain 1", "C2orf74 domain")
+# give no product name (InterProScan module).
+interpro_identifier_regex:\b(?:UPF\d{4}|KIAA\d{3,4}L?|C(?:\d{1,2}|X|Y)orf\d+[A-Z]?)\b
 
 # =============================================================================
 # ADD CUSTOM PATTERNS IN A SEPARATE FILE (--bad-patterns-extra FILE)

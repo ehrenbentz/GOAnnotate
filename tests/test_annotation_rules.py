@@ -304,6 +304,30 @@ with tempfile.TemporaryDirectory() as _d:
     check(_assign.unnamed_reference_genes(_ann, _uni, _fwd, _rev, {"A1": "BcDNA:SD01241"}) == 0,
           "a gene with a symbol is left alone")
 
+print("\n# Nomenclature-specific rules are read from the pattern file")
+from goannotate import filters as _filters
+from goannotate import cli as _cli
+from goannotate.mappings import _alias_synonym_ok, gene_symbol_of as _gso
+check(_gso("kay-RA") == "kay" and _gso("CG1647-PB") == "CG1647" and _gso("abc-ra") == "abc-ra" and _gso("-RA") == "-RA",
+      "FlyBase transcript suffix removed by the symbol_strip_regex line")
+check(not _alias_synonym_ok("cmt2n", "mfn2", {"mfn2"}) and not _alias_synonym_ok("af6q21", "foxo3", {"foxo3"})
+      and _alias_synonym_ok("fkhrl1", "foxo3", {"foxo3"}), "disease-locus and band names rejected as aliases")
+check(len(bnf.designator_patterns) == 3 and len(bnf.ortholog_symbol_patterns) == 1
+      and len(bnf.interpro_identifier_patterns) == 1, "designator, ortholog-symbol and InterPro lines loaded")
+with tempfile.TemporaryDirectory() as _d:
+    _copy = Path(_d) / "bad_patterns.txt"
+    check(_cli.write_bad_patterns(str(_copy)) == 0 and _copy.read_text() == default_bad_patterns_path().read_text(),
+          "--write-bad-patterns writes a copy of the bundled file")
+    _copy.write_text(_copy.read_text().replace("symbol_strip_regex:", "#symbol_strip_regex:")
+                     .replace("symbol_regex:^SI:", "#symbol_regex:^SI:"))
+    check(_cli.write_bad_patterns(str(_copy)) == 1 and "#symbol_strip_regex:" in _copy.read_text(),
+          "an existing file is not overwritten")
+    _edited = BadNameFilter(str(_copy))
+    _filters.set_active(_edited)
+    check(_gso("kay-RA") == "kay-RA" and not _edited.is_bad_symbol("si:ch211-1a19.3") and bnf.is_bad_symbol("si:ch211-1a19.3"),
+          "a commented-out line switches its rule off")
+    _filters.set_active(bnf)
+
 print("\n# Identifiers among gene symbols")
 flagged = ["BEST:CK00246", "lincRNA.S6902", "BS13C01.Y1", "MB8.CHRX.PASA.104-MIP02663", "AUGUSTUS-3.0.2_10649", "ANON-WO0170980.151", "BcDNA:GH28351", "BCDNA.GH02384", "EG:171D11.5", "38B.13",
            "lincRNA.945", "sb:cb1058", "XB5729910.S", "MGC147631.L", "ACEY_s0041.g366", "141233_at", "TY3B-G_151"]

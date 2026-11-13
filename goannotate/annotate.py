@@ -10,6 +10,7 @@ import time
 from collections import Counter, defaultdict
 from difflib import SequenceMatcher
 
+from goannotate import filters
 from goannotate.blast import merge_hits_by_gene
 from goannotate.filters import BadNameFilter
 from goannotate.go import GOHierarchy, ELECTRONIC_CODES, GO_ROOT_TERMS
@@ -602,6 +603,8 @@ def _init_worker(go_mapping, go_hierarchy, bad_name_filter, resolver, word_weigh
     _worker_go_mapping = go_mapping
     _worker_go_hierarchy = go_hierarchy
     _worker_bad_name_filter = bad_name_filter
+    if bad_name_filter is not None:
+        filters.set_active(bad_name_filter)
     _worker_resolver = resolver
     _worker_word_weights = word_weights
     _worker_forbidden_go = frozenset(forbidden_go or ())

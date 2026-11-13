@@ -5,6 +5,7 @@ import logging
 import os
 import shutil
 import sys
+from pathlib import Path
 
 from goannotate import GOAnnotateError, __version__
 from goannotate.filters import default_bad_patterns_path
@@ -270,6 +271,11 @@ Examples:
                    metavar="FILE", action="append", default=[],
                    help="Additional pattern file read after the main one, e.g. locus-tag patterns for\n"
                         "your taxon; may be given more than once")
+    g.add_argument("--write-bad-patterns", "--write_bad_patterns", dest="write_bad_patterns", nargs="?",
+                   const="bad_patterns.txt", default=None, metavar="FILE",
+                   help="Write a copy of the bundled pattern file to FILE (default: bad_patterns.txt in the\n"
+                        "current directory) and exit; an existing file is not overwritten. Edit the copy\n"
+                        "and pass it with --bad-patterns")
     g.add_argument("--consensus-threshold", type=float, default=0.5,
                    help="Similarity threshold for name clustering, 0-1 (default: %(default)s)")
 
@@ -458,7 +464,7 @@ def validate(args, parser) -> None:
         parser.error("--relatives must be at least 1")
     if args.signalp_processes < 0:
         parser.error("--signalp-processes must be 0 (automatic) or a positive number")
-    if args.check_tools:
+    if args.check_tools or args.write_bad_patterns:
         return
     if not args.output:
         parser.error("--output/-o is required")
@@ -496,6 +502,21 @@ def validate(args, parser) -> None:
         args.threads = os.cpu_count()
 
 
+def write_bad_patterns(destination: str) -> int:
+    """Copy the bundled pattern file to destination unless a file is already there."""
+    dest = Path(destination)
+    if dest.is_dir():
+        dest = dest / "bad_patterns.txt"
+    if dest.exists():
+        print(f"{dest} exists; it was not overwritten")
+        return 1
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(default_bad_patterns_path(), dest)
+    print(f"Wrote the bundled pattern file to {dest}\n"
+          f"Edit it and pass it with: --bad-patterns {dest}")
+    return 0
+
+
 def check_tools(args) -> int:
     """Print the availability of Diamond and of every module's tool; exit 0 when all are found."""
     from goannotate.modules import detect_all
@@ -522,6 +543,8 @@ def main(argv=None) -> int:
                         format='%(asctime)s - %(levelname)s - %(message)s')
     validate(args, parser)
 
+    if args.write_bad_patterns:
+        return write_bad_patterns(args.write_bad_patterns)
     if args.check_tools:
         return check_tools(args)
 
