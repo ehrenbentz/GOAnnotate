@@ -145,6 +145,18 @@ def test_parse_minimal(tmp):
     return genes
 
 
+def test_exons_as_cds(tmp):
+    path = tmp / "gemoma.gtf"
+    path.write_text(row("chr4", "exon", 100, 150, "-", "2", 'transcript_id "t1"; gene_id "g1";')
+                    + row("chr4", "exon", 200, 260, "-", "0", 'transcript_id "t1"; gene_id "g1";')
+                    + row("chr4", "exon", 500, 600, "+", ".", 'transcript_id "t2"; gene_id "g2";'))
+    genes, stats = gtf.parse_gtf(str(path))
+    g1, g2 = genes
+    check(g1.transcripts[0].cds == [(100, 150, 2), (200, 260, 0)] and g1.coding and g1.transcripts[0].first_phase == 0,
+          "exons with a frame and no CDS lines are read as the coding sequence")
+    check(not g2.coding and stats.n_exons_as_cds == 1, "exons without a frame stay non-coding")
+
+
 def test_parse_augustus(tmp):
     path = tmp / "augustus.gtf"
     path.write_text(AUGUSTUS)
@@ -255,6 +267,7 @@ if __name__ == "__main__":
         ncbi = test_parse_ncbi(tmp)
         minimal = test_parse_minimal(tmp)
         augustus = test_parse_augustus(tmp)
+        test_exons_as_cds(tmp)
         test_write_ncbi(tmp, ncbi)
         test_write_minimal(tmp, minimal)
         test_write_augustus(tmp, augustus)

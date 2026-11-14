@@ -146,6 +146,7 @@ class GFF3Stats:
     n_ignored_features: int = 0
     n_coding_genes: int = 0
     format: str = "GFF3"
+    n_exons_as_cds: int = 0
 
 
 def parse_gff3(path: str) -> tuple:

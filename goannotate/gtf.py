@@ -5,7 +5,11 @@ Features are grouped by their ``gene_id`` and ``transcript_id`` attributes.
 transcript without a line of its own is built from the span of its exon
 and CDS lines. Column 9 holding a bare identifier on gene and transcript
 lines (AUGUSTUS) is accepted. ``stop_codon`` features are joined to the
-CDS, so that the CDS includes the stop codon as it does in GFF3. The frame
+CDS, so that the CDS includes the stop codon as it does in GFF3. A
+transcript without CDS lines whose exon lines all carry a frame (0, 1 or
+2; GTF defines the frame only for coding features) has its exons read as
+the coding sequence, as written by gene predictors that emit coding
+segments only (GeMoMa). The frame
 column is read as the GFF3 phase. A key that occurs several times on a
 line (``tag``, ``db_xref``) is kept as a comma-separated value.
 
@@ -129,6 +133,7 @@ def parse_gtf(path: str) -> tuple:
     first_attrs = {}                 # transcript or gene ID -> attributes of its first child line
     spans = {}                       # transcript ID -> [seqid, strand, start, end] over its child lines
     exon_records = defaultdict(list)
+    exon_frames = defaultdict(list)    # (start, end, frame or None) of exon lines
     cds_records = defaultdict(list)
     stop_records = defaultdict(list)
     cds_attrs = {}
@@ -195,6 +200,7 @@ def parse_gtf(path: str) -> tuple:
                     span[3] = max(span[3], e)
                 if ftype == "exon":
                     exon_records[tid].append((s, e))
+                    exon_frames[tid].append((s, e, int(frame) if frame in ("0", "1", "2") else None))
                 else:
                     ph = int(frame) if frame in ("0", "1", "2") else 0
                     if ftype == "CDS":
@@ -247,6 +253,11 @@ def parse_gtf(path: str) -> tuple:
                 continue
             seen.add((s, e))
             cds.append((s, e, ph))
+        if not cds and exon_frames.get(tid) and all(ph is not None for _, _, ph in exon_frames[tid]):
+            # No CDS lines and a frame on every exon line: the exons are the
+            # coding segments (GTF defines the frame only for coding features)
+            cds = sorted(set(exon_frames[tid]))
+            stats.n_exons_as_cds += 1
         if cds:
             cds = _join_stop_codons(cds, stop_records.get(tid, []), rec["strand"])
         if not exons:
@@ -292,8 +303,11 @@ def parse_gtf(path: str) -> tuple:
                 f"{stats.n_genes_without_transcripts:,} without transcripts)")
     logger.info(f"  Transcripts: {stats.n_transcripts:,} ({stats.n_coding_transcripts:,} coding, "
                 f"{stats.n_implicit_transcripts:,} without a transcript line)")
-    if stats.feature_counts.get("CDS") and not stats.feature_counts.get("stop_codon"):
-        logger.warning("  The GTF has CDS features and no stop_codon features; the CDS is used as given")
+    if stats.n_exons_as_cds:
+        logger.warning(f"  Transcripts without CDS lines whose exon lines all carry a frame: "
+                       f"{stats.n_exons_as_cds:,}; their exons are read as the coding sequence")
+    if (stats.feature_counts.get("CDS") or stats.n_exons_as_cds) and not stats.feature_counts.get("stop_codon"):
+        logger.warning("  The GTF has no stop_codon features; the coding sequence is used as given")
     if stats.n_orphan_children:
         logger.warning(f"  Exon or CDS lines without gene_id and transcript_id: {stats.n_orphan_children:,}")
     if stats.n_ignored_features:
